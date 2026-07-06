@@ -465,16 +465,23 @@ async fn run_turn(
     }
 
     if let Ok(messages) = agent.memory().get_messages_erased().await {
+        let now = chrono::Utc::now().to_rfc3339();
+        let created_at = crate::session::store::load_session(&session_path.get())
+            .map(|existing| existing.created_at)
+            .unwrap_or_else(|_| now.clone());
         let mut session = crate::session::types::SessionFile::new(
             project_root,
             connection_name,
             model_name,
             tier,
-            chrono::Utc::now().to_rfc3339(),
+            created_at,
         );
+        session.updated_at = now;
         session.entries = transcript.get();
         session.messages = messages;
-        let _ = crate::session::store::save_session(&session_path.get(), &session);
+        if let Err(e) = crate::session::store::save_session(&session_path.get(), &session) {
+            eprintln!("warning: failed to persist session to {}: {e}", session_path.get().display());
+        }
     }
 
     streaming.set(false);
@@ -623,6 +630,44 @@ mod tests {
         let text = t.frame_text();
         assert!(!text.contains("hi there"), "{text}");
         assert!(!text.contains("Hello, world"), "{text}");
+
+        // The `/clear` handler must also start a brand-new session file on disk
+        // (not just reset the in-memory transcript): the original file should
+        // remain untouched, a new file should appear alongside it, and that new
+        // file should hold a genuinely fresh (empty) session.
+        fn find_json_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_dir() {
+                    find_json_files(&path, out);
+                } else if path.extension().and_then(|s| s.to_str()) == Some("json") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut json_files = Vec::new();
+        find_json_files(dir.path(), &mut json_files);
+        assert!(
+            json_files.len() >= 2,
+            "expected a new session file in addition to original.json, found: {json_files:?}"
+        );
+
+        let new_path = json_files
+            .iter()
+            .find(|p| p.file_name().unwrap() != "original.json")
+            .expect("a new session file distinct from original.json should exist");
+        let new_session = crate::session::store::load_session(new_path).unwrap();
+        assert!(new_session.entries.is_empty(), "new session should start with an empty transcript");
+        assert!(new_session.messages.is_empty(), "new session should start with empty message history");
+
+        // original.json was written to by the "hi there" turn (which ran before
+        // /clear), so it should still hold that turn's history — /clear must not
+        // retroactively wipe it, only stop using it going forward.
+        let original = crate::session::store::load_session(&dir.path().join("original.json")).unwrap();
+        assert!(
+            original.entries.iter().any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there")),
+            "original.json should retain the pre-/clear turn history"
+        );
     }
 
     #[tokio::test(start_paused = true)]
