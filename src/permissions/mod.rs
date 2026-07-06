@@ -8,7 +8,6 @@ pub use types::{
     ToolKind,
 };
 pub use settings::{load_settings, PermissionSettings, SettingsFile};
-// TODO(task 4): re-enable once Task 4 lands
-// pub use gate::{CheckOutcome, PermissionGate};
+pub use gate::{CheckOutcome, PermissionGate};
 // TODO(task 5): re-enable once Task 5 lands
 // pub use stdio::StdioPrompter;
