@@ -138,6 +138,7 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
                 &project_root,
                 cli.connection.as_deref(),
                 cli.permission_mode.map(PermissionModeArg::into_tier),
+                None,
             )
             .await?;
         }

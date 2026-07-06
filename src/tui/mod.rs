@@ -15,10 +15,16 @@ use std::path::Path;
 
 use crate::agent::provider::build_model;
 use crate::config::connection::{load_connections, Connection};
+use crate::config::mcp_servers::load_mcp_servers;
 use crate::config::paths::Paths;
 use crate::config::secrets::SecretStore;
+use crate::context::load_project_context;
+use crate::mcp::connect::connect_all;
 use crate::permissions::settings::load_settings;
 use crate::permissions::types::PermissionTier;
+use crate::session::paths::new_session_path;
+use crate::session::types::SessionFile;
+use daimon::model::types::Message;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TuiSessionError {
@@ -38,6 +44,21 @@ pub enum TuiSessionError {
     Provider(#[from] crate::agent::provider::ProviderError),
     #[error("tui error: {0}")]
     Tui(#[from] ntui::Error),
+    #[error("failed to persist session: {0}")]
+    Session(#[from] crate::session::store::SessionError),
+    #[error("failed to load mcp-servers.toml: {0}")]
+    LoadMcpServers(crate::config::mcp_servers::McpServersError),
+}
+
+/// The subset of a loaded `SessionFile` `run_tui` needs to seed a resumed
+/// session — the file's own `path` is threaded through separately so the
+/// resumed session keeps appending to the same file rather than starting a
+/// new one.
+pub struct ResumedSession {
+    pub session_path: std::path::PathBuf,
+    pub entries: Vec<crate::tui::state::TranscriptEntry>,
+    pub messages: Vec<Message>,
+    pub tier: PermissionTier,
 }
 
 /// Mirrors `local_code::agent::headless::run_headless`'s connection-selection
@@ -79,9 +100,10 @@ fn select_connection(
 /// answer prompts with, matching the spec's "ask (default)" permission tier.
 pub async fn run_tui(
     paths: &Paths,
-    _project_root: &Path,
+    project_root: &Path,
     connection_name: Option<&str>,
     permission_mode_override: Option<PermissionTier>,
+    resume: Option<ResumedSession>,
 ) -> Result<(), TuiSessionError> {
     let connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
     let connection = select_connection(&connections, connection_name)?;
@@ -90,7 +112,44 @@ pub async fn run_tui(
     let model = build_model(&connection, api_key)?;
 
     let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;
-    let initial_tier = permission_mode_override.unwrap_or(PermissionTier::Ask);
+    let system_context = load_project_context(paths, project_root);
+
+    // Discover MCP-server tools once at startup, exactly like run_headless
+    // (Phase 5) does — a broken server is logged and skipped, never fatal,
+    // and the resulting tools are threaded through every later agent rebuild
+    // (`/model`, `/resume`) via `AppProps::mcp_tools` so they're never only
+    // present in headless mode.
+    let mcp_server_configs = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)
+        .map_err(TuiSessionError::LoadMcpServers)?;
+    let mcp_report = connect_all(&mcp_server_configs).await;
+    for error in &mcp_report.errors {
+        eprintln!("warning: {error}");
+    }
+    let mcp_tools = mcp_report.tools;
+
+    let (initial_tier, initial_entries, initial_messages, session_path) = match resume {
+        Some(resumed) => (
+            permission_mode_override.unwrap_or(resumed.tier),
+            resumed.entries,
+            resumed.messages,
+            resumed.session_path,
+        ),
+        None => {
+            let now = chrono::Utc::now();
+            let path = new_session_path(&paths.user_state_dir, project_root, now);
+            let tier = permission_mode_override.unwrap_or(PermissionTier::Ask);
+            let session = SessionFile::new(
+                project_root.to_path_buf(),
+                connection.name.clone(),
+                connection.default_model.clone(),
+                tier,
+                now.to_rfc3339(),
+            );
+            crate::session::store::save_session(&path, &session)
+                .map_err(TuiSessionError::Session)?;
+            (tier, Vec::new(), Vec::new(), path)
+        }
+    };
 
     let props = AppProps {
         model: Some(model),
@@ -99,6 +158,11 @@ pub async fn run_tui(
         always_allow: settings.always_allow,
         always_deny: settings.always_deny,
         initial_tier,
+        initial_entries,
+        initial_messages,
+        system_context,
+        mcp_tools,
+        session_path,
     };
 
     ntui::render(ntui::element!(App(
@@ -107,7 +171,12 @@ pub async fn run_tui(
         model_name: props.model_name,
         always_allow: props.always_allow,
         always_deny: props.always_deny,
-        initial_tier: props.initial_tier
+        initial_tier: props.initial_tier,
+        initial_entries: props.initial_entries,
+        initial_messages: props.initial_messages,
+        system_context: props.system_context,
+        mcp_tools: props.mcp_tools,
+        session_path: props.session_path
     )))
     .await?;
     Ok(())

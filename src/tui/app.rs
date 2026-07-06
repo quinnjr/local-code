@@ -9,12 +9,9 @@ use futures::StreamExt;
 use ntui::props::{Dimension, FlexDirection};
 use ntui::{component, element, Cleanup, KeyCode};
 
-use crate::permissions::gate::PermissionGate;
-use crate::permissions::settings::PermissionSettings;
 use crate::permissions::types::{PermissionDecision, PermissionTier};
 use crate::tui::components::transcript::{Transcript, TranscriptProps};
 use crate::tui::components::{Footer, FooterProps, Header, HeaderProps, InputBox, InputBoxProps};
-use crate::tui::gated_tool::build_streaming_agent;
 use crate::tui::permission_prompter::NtuiPermissionPrompter;
 use crate::tui::state::{
     find_tool_call_mut, toggle_last_tool_call_expanded, ToolCallEntry, ToolCallResult,
@@ -34,6 +31,29 @@ pub struct AppProps {
     pub always_allow: Vec<String>,
     pub always_deny: Vec<String>,
     pub initial_tier: PermissionTier,
+    /// Non-empty only when launched via `--resume`/`/resume`; seeds the
+    /// visible transcript so a resumed session redraws immediately instead
+    /// of starting blank.
+    pub initial_entries: Vec<TranscriptEntry>,
+    /// The raw agent-facing history to seed the rebuilt agent's memory with
+    /// (see `SeededMemory`) — kept separate from `initial_entries` because
+    /// the two are not interconvertible (see this plan's Architecture
+    /// section).
+    pub initial_messages: Vec<daimon::model::types::Message>,
+    /// AGENTS.md/CLAUDE.md content (already concatenated by
+    /// `local_code::context::load_project_context`), appended to the system
+    /// prompt. Empty string if no context files were found.
+    pub system_context: String,
+    /// MCP-server-discovered tools (Phase 5's `connect_all`, called once by
+    /// `run_tui` at startup — see Step 6). Threaded through every agent
+    /// rebuild (`rebuild_agent`, Task 5) so `/model`/`/resume` never drop
+    /// MCP tools that were available at launch. `NamespacedMcpTool` is
+    /// `Clone` (wraps an `Arc<McpToolBridge>`), so cloning this list to hand
+    /// to a rebuilt agent reuses the same live connections rather than
+    /// reconnecting to every configured server on every rebuild.
+    pub mcp_tools: Vec<crate::mcp::tool::NamespacedMcpTool>,
+    /// The session file this instance persists to after every turn.
+    pub session_path: std::path::PathBuf,
 }
 
 impl Default for AppProps {
@@ -45,6 +65,11 @@ impl Default for AppProps {
             always_allow: Vec::new(),
             always_deny: Vec::new(),
             initial_tier: PermissionTier::Ask,
+            initial_entries: Vec::new(),
+            initial_messages: Vec::new(),
+            system_context: String::new(),
+            mcp_tools: Vec::new(),
+            session_path: std::path::PathBuf::new(),
         }
     }
 }
@@ -73,7 +98,10 @@ fn tier_label(tier: PermissionTier) -> &'static str {
 /// drives (re-)running a turn.
 #[component]
 pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
-    let transcript = hooks.use_state(Vec::<TranscriptEntry>::new);
+    let transcript = hooks.use_state({
+        let initial_entries = props.initial_entries.clone();
+        move || initial_entries
+    });
     let input_buffer = hooks.use_state(String::new);
     let turn_id = hooks.use_state(|| 0u64);
     let pending_turn_input = hooks.use_state(|| Option::<String>::None);
@@ -88,19 +116,21 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let always_allow = props.always_allow.clone();
         let always_deny = props.always_deny.clone();
         let initial_tier = props.initial_tier;
+        let initial_messages = props.initial_messages.clone();
+        let system_context = props.system_context.clone();
+        let mcp_tools = props.mcp_tools.clone();
         let pending_permission = pending_permission.clone();
         move || {
-            let prompter = NtuiPermissionPrompter::new(pending_permission.clone());
-            let responder = prompter.responder_handle();
-            let settings = PermissionSettings {
+            crate::tui::rebuild::rebuild_agent(
+                model,
+                initial_tier,
                 always_allow,
                 always_deny,
-            };
-            let gate = Arc::new(PermissionGate::new(initial_tier, settings, Arc::new(prompter)));
-            let agent = Arc::new(
-                build_streaming_agent(model, gate.clone()).expect("agent construction should not fail"),
-            );
-            (agent, gate, responder)
+                initial_messages,
+                &system_context,
+                mcp_tools,
+                pending_permission,
+            )
         }
     });
     let (agent, gate, responder) = agent_and_responder.get();
@@ -377,6 +407,7 @@ mod tests {
             always_allow: vec![],
             always_deny: vec![],
             initial_tier: PermissionTier::FullAuto,
+            ..AppProps::default()
         }
     }
 
