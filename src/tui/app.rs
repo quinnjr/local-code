@@ -143,6 +143,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let always_allow_snapshot = props.always_allow.clone();
     let always_deny_snapshot = props.always_deny.clone();
     let mcp_tools_snapshot = props.mcp_tools.clone();
+    let model_snapshot = props.model.clone().expect("AppProps::model is always Some");
 
     let agent_and_responder = hooks.use_state({
         let model = props.model.clone().expect("AppProps::model is always Some");
@@ -232,6 +233,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let always_deny_snapshot = always_deny_snapshot.clone();
         let mcp_tools_snapshot = mcp_tools_snapshot.clone();
         let system_context = props.system_context.clone();
+        let model_snapshot = model_snapshot.clone();
         move |ev, _ctx| {
             if pending_permission.get().is_some() {
                 let decision = match ev.code {
@@ -394,6 +396,8 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             always_allow: always_allow_snapshot.clone(),
                             always_deny: always_deny_snapshot.clone(),
                             pending_permissions_menu: pending_permissions_menu.clone(),
+                            agent: agent.clone(),
+                            model: model_snapshot.clone(),
                         });
                         return;
                     }
@@ -446,6 +450,8 @@ struct SlashContext {
     always_allow: Vec<String>,
     always_deny: Vec<String>,
     pending_permissions_menu: ntui::State<bool>,
+    agent: Arc<Agent>,
+    model: SharedModel,
 }
 
 const HELP_TEXT: &str = "\
@@ -603,7 +609,114 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 });
             });
         }
-        // Tasks 13–15 fill in every remaining variant. Left unmatched here
+        SlashCommand::Compact => {
+            const RETAIN_RECENT: usize = 10;
+            const COMPACT_THRESHOLD: usize = 20;
+            let agent = ctx.agent.clone();
+            let model = ctx.model.clone();
+            let transcript = ctx.transcript.clone();
+            tokio::spawn(async move {
+                let history = match agent.memory().get_messages_erased().await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        transcript.update(|entries| {
+                            entries.push(TranscriptEntry::SystemNotice {
+                                text: format!("compact failed: could not read history: {e}"),
+                            });
+                        });
+                        return;
+                    }
+                };
+
+                if history.len() <= COMPACT_THRESHOLD {
+                    transcript.update(|entries| {
+                        entries.push(TranscriptEntry::SystemNotice {
+                            text: format!(
+                                "nothing to compact yet ({} messages, threshold is {COMPACT_THRESHOLD})",
+                                history.len()
+                            ),
+                        });
+                    });
+                    return;
+                }
+
+                let split_at = history.len().saturating_sub(RETAIN_RECENT);
+                let (older, recent) = history.split_at(split_at);
+
+                let mut conversation_text = String::new();
+                for msg in older {
+                    let role = format!("{:?}", msg.role);
+                    if let Some(content) = &msg.content {
+                        conversation_text.push_str(&format!("{role}: {content}\n"));
+                    }
+                }
+
+                let summary_request = daimon::model::types::ChatRequest {
+                    messages: vec![
+                        daimon::model::types::Message::system(
+                            "You are a conversation summarizer. Summarize the following \
+                             conversation into a concise paragraph that preserves all important \
+                             facts, decisions, tool results, and context. Be specific — include \
+                             names, numbers, and outcomes. Do not include any preamble, just the \
+                             summary.",
+                        ),
+                        daimon::model::types::Message::user(conversation_text),
+                    ],
+                    tools: Vec::new(),
+                    temperature: Some(0.0),
+                    max_tokens: Some(512),
+                };
+
+                let summary_text = match model.generate_erased(&summary_request).await {
+                    Ok(response) => response.text().to_string(),
+                    Err(e) => {
+                        transcript.update(|entries| {
+                            entries.push(TranscriptEntry::SystemNotice {
+                                text: format!("compact failed: summarization call errored: {e}"),
+                            });
+                        });
+                        return;
+                    }
+                };
+
+                if let Err(e) = agent.memory().clear_erased().await {
+                    transcript.update(|entries| {
+                        entries.push(TranscriptEntry::SystemNotice {
+                            text: format!("compact failed: could not clear memory: {e}"),
+                        });
+                    });
+                    return;
+                }
+                let _ = agent
+                    .memory()
+                    .add_message_erased(daimon::model::types::Message::system(format!(
+                        "Previous conversation summary: {summary_text}"
+                    )))
+                    .await;
+                for msg in recent.iter().cloned() {
+                    let _ = agent.memory().add_message_erased(msg).await;
+                }
+
+                // The display transcript has no 1:1 correspondence to the
+                // message-level split above (one user turn can expand into
+                // several TranscriptEntry values via tool cards) — this plan
+                // approximates the same boundary at the display layer by
+                // keeping only the transcript's last RETAIN_RECENT entries
+                // and prepending one SystemNotice with the summary, rather
+                // than attempting an exact message-to-entry alignment. This
+                // is a documented approximation, the same honest-scoping
+                // approach Phase 3 used for diff coloring.
+                transcript.update(|entries| {
+                    let keep_from = entries.len().saturating_sub(RETAIN_RECENT);
+                    let mut compacted = vec![TranscriptEntry::SystemNotice {
+                        text: format!("compacted {} older messages into a summary", older.len()),
+                    }];
+                    compacted.extend(entries.split_off(keep_from));
+                    *entries = compacted;
+                });
+            });
+        }
+        // Tasks 14–15 fill in every remaining variant. Left unmatched here
         // deliberately would be a compile error (the match is exhaustive),
         // which is why Task 9 (the very next task) adds `Clear` immediately
         // rather than leaving this plan in a non-compiling state at the end
@@ -988,5 +1101,59 @@ mod tests {
         type_and_submit(&mut t, "/connections add").await;
         t.tick().await.unwrap();
         assert!(t.frame_text().contains("local-code connections add"), "{}", t.frame_text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn compact_reports_nothing_to_do_below_the_threshold() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/compact").await;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+        assert!(t.frame_text().contains("nothing to compact yet"), "{}", t.frame_text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn compact_summarizes_older_messages_and_keeps_recent_ones() {
+        let props = test_props();
+        // Reuse StreamingEchoModel as the active model for both turns and the
+        // summarization call — its generate() (non-streaming) path is used by
+        // /compact, its generate_stream() path by ordinary turns; both are
+        // already implemented on this fixture from Phase 3.
+        // A tall terminal (rather than the usual 80x24) so every turn's
+        // rendered entries stay on-screen — with 25 real turns run before
+        // `/compact`, a normal 24-row terminal would scroll the compaction
+        // notice (pushed to the front of the post-compaction transcript) off
+        // the visible frame well before the assertion below runs, making the
+        // test fragile regardless of whether compaction actually happened.
+        let mut t = TestTerminal::new(80, 1000, Element::component::<App>(props.clone())).unwrap();
+
+        // `Agent::prompt_stream` (the streaming path `run_turn` uses) only
+        // ever calls `memory.add_message_erased` for the *user* half of each
+        // turn — the streamed assistant reply is accumulated into a local
+        // `messages` vec for the in-flight ReAct loop but is never persisted
+        // back to memory (confirmed by reading daimon 0.16.0's
+        // `agent/runner.rs::prompt_stream`, which has no
+        // `add_message_erased` call for the assistant's final text). So each
+        // submitted turn contributes exactly 1 message to
+        // `agent.memory().get_messages_erased()`, not 2 — this test submits
+        // 25 turns (not the plan's assumed 15) so the resulting 25-message
+        // history clears `COMPACT_THRESHOLD` (20).
+        for i in 0..25 {
+            type_and_submit(&mut t, &format!("turn {i}")).await;
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                t.tick().await.unwrap();
+            }
+        }
+
+        type_and_submit(&mut t, "/compact").await;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+        assert!(t.frame_text().contains("compacted"), "{}", t.frame_text());
+        let _ = props; // props is cloned above only to keep it available for potential future assertions
     }
 }
