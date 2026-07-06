@@ -4,8 +4,7 @@ pub mod gated_tool;
 pub mod build;
 pub mod headless;
 
-// TODO(task 2): re-enable once Task 2 lands
-// pub use provider::{build_model, ProviderError};
+pub use provider::{build_model, ProviderError};
 // TODO(task 6): re-enable once Task 6 lands
 // pub use gated_tool::GatedTool;
 // TODO(task 8): re-enable once Task 8 lands
