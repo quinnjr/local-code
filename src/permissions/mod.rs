@@ -9,5 +9,4 @@ pub use types::{
 };
 pub use settings::{load_settings, PermissionSettings, SettingsFile};
 pub use gate::{CheckOutcome, PermissionGate};
-// TODO(task 5): re-enable once Task 5 lands
-// pub use stdio::StdioPrompter;
+pub use stdio::StdioPrompter;
