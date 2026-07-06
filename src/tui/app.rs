@@ -561,7 +561,49 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             });
             ctx.pending_permissions_menu.set(true);
         }
-        // Tasks 12–15 fill in every remaining variant. Left unmatched here
+        SlashCommand::ConnectionsList => {
+            let paths = crate::config::paths::Paths {
+                user_config_dir: ctx.user_config_dir.clone(),
+                project_config_dir: ctx.project_config_dir.clone(),
+                user_state_dir: ctx.user_state_dir.clone(),
+            };
+            let mut out = Vec::new();
+            let text = match crate::cli::connections::list(&paths, &mut out) {
+                Ok(()) => String::from_utf8_lossy(&out).to_string(),
+                Err(e) => format!("failed to list connections: {e}"),
+            };
+            ctx.transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice { text });
+            });
+        }
+        SlashCommand::ConnectionsRemove { name } => {
+            let paths = crate::config::paths::Paths {
+                user_config_dir: ctx.user_config_dir.clone(),
+                project_config_dir: ctx.project_config_dir.clone(),
+                user_state_dir: ctx.user_state_dir.clone(),
+            };
+            let mut out = Vec::new();
+            let text = match crate::cli::connections::remove(&paths, &name, &mut out) {
+                Ok(()) => String::from_utf8_lossy(&out).to_string(),
+                Err(e) => format!("failed to remove connection: {e}"),
+            };
+            ctx.transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice { text });
+            });
+        }
+        SlashCommand::ConnectionsAddUnsupported => {
+            ctx.transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice {
+                    text: "adding a connection interactively isn't supported inside the TUI\n\
+                           (the wizard needs multi-step line-by-line stdin, which the raw-mode\n\
+                           TUI input loop doesn't support). Exit and run\n\
+                           `local-code connections add` in a separate terminal, then use /model\n\
+                           to switch to it."
+                        .to_string(),
+                });
+            });
+        }
+        // Tasks 13–15 fill in every remaining variant. Left unmatched here
         // deliberately would be a compile error (the match is exhaustive),
         // which is why Task 9 (the very next task) adds `Clear` immediately
         // rather than leaving this plan in a non-compiling state at the end
@@ -930,5 +972,21 @@ mod tests {
         t.send_key(KeyCode::Char('1')).unwrap();
         t.tick().await.unwrap();
         assert!(t.frame_text().contains("[ask]"), "{}", t.frame_text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connections_list_reports_no_connections_configured() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/connections list").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("No connections configured"), "{}", t.frame_text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connections_add_explains_it_is_unsupported_in_tui() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("local-code connections add"), "{}", t.frame_text());
     }
 }
