@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "local-code"
 path = "src/main.rs"
 
+[[bin]]
+name = "mock_mcp_stdio_server"
+path = "src/bin/mock_mcp_stdio_server.rs"
+
 [dependencies]
 ntui = "0.1.0"
 ntui-macros = "0.1.0"
