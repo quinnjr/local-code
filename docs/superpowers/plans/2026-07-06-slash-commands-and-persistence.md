@@ -60,6 +60,23 @@ parameter session-resume/`/model` need. Headless mode (`src/agent/headless.rs`, 
 session in this integration, and headless's own system prompt remains a documented, unchanged gap
 called out in Phase 2's Self-review (out of scope here; flagged again in this plan's Self-review).
 
+**MCP tools in the TUI:** `build_streaming_agent_with_history` registers tools by calling
+`local_code::agent::build::register_all_tools` — the exact same function headless mode's
+`build_agent`/`build_agent_with_mcp_tools` (Phase 2/5) call — rather than re-listing
+`GatedTool`-wrapped built-ins by hand the way Phase 3's original `build_streaming_agent` did. This
+means `build_streaming_agent_with_history` also takes an `mcp_tools: Vec<local_code::mcp::tool::NamespacedMcpTool>`
+parameter (Task 4), threaded through `rebuild_agent` (Task 5) and `AppProps` (Task 6), so MCP-server
+tools discovered at TUI startup (`run_tui`, Task 6, calling Phase 5's `load_mcp_servers`/`connect_all`
+exactly like `run_headless` does) are present on first launch and after every rebuild
+(`/model`, Task 10; `/resume`, Tasks 15–16) — not just in headless mode. **This introduces a real
+dependency on Phase 5 (`docs/superpowers/plans/2026-07-06-mcp-client.md`) that this plan's numbering
+does not otherwise imply**: `NamespacedMcpTool`, `connect_all`, and `load_mcp_servers` are Phase 5
+types, and `register_all_tools`'s MCP-aware signature is only defined once Phase 5's own Task 8
+lands. Concretely, this means Phase 5 must be implemented before Tasks 4, 5, 6, 10, 15, and 16 of
+*this* plan can compile — despite Phase 5 being numbered after this plan. This is flagged
+explicitly, not silently assumed; see this plan's Self-review notes for the same point restated at
+the end of the plan, where the original (now-fixed) Phase 4/Phase 5 integration gap was tracked.
+
 Slash-command dispatch is one parser (`local_code::tui::slash::parse_slash_command`) plus a set of
 handler functions/inline branches inside `App`'s `use_input` `Enter` case, replacing Phase 3's
 `slash_command_placeholder` call site exactly (the one place Phase 3 documented as the extension
@@ -72,8 +89,12 @@ shape Phase 3 already established for `pending_permission`.
 `/init`) and `serde`/`chrono` derives on already-present dependencies (`chrono` already added by
 Phase 6's memory plan; `serde_json` already present from Phase 2). Builds directly on
 `local_code::config::{paths::Paths, connection::{Connection, ProviderKind, load_connections}, secrets::SecretStore}`
-(Phase 1), `local_code::permissions::{PermissionGate, PermissionTier, PermissionSettings, load_settings, PermissionDecision, PermissionRequest, PermissionPrompter}` and `local_code::agent::provider::build_model` (Phase 2), and
-`local_code::tui::{run_tui, App, AppProps, gated_tool::{GatedTool, build_streaming_agent}, permission_prompter::NtuiPermissionPrompter, state::{TranscriptEntry, ToolCallEntry, ToolCallResult, UsageSummary, find_tool_call_mut, toggle_last_tool_call_expanded}}` (Phase 3). Reuses `daimon::agent::{Agent, AgentBuilder}`,
+(Phase 1), `local_code::permissions::{PermissionGate, PermissionTier, PermissionSettings, load_settings, PermissionDecision, PermissionRequest, PermissionPrompter}`, `local_code::agent::provider::build_model`, and
+`local_code::agent::{gated_tool::GatedTool, build::register_all_tools}` (Phase 2), and
+`local_code::tui::{run_tui, App, AppProps, gated_tool::build_streaming_agent, permission_prompter::NtuiPermissionPrompter, state::{TranscriptEntry, ToolCallEntry, ToolCallResult, UsageSummary, find_tool_call_mut, toggle_last_tool_call_expanded}}` (Phase 3). Additionally builds on
+`local_code::mcp::{tool::NamespacedMcpTool, connect::connect_all}` and
+`local_code::config::mcp_servers::load_mcp_servers` (Phase 5) — see this plan's Architecture section
+for the resulting Phase 4-depends-on-Phase-5 ordering note. Reuses `daimon::agent::{Agent, AgentBuilder}`,
 `daimon::model::{SharedModel, types::{ChatRequest, Message, Role}}`, `daimon::memory::Memory`
 directly (all confirmed present in the vendored `daimon-0.16.0`/`daimon-core-0.16.0` source).
 
@@ -885,25 +906,38 @@ PASS (3 tests).
 
 - [ ] **Step 5: Add `build_streaming_agent_with_history` to `src/tui/gated_tool.rs`**
 
-Append (do not remove `build_streaming_agent` — Task 3 of Phase 3's own plan and its tests still
-depend on it unchanged):
+This function requires Phase 5 to be implemented first (it takes `NamespacedMcpTool`s and calls the
+MCP-aware, three-argument `register_all_tools` Phase 5's own Task 8 extends Phase 2's function
+to) — see this plan's Architecture section for the resulting cross-phase ordering note. Append (do
+not remove `build_streaming_agent` — Task 3 of Phase 3's own plan and its tests still depend on it
+unchanged):
 
 ```rust
+use crate::agent::build::register_all_tools;
+use crate::mcp::tool::NamespacedMcpTool;
 use crate::tui::memory_seed::SeededMemory;
 use daimon::model::types::Message;
 
 /// Identical to [`build_streaming_agent`] but (a) seeds the agent's memory
 /// with `initial_messages` via [`SeededMemory`] instead of starting empty,
-/// and (b) appends `extra_system_context` (AGENTS.md/CLAUDE.md content, or an
-/// empty string if none was found) to the system prompt. Used by every
-/// call site added in this plan (`App`'s mount, `/model`, `/resume`);
-/// `build_streaming_agent` itself remains unchanged and is still exercised by
-/// Phase 3's own tests.
+/// (b) appends `extra_system_context` (AGENTS.md/CLAUDE.md content, or an
+/// empty string if none was found) to the system prompt, and (c) registers
+/// `mcp_tools` (already-discovered `NamespacedMcpTool`s — see
+/// `local_code::mcp::connect::connect_all`, Phase 5, called once at `run_tui`
+/// startup, Task 6) alongside the built-ins. Tool registration itself goes
+/// through `local_code::agent::build::register_all_tools` — the exact same
+/// function headless mode's `build_agent_with_mcp_tools` (Phase 5) calls —
+/// rather than re-listing `GatedTool`-wrapped built-ins by hand, so the TUI
+/// and headless paths can never register a different tool set from each
+/// other. Used by every call site added in this plan (`App`'s mount, `/model`,
+/// `/resume`); `build_streaming_agent` itself remains unchanged and is still
+/// exercised by Phase 3's own tests.
 pub fn build_streaming_agent_with_history(
     model: SharedModel,
     gate: Arc<PermissionGate>,
     initial_messages: Vec<Message>,
     extra_system_context: &str,
+    mcp_tools: Vec<NamespacedMcpTool>,
 ) -> daimon::Result<Agent> {
     let system_prompt = if extra_system_context.trim().is_empty() {
         SYSTEM_PROMPT.to_string()
@@ -911,17 +945,11 @@ pub fn build_streaming_agent_with_history(
         format!("{SYSTEM_PROMPT}\n\n{extra_system_context}")
     };
 
-    AgentBuilder::new()
+    let builder = AgentBuilder::new()
         .shared_model(model)
         .system_prompt(system_prompt)
-        .memory(SeededMemory::new(initial_messages))
-        .tool(GatedTool::new(ReadFile, gate.clone()))
-        .tool(GatedTool::new(WriteFile, gate.clone()))
-        .tool(GatedTool::new(EditFile, gate.clone()))
-        .tool(GatedTool::new(Bash, gate.clone()))
-        .tool(GatedTool::new(Grep, gate.clone()))
-        .tool(GatedTool::new(Glob, gate))
-        .build()
+        .memory(SeededMemory::new(initial_messages));
+    register_all_tools(builder, gate, mcp_tools).build()
 }
 
 #[cfg(test)]
@@ -968,7 +996,7 @@ mod with_history_tests {
     async fn seeded_history_is_visible_to_the_next_turn() {
         let model: SharedModel = Arc::new(EchoModel);
         let initial = vec![Message::user("earlier turn"), Message::assistant("earlier reply")];
-        let agent = build_streaming_agent_with_history(model, gate(), initial, "").unwrap();
+        let agent = build_streaming_agent_with_history(model, gate(), initial, "", Vec::new()).unwrap();
 
         let response = agent.prompt("new turn").await.unwrap();
         // system prompt + 2 seeded + new user turn = 4 messages sent to the model
@@ -997,7 +1025,14 @@ mod with_history_tests {
         }
 
         let model: SharedModel = Arc::new(CapturingModel);
-        let agent = build_streaming_agent_with_history(model, gate(), vec![], "Project rule: never use unwrap().").unwrap();
+        let agent = build_streaming_agent_with_history(
+            model,
+            gate(),
+            vec![],
+            "Project rule: never use unwrap().",
+            Vec::new(),
+        )
+        .unwrap();
         let response = agent.prompt("hi").await.unwrap();
         assert!(response.text().contains("Project rule: never use unwrap()."), "{}", response.text());
     }
@@ -1007,7 +1042,7 @@ mod with_history_tests {
 - [ ] **Step 6: Run the tests to verify they fail, then pass**
 
 Run: `cargo test --lib tui::gated_tool`
-Expected: PASS (8 tests: the 6 pre-existing from Phase 3 + the 2 new).
+Expected: PASS (7 tests: the 5 pre-existing from Phase 3 + the 2 new).
 
 - [ ] **Step 7: Run `cargo check` for the whole crate**
 
@@ -1029,6 +1064,10 @@ git commit -m "feat: add SeededMemory and build_streaming_agent_with_history for
 **Files:**
 - Create: `src/tui/rebuild.rs`
 
+Like Task 4, this task depends on Phase 5 (`rebuild_agent` takes and threads through a
+`Vec<NamespacedMcpTool>` to `build_streaming_agent_with_history`) — see this plan's Architecture
+section for the cross-phase ordering note.
+
 - [ ] **Step 1: Write the failing test**
 
 ```rust
@@ -1041,6 +1080,7 @@ use daimon::model::SharedModel;
 use daimon::model::types::Message;
 use tokio::sync::oneshot;
 
+use crate::mcp::tool::NamespacedMcpTool;
 use crate::permissions::gate::PermissionGate;
 use crate::permissions::settings::PermissionSettings;
 use crate::permissions::types::{PermissionDecision, PermissionRequest, PermissionTier};
@@ -1052,10 +1092,14 @@ pub type ResponderHandle = Arc<Mutex<Option<oneshot::Sender<PermissionDecision>>
 /// Builds a fresh `(Agent, PermissionGate, ResponderHandle)` triple: a new
 /// `NtuiPermissionPrompter` bound to `pending_permission`, a `PermissionGate`
 /// at `initial_tier` with `always_allow`/`always_deny`, and an `Agent` seeded
-/// with `initial_messages` and `extra_system_context`. This is the single
-/// place that logic lives — `App`'s mount, `/model`, and `/resume` all call
-/// it instead of duplicating the construction sequence Phase 3 originally
-/// left inlined in `App`'s `hooks.use_state` initializer.
+/// with `initial_messages`, `extra_system_context`, and `mcp_tools` (already
+/// `connect_all`-discovered `NamespacedMcpTool`s — `NamespacedMcpTool` is
+/// `Clone`, wrapping an `Arc<McpToolBridge>`, so the *same* live MCP
+/// connections can be handed to a freshly-rebuilt agent without reconnecting
+/// to every server again on `/model`/`/resume`). This is the single place
+/// that logic lives — `App`'s mount, `/model`, and `/resume` all call it
+/// instead of duplicating the construction sequence Phase 3 originally left
+/// inlined in `App`'s `hooks.use_state` initializer.
 pub fn rebuild_agent(
     model: SharedModel,
     initial_tier: PermissionTier,
@@ -1063,6 +1107,7 @@ pub fn rebuild_agent(
     always_deny: Vec<String>,
     initial_messages: Vec<Message>,
     extra_system_context: &str,
+    mcp_tools: Vec<NamespacedMcpTool>,
     pending_permission: ntui::State<Option<PermissionRequest>>,
 ) -> (Arc<Agent>, Arc<PermissionGate>, ResponderHandle) {
     let prompter = NtuiPermissionPrompter::new(pending_permission);
@@ -1070,8 +1115,14 @@ pub fn rebuild_agent(
     let settings = PermissionSettings { always_allow, always_deny };
     let gate = Arc::new(PermissionGate::new(initial_tier, settings, Arc::new(prompter)));
     let agent = Arc::new(
-        build_streaming_agent_with_history(model, gate.clone(), initial_messages, extra_system_context)
-            .expect("agent construction should not fail"),
+        build_streaming_agent_with_history(
+            model,
+            gate.clone(),
+            initial_messages,
+            extra_system_context,
+            mcp_tools,
+        )
+        .expect("agent construction should not fail"),
     );
     (agent, gate, responder)
 }
@@ -1120,6 +1171,7 @@ mod tests {
                     vec![],
                     vec![Message::user("seeded turn")],
                     "",
+                    Vec::new(),
                     pending,
                 );
                 tokio::spawn(async move {
@@ -1189,6 +1241,7 @@ to:
         let initial_tier = props.initial_tier;
         let initial_messages = props.initial_messages.clone();
         let system_context = props.system_context.clone();
+        let mcp_tools = props.mcp_tools.clone();
         let pending_permission = pending_permission.clone();
         move || {
             crate::tui::rebuild::rebuild_agent(
@@ -1198,16 +1251,17 @@ to:
                 always_deny,
                 initial_messages,
                 &system_context,
+                mcp_tools,
                 pending_permission,
             )
         }
     });
 ```
 
-This references `props.initial_messages` and `props.system_context`, which do not exist on
-`AppProps` yet — Task 6 adds them (along with `props.initial_entries`, used by the `transcript`
-`hooks.use_state` initializer the same way). Leave `cargo check` failing at the end of this step;
-Task 6 fixes it as part of extending `AppProps`. Also remove the now-unused
+This references `props.initial_messages`, `props.system_context`, and `props.mcp_tools`, which do
+not exist on `AppProps` yet — Task 6 adds them (along with `props.initial_entries`, used by the
+`transcript` `hooks.use_state` initializer the same way). Leave `cargo check` failing at the end of
+this step; Task 6 fixes it as part of extending `AppProps`. Also remove the now-unused
 `use crate::tui::gated_tool::build_streaming_agent;` and `use crate::tui::permission_prompter::NtuiPermissionPrompter;`
 imports from `src/tui/app.rs` if `cargo check` (run after Task 6) flags them as unused — `App` no
 longer constructs these types directly.
@@ -1352,8 +1406,10 @@ Expected: FAIL to compile until `src/context/mod.rs` is created with the content
 
 - [ ] **Step 4: Extend `AppProps` in `src/tui/app.rs`**
 
-Add three fields (`initial_entries`, `initial_messages`, `system_context`) and their `Default` impl
-entries:
+Add four fields (`initial_entries`, `initial_messages`, `system_context`, `mcp_tools`) and their
+`Default` impl entries. `mcp_tools` is Phase 5's `NamespacedMcpTool`, discovered once by `run_tui`
+at startup (Step 6, below) and threaded through every agent rebuild (`/model`, `/resume`) — this is
+what closes the gap where MCP tools were only wired up for headless mode:
 
 ```rust
 #[derive(Clone)]
@@ -1377,6 +1433,14 @@ pub struct AppProps {
     /// `local_code::context::load_project_context`), appended to the system
     /// prompt. Empty string if no context files were found.
     pub system_context: String,
+    /// MCP-server-discovered tools (Phase 5's `connect_all`, called once by
+    /// `run_tui` at startup — see Step 6). Threaded through every agent
+    /// rebuild (`rebuild_agent`, Task 5) so `/model`/`/resume` never drop
+    /// MCP tools that were available at launch. `NamespacedMcpTool` is
+    /// `Clone` (wraps an `Arc<McpToolBridge>`), so cloning this list to hand
+    /// to a rebuilt agent reuses the same live connections rather than
+    /// reconnecting to every configured server on every rebuild.
+    pub mcp_tools: Vec<crate::mcp::tool::NamespacedMcpTool>,
     /// The session file this instance persists to after every turn.
     pub session_path: std::path::PathBuf,
 }
@@ -1393,6 +1457,7 @@ impl Default for AppProps {
             initial_entries: Vec::new(),
             initial_messages: Vec::new(),
             system_context: String::new(),
+            mcp_tools: Vec::new(),
             session_path: std::path::PathBuf::new(),
         }
     }
@@ -1414,16 +1479,20 @@ Update the `transcript` state initializer to seed from `props.initial_entries`:
 
 Run: `cargo check --lib`
 Expected: PASS for `AppProps`/`App`'s own code; `src/tui/mod.rs`'s `run_tui` (which constructs
-`AppProps` and doesn't yet supply the three new fields) and its own tests will fail to compile until
+`AppProps` and doesn't yet supply the four new fields) and its own tests will fail to compile until
 Step 6.
 
 - [ ] **Step 6: Extend `run_tui` in `src/tui/mod.rs`**
 
-Add a `ResumedSession` type and thread it through `run_tui`. Replace the existing `run_tui` function
-and its surrounding imports with:
+Add a `ResumedSession` type and thread it through `run_tui`. This is also where MCP tool discovery
+for the TUI happens — once, at startup, exactly like `run_headless` (Phase 5) — so both invocation
+modes have MCP tools available from the start, not just headless. Replace the existing `run_tui`
+function and its surrounding imports with:
 
 ```rust
+use crate::config::mcp_servers::load_mcp_servers;
 use crate::context::load_project_context;
+use crate::mcp::connect::connect_all;
 use crate::session::paths::new_session_path;
 use crate::session::types::SessionFile;
 use daimon::model::types::Message;
@@ -1454,6 +1523,19 @@ pub async fn run_tui(
 
     let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;
     let system_context = load_project_context(paths, project_root);
+
+    // Discover MCP-server tools once at startup, exactly like run_headless
+    // (Phase 5) does — a broken server is logged and skipped, never fatal,
+    // and the resulting tools are threaded through every later agent rebuild
+    // (`/model`, `/resume`) via `AppProps::mcp_tools` so they're never only
+    // present in headless mode.
+    let mcp_server_configs = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)
+        .map_err(TuiSessionError::LoadMcpServers)?;
+    let mcp_report = connect_all(&mcp_server_configs).await;
+    for error in &mcp_report.errors {
+        eprintln!("warning: {error}");
+    }
+    let mcp_tools = mcp_report.tools;
 
     let (initial_tier, initial_entries, initial_messages, session_path) = match resume {
         Some(resumed) => (
@@ -1489,6 +1571,7 @@ pub async fn run_tui(
         initial_entries,
         initial_messages,
         system_context,
+        mcp_tools,
         session_path,
     };
 
@@ -1502,6 +1585,7 @@ pub async fn run_tui(
         initial_entries: props.initial_entries,
         initial_messages: props.initial_messages,
         system_context: props.system_context,
+        mcp_tools: props.mcp_tools,
         session_path: props.session_path
     )))
     .await?;
@@ -1509,11 +1593,13 @@ pub async fn run_tui(
 }
 ```
 
-Add the new `Session` error variant to `TuiSessionError`:
+Add the new `Session` and `LoadMcpServers` error variants to `TuiSessionError`:
 
 ```rust
     #[error("failed to persist session: {0}")]
     Session(#[from] crate::session::store::SessionError),
+    #[error("failed to load mcp-servers.toml: {0}")]
+    LoadMcpServers(crate::config::mcp_servers::McpServersError),
 ```
 
 - [ ] **Step 7: Update `src/tui/mod.rs`'s own tests and every other `run_tui` caller for the new parameter**
@@ -1549,13 +1635,15 @@ to:
 - [ ] **Step 8: Run the full workspace test suite**
 
 Run: `cargo test`
-Expected: PASS — every test from Phases 1–3 plus this plan's Tasks 1–6. `App`'s own Phase 3
-integration tests (`submitting_a_prompt_streams_the_assistant_reply_into_the_transcript`, etc.) must
-still pass unmodified since `test_props()` there constructs `AppProps { .. }` with the pre-Task-6
-fields explicitly and relies on `..Default::default()`-equivalent — if `test_props()` uses a bare
-struct literal without `..Default::default()`, add `initial_entries: vec![], initial_messages: vec![],
-system_context: String::new(), session_path: std::path::PathBuf::new()` to it (or switch it to spread
-from `AppProps::default()` and override only the fields it cares about) so it still compiles.
+Expected: PASS — every test from Phases 1–3 (and Phase 5, a prerequisite for this plan's Tasks 4–6
+per the Architecture section's cross-phase ordering note) plus this plan's Tasks 1–6. `App`'s own
+Phase 3 integration tests (`submitting_a_prompt_streams_the_assistant_reply_into_the_transcript`,
+etc.) must still pass unmodified since `test_props()` there constructs `AppProps { .. }` with the
+pre-Task-6 fields explicitly and relies on `..Default::default()`-equivalent — if `test_props()`
+uses a bare struct literal without `..Default::default()`, add `initial_entries: vec![],
+initial_messages: vec![], system_context: String::new(), mcp_tools: vec![], session_path:
+std::path::PathBuf::new()` to it (or switch it to spread from `AppProps::default()` and override
+only the fields it cares about) so it still compiles.
 
 - [ ] **Step 9: Commit**
 
@@ -2220,6 +2308,7 @@ typing/Enter handling), capturing the extra state it needs:
                                     let always_allow = always_allow_snapshot.clone();
                                     let always_deny = always_deny_snapshot.clone();
                                     let system_context = props.system_context.clone();
+                                    let mcp_tools = mcp_tools_snapshot.clone();
                                     tokio::spawn(async move {
                                         let history = agent_for_history
                                             .memory()
@@ -2233,6 +2322,7 @@ typing/Enter handling), capturing the extra state it needs:
                                             always_deny,
                                             history,
                                             &system_context,
+                                            mcp_tools,
                                             pending_permission_for_rebuild,
                                         );
                                         agent_and_responder.set(rebuilt);
@@ -2258,13 +2348,15 @@ typing/Enter handling), capturing the extra state it needs:
             }
 ```
 
-This references `always_allow_snapshot`/`always_deny_snapshot`, which don't exist yet — add them as
-plain (non-`State`) local `let` bindings at the top of `App`'s body, since `always_allow`/`always_deny`
-only ever come from `props` and never change during the component's lifetime:
+This references `always_allow_snapshot`/`always_deny_snapshot`/`mcp_tools_snapshot`, which don't
+exist yet — add them as plain (non-`State`) local `let` bindings at the top of `App`'s body, since
+`always_allow`/`always_deny`/`mcp_tools` only ever come from `props` and never change during the
+component's lifetime:
 
 ```rust
     let always_allow_snapshot = props.always_allow.clone();
     let always_deny_snapshot = props.always_deny.clone();
+    let mcp_tools_snapshot = props.mcp_tools.clone();
 ```
 
 - [ ] **Step 4: Write the test**
@@ -3274,6 +3366,7 @@ from Tasks 10–11):
                                                         always_deny_snapshot.clone(),
                                                         session.messages.clone(),
                                                         &props.system_context,
+                                                        mcp_tools_snapshot.clone(),
                                                         pending_permission.clone(),
                                                     );
                                                     agent_and_responder.set(rebuilt);
@@ -3789,11 +3882,20 @@ git commit -m "test: add ignored live integration tests for /compact summarizati
     verbatim; `PermissionTier` gains a `Serialize`/`Deserialize` derive in Task 1 (additive, not a
     redefinition).
   - `App`, `AppProps`, `run_tui`, `TranscriptEntry`, `ToolCallEntry`, `ToolCallResult`,
-    `UsageSummary`, `GatedTool`, `build_streaming_agent`, `NtuiPermissionPrompter` (Phase 3) — used
+    `UsageSummary`, `build_streaming_agent`, `NtuiPermissionPrompter` (Phase 3) — used
     verbatim; the four transcript-state types gain `Serialize`/`Deserialize` derives in Task 1
     (additive); `AppProps`/`run_tui` gain new fields/parameters in Tasks 6, 9, 10, 15 (additive,
     every pre-existing field/parameter retained); `build_streaming_agent` itself is untouched — a
     new sibling function `build_streaming_agent_with_history` is added instead (Task 4).
+  - `GatedTool` and `register_all_tools` (Phase 2, extended by Phase 5's Task 8 to add MCP-tool
+    registration) — used verbatim by `build_streaming_agent_with_history` (Task 4), which calls
+    `register_all_tools` rather than re-listing `GatedTool`-wrapped built-ins by hand. This is the
+    same function headless mode's `build_agent_with_mcp_tools` calls, so the TUI and headless paths
+    can never register a different tool set from each other.
+  - `NamespacedMcpTool`, `connect_all`, `load_mcp_servers` (Phase 5) — used verbatim by `run_tui`
+    (Task 6, MCP discovery at startup), `AppProps::mcp_tools` (Task 6), and `rebuild_agent` (Task 5,
+    threading `mcp_tools` through every rebuild). Not redefined here — this plan is, by necessity,
+    implemented after Phase 5 despite its lower phase number; see this plan's Architecture section.
   - `daimon::agent::{Agent, AgentBuilder}`, `daimon::model::{SharedModel, types::{ChatRequest,
     Message, Role, ChatResponse, StopReason, Usage}}`, `daimon::memory::Memory`,
     `Agent::memory()` → `SharedMemory` → `ErasedMemory::{get_messages_erased, clear_erased,
@@ -3808,6 +3910,25 @@ git commit -m "test: add ignored live integration tests for /compact summarizati
   5 extracts that inline logic into the `rebuild_agent` function Phase 3's own documentation
   promised, and Task 5's Step 3 refactors `App`'s mount closure to call it — so the actual code now
   matches what Phase 3 said it would be, rather than silently working around the gap.
+
+- **Cross-phase gap found and closed: MCP tools were headless-only.** An earlier draft of this plan
+  built `build_streaming_agent_with_history` without any knowledge of Phase 5's MCP tool discovery,
+  while Phase 2's headless `build_agent`/Phase 5's `build_agent_with_mcp_tools` did wire MCP tools up
+  for the `-p` CLI path. Net effect: MCP-server tools would work in headless mode but be silently
+  absent from the TUI, both on first launch and after every `/model`/`/resume` rebuild — a real
+  functional gap, not just a style inconsistency. This is now closed: `register_all_tools` (Phase 2,
+  extended by Phase 5) is the one function both `build_agent_with_mcp_tools` (headless) and
+  `build_streaming_agent_with_history` (this plan's Task 4, called by `rebuild_agent`/Task 5) call,
+  and `run_tui` (Task 6) discovers MCP tools once at startup exactly like `run_headless` does,
+  threading the result through `AppProps::mcp_tools` into every rebuild (`/model`, Task 10;
+  `/resume`, Tasks 15–16). The one residual difference from headless mode: the TUI does not
+  reconnect to MCP servers on every `/model`/`/resume` rebuild — it reuses the `NamespacedMcpTool`s
+  discovered at launch (cheap to do since `NamespacedMcpTool` is `Clone`, wrapping an
+  `Arc<McpToolBridge>`, so the same live connection is shared). This is a deliberate, documented
+  trade-off (avoiding redundant reconnects to potentially-slow stdio/network MCP servers on every
+  model switch), not an oversight — if a server is added to `mcp-servers.toml` mid-session, it will
+  only be picked up on the next full TUI restart, not by `/model`/`/resume` alone. A future
+  enhancement could add an explicit `/mcp reload` command if this proves limiting in practice.
 
 - **API-compatibility risks worth flagging:**
   1. **`Agent` has no public accessor for its model.** Confirmed by reading `daimon-0.16.0/src/agent/mod.rs`
@@ -3840,19 +3961,22 @@ git commit -m "test: add ignored live integration tests for /compact summarizati
 
 - **End-to-end spec coverage across all 7 phases (final check for this last phase):** Phase 1 (config/
   connections/secrets), Phase 2 (agent loop/tools/permissions/headless), Phase 3 (TUI shell), Phase 4
-  (this plan: slash commands/persistence), and Phase 6 (flat-file memory) each state their own spec
-  traceability against `docs/superpowers/specs/2026-07-06-local-code-tui-design.md`, and together they
-  cover sections 1–9 in full: §1 connections+secrets (Phase 1) and `/model` switching (this plan);
-  §2 agent loop/tools/MCP-readiness (Phase 2; MCP itself is Phase 5, not reviewed here since its plan
-  file wasn't part of this task's required reading — flagged as unverified, not confirmed done); §3
-  permissions (Phase 2, viewed/changed via this plan's `/permissions`); §4 AGENTS.md/CLAUDE.md (this
-  plan, both halves); §5 TUI (Phase 3); §6 slash commands (this plan, all 8); §7 session persistence
-  (this plan); §8 invocation modes (Phase 2's headless `-p`, Phase 3's interactive default — headless
+  (this plan: slash commands/persistence), Phase 5 (MCP client), and Phase 6 (flat-file memory) each
+  state their own spec traceability against
+  `docs/superpowers/specs/2026-07-06-local-code-tui-design.md`, and together they cover sections 1–9
+  in full: §1 connections+secrets (Phase 1) and `/model` switching (this plan); §2 agent loop/tools
+  (Phase 2) and MCP client (Phase 5, now fully wired into *both* invocation modes — see below); §3
+  permissions (Phase 2, viewed/changed via this plan's `/permissions`, and extended by Phase 5's
+  MCP-tool gating, all via the single `GatedTool` mechanism); §4 AGENTS.md/CLAUDE.md (this plan, both
+  halves); §5 TUI (Phase 3); §6 slash commands (this plan, all 8); §7 session persistence (this
+  plan); §8 invocation modes (Phase 2's headless `-p`, Phase 3's interactive default — headless
   mode's own context-loading gap remains open, called out above and in Phase 2's own Self-review, and
   is out of scope for this phase per this plan's Architecture section); §9 cross-session memory (Phase
   6, a deliberately separate concept from session persistence, correctly not conflated with it
-  anywhere in this plan). The one item this review cannot confirm is Phase 5 (MCP client wiring,
-  spec section 2's "MCP client wired in from v1") — its plan file was not in this task's required
-  reading list and this plan does not touch tool registration, so whether Phase 5 was completed and
-  whether `build_streaming_agent_with_history` would need to also register MCP-sourced tools is
-  unverified here and should be checked before considering the full 7-phase spec closed out.
+  anywhere in this plan). This revision closes the two items an earlier draft of this review flagged
+  as unverified: (1) Phase 5 (MCP client wiring) has now been read and is confirmed implemented, and
+  (2) `build_streaming_agent_with_history` now does register MCP-sourced tools, via the shared
+  `register_all_tools` function (Task 4/Task 5, calling into Phase 5's Task 8 extension) — this was a
+  real gap (MCP tools were headless-only), not a hypothetical one, and it is now closed; see the
+  dedicated self-review bullet above for the one residual, deliberate trade-off (rebuilds reuse
+  already-discovered MCP connections rather than reconnecting on every `/model`/`/resume`).

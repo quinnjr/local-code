@@ -6,8 +6,8 @@
 HTTP, or WebSocket transports — via layered project/user TOML config. At startup, connect to
 each configured server, discover its tools, and register them (namespaced by server name) into
 the exact same `daimon::agent::AgentBuilder`/`ToolRegistry` the core agent loop (Phase 2) already
-uses for its six built-in tools — subject to the same `PermissionGate`/`PermissionMiddleware`
-enforcement, with no bypass path. A server that fails to connect is logged and skipped; the rest
+uses for its six built-in tools — subject to the same `PermissionGate`/`GatedTool` enforcement,
+with no bypass path. A server that fails to connect is logged and skipped; the rest
 of the agent (built-ins + other MCP servers) still works.
 
 **Architecture:** `daimon`'s vendored `mcp` feature already ships everything needed on the client
@@ -16,22 +16,39 @@ implementations (`StdioTransport`, `HttpTransport`, `WebSocketTransport`), and `
 `Tool` impl that forwards `execute()` to a real `tools/call` JSON-RPC request. Because
 `McpToolBridge::name()` returns the MCP server's own (un-namespaced) tool name, and we need
 `servername__toolname` to avoid cross-server collisions, this plan adds one small wrapper type,
-`local_code::mcp::tool::NamespacedMcpTool`, that owns an `McpToolBridge` and overrides only
-`name()`. This wrapper is a single concrete Rust type, so it can be registered through Phase 2's
-existing `AgentBuilder::tool<T: Tool + 'static>(self, tool: T)` in a loop — **no refactor of
-Phase 2's registry is needed**; that builder was already generic/append-only by design (confirmed
-by reading `daimon-0.16.0/src/agent/builder.rs`). Config is a new layered TOML file,
-`.local-code/mcp-servers.toml` (project) + a user-level equivalent, merged by server name exactly
-like Phase 1's `connections.toml` (`local_code::config::mcp_servers::load_mcp_servers`, same
-project-wins-by-name merge as `load_connections`). `local_code::mcp::connect::connect_all` fans out
-one connection attempt per configured server, returning `(Vec<NamespacedMcpTool>, Vec<McpConnectError>)`
-— successes and failures are both collected, never a hard error, so one bad server never aborts
-startup. `local_code::agent::build::build_agent_with_mcp_tools` (new, alongside the existing
-`build_agent`, which now delegates to it with an empty tool list so Phase 2 callers keep working
-unmodified) registers the discovered tools onto the same builder chain Phase 2 built, before the
-same `PermissionMiddleware` is attached — so an MCP tool call is classified by
-`local_code::permissions::types::classify_tool`, which (per Phase 2's own design) treats any
-unrecognized tool name as `ToolKind::Edit`, i.e. **prompted by default**, never auto-trusted.
+`local_code::mcp::tool::NamespacedMcpTool`, that owns an `Arc<McpToolBridge>` (shared, and `Clone`,
+so the same live connection can be registered onto more than one `Agent` across a TUI rebuild
+without reconnecting — see Task 3) and overrides only `name()`. This wrapper is a single concrete
+Rust type, so it can be registered through Phase 2's existing `AgentBuilder::tool<T: Tool +
+'static>(self, tool: T)` in a loop — **no refactor of Phase 2's registry is needed**; that builder
+was already generic/append-only by design (confirmed by reading `daimon-0.16.0/src/agent/builder.rs`).
+Config is a new layered TOML file, `.local-code/mcp-servers.toml` (project) + a user-level
+equivalent, merged by server name exactly like Phase 1's `connections.toml`
+(`local_code::config::mcp_servers::load_mcp_servers`, same project-wins-by-name merge as
+`load_connections`). `local_code::mcp::connect::connect_all` fans out one connection attempt per
+configured server, returning `(Vec<NamespacedMcpTool>, Vec<McpConnectError>)` — successes and
+failures are both collected, never a hard error, so one bad server never aborts startup.
+
+Every discovered `NamespacedMcpTool` must be gated exactly like a built-in tool, through the *same*
+mechanism — this plan does not add a second enforcement path. Phase 2 defined
+`local_code::agent::gated_tool::GatedTool<T>` (a `Tool` wrapper that checks
+`local_code::permissions::gate::PermissionGate` inside its own `execute()`, which both
+`Agent::prompt` and `Agent::prompt_stream` call unconditionally — Phase 2 never used
+`daimon::middleware::Middleware`, precisely because `prompt_stream` never invokes it) and
+`local_code::agent::build::register_all_tools`, the one function that registers every available
+tool (each `GatedTool`-wrapped) onto an `AgentBuilder`. Phase 2's own version of `register_all_tools`
+only knew about the six built-ins, by necessity (Phase 5's types didn't exist yet when Phase 2 was
+written) — this plan's Task 8 **extends that exact function's signature in place** (adds an
+`mcp_tools: Vec<NamespacedMcpTool>` parameter, wraps each in `GatedTool::new(tool, gate.clone())`
+before registering) rather than introducing a competing registration function. This is also why
+Phase 4 (slash commands/persistence)'s TUI agent-rebuild path can register MCP tools too, simply by
+calling the same, now-MCP-aware `register_all_tools` — there is exactly one place tool registration
+happens, for both the headless and TUI paths. `local_code::agent::build::build_agent_with_mcp_tools`
+(new, alongside the existing `build_agent`, which now delegates to it with an empty tool list so
+Phase 2 callers keep working unmodified) calls `register_all_tools` with the discovered MCP tools —
+so an MCP tool call is classified by `local_code::permissions::types::classify_tool`, which (per
+Phase 2's own design) treats any unrecognized tool name as `ToolKind::Edit`, i.e. **prompted by
+default**, never auto-trusted, and is gated by the identical `GatedTool` wrapper as every built-in.
 `local_code::agent::headless::run_headless` is updated to call `connect_all` before building the
 agent and to print connection failures to stderr without aborting.
 
@@ -62,12 +79,18 @@ It builds directly on, and does not redefine, these Phase 1/Phase 2 types (impor
 - `local_code::permissions::types::{classify_tool, ToolKind}` (Phase 2) — used unchanged; this plan
   adds a locking test confirming namespaced MCP tool names fall through to `ToolKind::Edit`, but
   changes no logic here.
-- `local_code::permissions::gate::PermissionGate` and `local_code::agent::middleware::PermissionMiddleware`
-  (Phase 2) — reused unchanged; MCP tools flow through the identical `on_tool_call` check as
-  built-ins.
-- `local_code::agent::build::build_agent` (Phase 2) — kept as a public function with its original
-  signature (delegates to the new `build_agent_with_mcp_tools` with `vec![]`), so it is not a
-  breaking change for any Phase-2-era caller.
+- `local_code::permissions::gate::PermissionGate` and `local_code::agent::gated_tool::GatedTool`
+  (Phase 2) — reused unchanged; MCP tools are wrapped in the identical `GatedTool` as built-ins
+  before registration, so the same `execute()`-time check applies regardless of whether the caller
+  is `Agent::prompt` (headless) or `Agent::prompt_stream` (TUI). No `daimon::middleware::Middleware`
+  is used anywhere in this plan (Phase 2 doesn't use one either — see its Architecture section).
+- `local_code::agent::build::{build_agent, register_all_tools}` (Phase 2) — `build_agent` is kept as
+  a public function with its original signature (delegates to the new `build_agent_with_mcp_tools`
+  with `vec![]`), so it is not a breaking change for any Phase-2-era caller. `register_all_tools`'s
+  *signature* is extended in place (Task 8) to add an `mcp_tools` parameter — this is the one and
+  only tool-registration function in the project, also called by Phase 4's TUI agent-rebuild path,
+  so extending it here (rather than adding a second, MCP-aware registration function) is what keeps
+  the headless and TUI paths from drifting apart.
 - `local_code::agent::headless::run_headless` (Phase 2) — modified in place (this is the one
   function the spec identifies as the CLI entry point that must gain MCP wiring).
 
@@ -474,6 +497,8 @@ pub use connect::{connect_all, McpConnectError, McpDiscoveryReport};
 ```rust
 // src/mcp/tool.rs
 
+use std::sync::Arc;
+
 use daimon::mcp::McpToolBridge;
 use daimon::tool::{Tool, ToolOutput};
 
@@ -483,17 +508,22 @@ use daimon::tool::{Tool, ToolOutput};
 /// (or a built-in tool) that happen to expose the same bare name. Everything
 /// else — description, parameter schema, and execution — is delegated
 /// unchanged to the wrapped bridge, which is what actually issues the
-/// `tools/call` JSON-RPC request over the real transport.
+/// `tools/call` JSON-RPC request over the real transport. The bridge is held
+/// behind an `Arc` (and `NamespacedMcpTool` derives `Clone`) so the *same*
+/// live MCP connection can be registered onto more than one `daimon::agent::Agent`
+/// across a TUI agent rebuild (`/model`, `/resume`) without reconnecting to the
+/// server every time — see Phase 4's `rebuild_agent`.
+#[derive(Clone)]
 pub struct NamespacedMcpTool {
     namespaced_name: String,
-    inner: McpToolBridge,
+    inner: Arc<McpToolBridge>,
 }
 
 impl NamespacedMcpTool {
     pub fn new(server_name: &str, inner: McpToolBridge) -> Self {
         Self {
             namespaced_name: format!("{server_name}__{}", inner.name()),
-            inner,
+            inner: Arc::new(inner),
         }
     }
 }
@@ -1277,18 +1307,24 @@ git commit -m "test: add real stdio MCP integration test against a spawned fixtu
 
 ---
 
-### Task 7: Confirm MCP tool names are never auto-trusted by `PermissionGate`
+### Task 7: Confirm MCP tool calls are never auto-trusted, through `GatedTool` itself
 
 **Files:**
 - Modify: `src/permissions/types.rs`
+- Modify: `src/agent/gated_tool.rs`
 
-This task adds no new production code — Phase 2's `classify_tool` already defaults any
-unrecognized name to `ToolKind::Edit` (i.e. "ask/gate it"), and namespaced MCP tool names like
-`filesystem__write_file` or `fixture__echo` never match the built-in-tool names it special-cases.
-This task exists to lock that behavior down with an explicit test, per this plan's hard requirement
-that MCP tool calls are never a permissions bypass.
+The classification half of this task adds no new production code — Phase 2's `classify_tool`
+already defaults any unrecognized name to `ToolKind::Edit` (i.e. "ask/gate it"), and namespaced MCP
+tool names like `filesystem__write_file` or `fixture__echo` never match the built-in-tool names it
+special-cases. But classification alone doesn't prove enforcement — this task also adds an
+end-to-end test, in Phase 2's own `src/agent/gated_tool.rs`, proving that a denied MCP-shaped tool
+call is actually blocked by `GatedTool::execute` (the one mechanism every tool call, built-in or
+MCP, goes through) rather than merely asserting what `classify_tool` would return in isolation. This
+directly satisfies this plan's hard requirement that MCP tool calls are never a permissions bypass,
+exercised through the real mechanism, not the middleware path this plan's earlier drafts assumed
+before `GatedTool` existed.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test for `classify_tool`**
 
 Append to the existing `mod tests` block in `src/permissions/types.rs` (from Phase 2's Task 3):
 
@@ -1306,7 +1342,50 @@ Append to the existing `mod tests` block in `src/permissions/types.rs` (from Pha
     }
 ```
 
-- [ ] **Step 2: Run the tests to verify they pass**
+- [ ] **Step 2: Write the failing end-to-end test proving `GatedTool` actually blocks a denied MCP-shaped tool call**
+
+Append to the existing `mod tests` block in `src/agent/gated_tool.rs` (from Phase 2's Task 6):
+
+```rust
+    #[tokio::test]
+    async fn denied_mcp_shaped_tool_call_never_reaches_the_wrapped_tool() {
+        // Proves MCP tool calls are gated through the exact same mechanism as
+        // built-ins, not a separate (and therefore possibly-bypassable) path.
+        // A namespaced-style name (`fixture__dangerous`) falls through
+        // `classify_tool`'s `_ => ToolKind::Edit` default (locked down
+        // separately in `src/permissions/types.rs`), so the `Ask`-tier gate
+        // below prompts for it — denying that prompt must mean the wrapped
+        // tool's `execute` body never runs at all.
+        struct PanicsIfCalled;
+        impl Tool for PanicsIfCalled {
+            fn name(&self) -> &str {
+                "fixture__dangerous"
+            }
+            fn description(&self) -> &str {
+                "would do something irreversible if actually called"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _input: &serde_json::Value) -> daimon::Result<ToolOutput> {
+                panic!("must never be reached when the gate denies the call")
+            }
+        }
+
+        let gate = gate_with(
+            PermissionTier::Ask,
+            PermissionDecision::Deny {
+                feedback: "no".into(),
+            },
+        );
+        let tool = GatedTool::new(PanicsIfCalled, gate);
+        let output = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(output.is_error);
+        assert_eq!(output.content, "no");
+    }
+```
+
+- [ ] **Step 3: Run the tests to verify they pass**
 
 Run: `cargo test --lib permissions::types`
 Expected: PASS immediately (5 tests total: the 4 from Phase 2 + this one) — no production code
@@ -1314,57 +1393,87 @@ change is required, since `classify_tool`'s existing `_ => ToolKind::Edit` fallb
 this. If this assertion ever fails after a future change to `classify_tool`, that is exactly the
 regression this test exists to catch.
 
-- [ ] **Step 3: Commit**
+Run: `cargo test --lib agent::gated_tool`
+Expected: PASS (4 tests total: the 3 from Phase 2's Task 6 + this one). This is the actual
+enforcement proof this task's title promises — a namespaced-MCP-shaped tool name, denied by the
+gate, never reaches the wrapped tool's `execute` body, through the exact mechanism (`GatedTool`)
+every real MCP tool call (Task 8) goes through too.
+
+- [ ] **Step 4: Commit**
 
 ```bash
-git add src/permissions/types.rs
-git commit -m "test: lock down that namespaced MCP tool names are never auto-trusted"
+git add src/permissions/types.rs src/agent/gated_tool.rs
+git commit -m "test: lock down that MCP tool calls are never auto-trusted, via GatedTool itself"
 ```
 
 ---
 
-### Task 8: Wire MCP tool discovery into `build_agent` and `run_headless`
+### Task 8: Extend `register_all_tools` with MCP tools; wire discovery into `run_headless`
 
 **Files:**
 - Modify: `src/agent/build.rs`
 - Modify: `src/agent/headless.rs`
 
-- [ ] **Step 1: Write the failing test for `build_agent_with_mcp_tools`**
+This task extends Phase 2's `register_all_tools` **in place** — the exact function Phase 2 defined
+and Phase 4's TUI agent-rebuild path (`build_streaming_agent_with_history`/`rebuild_agent`) also
+calls — rather than introducing a second, competing registration function. This is the whole point
+of that function existing: whichever phase (headless here, TUI in Phase 4) calls
+`register_all_tools` gets the identical, `GatedTool`-wrapped tool set, built-ins and MCP tools
+alike, with no way for the two call sites to drift apart.
+
+- [ ] **Step 1: Write the failing test for the extended `register_all_tools`/new `build_agent_with_mcp_tools`**
 
 Append to `src/agent/build.rs` (implementation above the existing `build_agent`, tests inside the
-existing `mod tests` block):
+existing `mod tests` block). Replace Phase 2's `register_all_tools` (which only took `builder` and
+`gate`) with this MCP-aware version, and add `build_agent_with_mcp_tools` alongside it:
 
 ```rust
 use crate::mcp::tool::NamespacedMcpTool;
 
-/// Builds a `daimon::agent::Agent` wired with the six built-in tools, the
-/// sentinel `__permission_denied` tool, any MCP-server-discovered tools passed
-/// in `mcp_tools`, and a `PermissionMiddleware` backed by `gate`. MCP tools are
-/// registered onto the exact same `AgentBuilder.tool(...)` chain as the
-/// built-ins — there is no separate registry or execution path for them, and
-/// they pass through the identical `PermissionMiddleware` (see
-/// `src/agent/middleware.rs`) before ever executing.
+/// Registers every available tool onto `builder`, each wrapped in
+/// [`crate::agent::gated_tool::GatedTool`] so permission enforcement is
+/// identical for built-ins and MCP tools alike, under both `Agent::prompt` and
+/// `Agent::prompt_stream`. This is the one and only tool-registration function
+/// in the project — Phase 2 defined its non-MCP-aware form first (TDD
+/// progression, since `NamespacedMcpTool` didn't exist yet); this task extends
+/// its *signature* in place to add `mcp_tools`, rather than adding a second
+/// function, so headless mode (`build_agent`/`build_agent_with_mcp_tools`,
+/// below) and the TUI's agent-rebuild path (Phase 4's
+/// `build_streaming_agent_with_history`) can never register a different tool
+/// set from each other.
+pub fn register_all_tools(
+    builder: AgentBuilder,
+    gate: Arc<PermissionGate>,
+    mcp_tools: Vec<NamespacedMcpTool>,
+) -> AgentBuilder {
+    let mut builder = builder
+        .tool(GatedTool::new(ReadFile, gate.clone()))
+        .tool(GatedTool::new(WriteFile, gate.clone()))
+        .tool(GatedTool::new(EditFile, gate.clone()))
+        .tool(GatedTool::new(Bash, gate.clone()))
+        .tool(GatedTool::new(Grep, gate.clone()))
+        .tool(GatedTool::new(Glob, gate.clone()));
+
+    for tool in mcp_tools {
+        builder = builder.tool(GatedTool::new(tool, gate.clone()));
+    }
+
+    builder
+}
+
+/// Builds a `daimon::agent::Agent` wired with the six built-in tools plus any
+/// MCP-server-discovered tools passed in `mcp_tools`, via [`register_all_tools`]
+/// — every tool, built-in or MCP, is `GatedTool`-wrapped there, so there is no
+/// separate registry or enforcement path for MCP tools.
 pub fn build_agent_with_mcp_tools(
     model: SharedModel,
     gate: Arc<PermissionGate>,
     mcp_tools: Vec<NamespacedMcpTool>,
 ) -> daimon::Result<Agent> {
-    let mut builder = AgentBuilder::new()
+    let builder = AgentBuilder::new()
         .shared_model(model)
-        .system_prompt(DEFAULT_SYSTEM_PROMPT)
-        .tool(ReadFile)
-        .tool(WriteFile)
-        .tool(EditFile)
-        .tool(Bash)
-        .tool(Grep)
-        .tool(Glob)
-        .tool(PermissionDeniedTool);
-
-    for tool in mcp_tools {
-        builder = builder.tool(tool);
-    }
-
-    builder.middleware(PermissionMiddleware::new(gate)).build()
+        .system_prompt(DEFAULT_SYSTEM_PROMPT);
+    register_all_tools(builder, gate, mcp_tools).build()
 }
 
 /// Builds an agent with only the six built-in tools (no MCP servers
@@ -1375,9 +1484,12 @@ pub fn build_agent(model: SharedModel, gate: Arc<PermissionGate>) -> daimon::Res
 }
 ```
 
-Remove the old standalone `build_agent` body (the one defined directly with the `AgentBuilder`
-chain in Phase 2's Task 8) — it is replaced by the two functions above, where `build_agent` is now
-a one-line delegator.
+Remove Phase 2's old two-argument `register_all_tools`/`build_agent` bodies (the ones defined
+directly with the `AgentBuilder` chain in Phase 2's Task 8) — they are replaced by the three
+functions above. Update Phase 2's own test module in this same file: every existing call to
+`register_all_tools(builder, gate)` becomes `register_all_tools(builder, gate, Vec::new())` (the two
+call sites are `build_agent`, already updated above, and nowhere else — Phase 2's own tests only
+ever call `build_agent`, never `register_all_tools` directly, so no other test edits are needed here).
 
 Test (add to the existing `mod tests` block in `src/agent/build.rs`):
 
@@ -1405,23 +1517,16 @@ Test (add to the existing `mod tests` block in `src/agent/build.rs`):
         // NamespacedMcpTool itself always wraps a real McpToolBridge (which
         // needs a transport); to keep this test fast and dependency-free we
         // assert the same *shape of contract* — "a plain Tool impl can be
-        // added to the same builder chain build_agent uses" — via a
-        // structurally-identical fake tool rather than standing up an MCP
-        // client. Task 8's headless integration proves the real
-        // NamespacedMcpTool path end to end.
-        let agent = AgentBuilder::new()
+        // wrapped in GatedTool and added to the same register_all_tools
+        // builder chain build_agent uses" — via a structurally-identical fake
+        // tool rather than standing up an MCP client. This task's headless
+        // integration test (below) proves the real NamespacedMcpTool path end
+        // to end.
+        let builder = AgentBuilder::new()
             .shared_model(model)
             .system_prompt(DEFAULT_SYSTEM_PROMPT)
-            .tool(ReadFile)
-            .tool(WriteFile)
-            .tool(EditFile)
-            .tool(Bash)
-            .tool(Grep)
-            .tool(Glob)
-            .tool(PermissionDeniedTool)
-            .tool(FakeMcpTool)
-            .middleware(PermissionMiddleware::new(test_gate()))
-            .build();
+            .tool(GatedTool::new(FakeMcpTool, test_gate()));
+        let agent = register_all_tools(builder, test_gate(), Vec::new()).build();
         assert!(agent.is_ok());
     }
 
@@ -1629,10 +1734,11 @@ git commit -m "feat: discover and register MCP-server tools at headless agent st
     spawned child process (not just an in-process mock) in Task 6.
   - Execution: an MCP tool call is routed through the actual MCP client call
     (`McpToolBridge::execute` → real `tools/call` JSON-RPC, unmodified from `daimon`), and is subject
-    to the identical `PermissionGate`/`PermissionMiddleware` as built-ins — no separate registry, no
-    separate middleware, no bypass path. `classify_tool`'s existing fallback (`_ =>
-    ToolKind::Edit`) already defaults any MCP tool name to "needs permission," locked down by an
-    explicit test in Task 7 with zero production-code change required.
+    to the identical `PermissionGate`/`GatedTool` as built-ins — no separate registry, no separate
+    enforcement mechanism, no bypass path. `classify_tool`'s existing fallback (`_ =>
+    ToolKind::Edit`) already defaults any MCP tool name to "needs permission" (locked down by a test
+    in Task 7), and Task 7 also proves, end to end through `GatedTool::execute`, that a denied
+    MCP-shaped call never reaches the wrapped tool.
   - Graceful degradation: `connect_all` (Task 5) collects per-server failures into
     `McpDiscoveryReport.errors` without ever returning a hard error itself; `run_headless` (Task 8)
     logs each failure to stderr and proceeds to build the agent with whatever tools *did* connect
@@ -1641,15 +1747,22 @@ git commit -m "feat: discover and register MCP-server tools at headless agent st
     success/failure report against a real spawned process (Task 6's
     `connect_all_reports_one_real_success_alongside_one_configured_failure`).
 
-- **Did Phase 2's tool registry need a refactor?** No. `daimon::agent::builder::AgentBuilder::tool<T:
-  Tool + 'static>(self, tool: T)` (confirmed by reading `daimon-0.16.0/src/agent/builder.rs`) is
-  already generic over any concrete `Tool` implementor and can be called any number of times in a
-  loop — which is exactly what registering a runtime-determined number of MCP tools needs. The one
-  addition, `NamespacedMcpTool` (Task 3), exists solely to override the tool *name* (MCP's
-  `McpToolBridge::name()` returns the bare, un-namespaced name) — it is a wrapper around the
-  vendored bridge type, not a new registry mechanism. `build_agent`'s Phase 2 signature is preserved
-  unchanged (it now delegates to the new `build_agent_with_mcp_tools` with an empty tool list), so
-  no Phase-2-era caller breaks.
+- **Did Phase 2's tool registry need a refactor?** No, and neither did its enforcement mechanism.
+  `daimon::agent::builder::AgentBuilder::tool<T: Tool + 'static>(self, tool: T)` (confirmed by
+  reading `daimon-0.16.0/src/agent/builder.rs`) is already generic over any concrete `Tool`
+  implementor and can be called any number of times in a loop — which is exactly what registering a
+  runtime-determined number of MCP tools needs. The one addition, `NamespacedMcpTool` (Task 3),
+  exists solely to override the tool *name* (MCP's `McpToolBridge::name()` returns the bare,
+  un-namespaced name) — it is a wrapper around the vendored bridge type, not a new registry
+  mechanism. `build_agent`'s Phase 2 signature is preserved unchanged (it now delegates to the new
+  `build_agent_with_mcp_tools` with an empty tool list), so no Phase-2-era caller breaks.
+  `register_all_tools`'s signature *is* extended (Task 8, in place — an `mcp_tools` parameter is
+  added), but its callers are only ever within this same codebase (Phase 2's `build_agent`, this
+  plan's `build_agent_with_mcp_tools`, and Phase 4's TUI rebuild path, none of which are "external"
+  callers in the sense a published API would need to worry about), so this is a normal same-repo
+  signature change tracked across phases, not a breaking change to a stable interface. Every tool,
+  built-in or MCP, is wrapped in the identical `GatedTool` before registration — MCP tools get no
+  separate, and therefore no weaker, enforcement path.
 
 - **Placeholder scan:** no `TODO`/`TBD`/`unimplemented!`/"implement later" anywhere in this plan.
   Task 6's fixture-server code sketch (the `serde_json_lite` version) is explicitly labeled
@@ -1662,11 +1775,16 @@ git commit -m "feat: discover and register MCP-server tools at headless agent st
 - **Type consistency:** `McpServerConfig`/`McpTransportConfig`/`McpServersFile`/`load_mcp_servers`
   (Task 1) are defined once and reused verbatim by `connect_one`/`connect_all` (Tasks 4–5) and
   `run_headless` (Task 8). `NamespacedMcpTool` (Task 3) is defined once and reused verbatim by
-  `connect_one` (Task 4) and `build_agent_with_mcp_tools` (Task 8). `McpConnectError`/
+  `connect_one` (Task 4) and `register_all_tools`/`build_agent_with_mcp_tools` (Task 8) — and by
+  Phase 4's TUI agent-rebuild path, which also calls `register_all_tools`. `McpConnectError`/
   `McpDiscoveryReport` (Tasks 4–5) are defined once and reused by `run_headless`'s new
-  `HeadlessError::LoadMcpServers` handling and its test (Task 8). No Phase 1/Phase 2 type
-  (`Paths`, `PermissionGate`, `PermissionMiddleware`, `classify_tool`, `build_agent`) is redefined —
-  each is imported from its original module path.
+  `HeadlessError::LoadMcpServers` handling and its test (Task 8). `GatedTool` (Phase 2) is imported
+  unchanged and used to wrap every `NamespacedMcpTool` before registration (Task 8) — not
+  redefined, not routed through a middleware. `register_all_tools` (Phase 2) has its *signature*
+  extended in place by this plan (Task 8) to add the `mcp_tools` parameter — the function itself,
+  not a competing one, is what both headless and TUI call. No other Phase 1/Phase 2 type (`Paths`,
+  `PermissionGate`, `classify_tool`, `build_agent`) is redefined — each is imported from its original
+  module path.
 
 - **API-compatibility risks worth flagging before implementation starts:**
   1. **`AgentBuilder::tool`/`ToolRegistry::register` silently drops duplicate-named tools.**

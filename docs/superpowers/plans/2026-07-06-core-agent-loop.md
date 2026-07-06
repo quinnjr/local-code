@@ -14,18 +14,32 @@ session persistence — those are later phases.
 `#[tool_fn]`-annotated async functions (`read_file`, `write_file`, `edit_file`, `bash`, `grep`,
 `glob`) are registered into a `daimon::tool::ToolRegistry`-backed `AgentBuilder`. Because
 `#[tool_fn]` generates stateless unit structs, permission enforcement cannot live inside the tool
-bodies — instead a `local_code::permissions::PermissionGate` (tier + project allow/deny list +
-pluggable `PermissionPrompter`) is wired in as a `daimon::middleware::Middleware` that intercepts
-every `ToolCall` before execution. On denial, the middleware rewrites the call to invoke a
-sentinel `PermissionDeniedTool` so the model receives the specific denial reason/feedback as a
-tool result, rather than relying on daimon's generic "skipped by middleware" text. The permission
-*decision* logic (`PermissionGate::check`, `PermissionPrompter` trait) is fully decoupled from how
-a prompt is rendered — a `StdioPrompter` renders it over plain stdin/stdout for this phase; the
-TUI phase later provides an `ntui`-rendering implementation of the same trait with zero changes to
-`PermissionGate`. `local_code::agent::build::build_agent` wires model + tools + middleware into a
-`daimon::agent::Agent`, and `local_code::agent::headless::run_headless` drives one `agent.prompt()`
-call to completion for the `-p` CLI flag, defaulting the permission tier to `full-auto` (overridable
-via `--permission-mode`).
+bodies as originally written by the macro — but it also must not depend on
+`daimon::middleware::Middleware` being invoked, because (as later verified in Phase 3 by reading the
+real vendored `daimon-0.16.0` source, `src/agent/runner.rs`) `Agent::prompt_stream` calls
+`tool.execute_erased(...)` directly and never runs the middleware stack, while `Agent::prompt` does.
+Relying on `Middleware` would therefore silently stop enforcing permissions the moment any caller
+(the TUI, Phase 3) drives the agent via `prompt_stream` instead of `prompt`. This plan instead
+defines the canonical `local_code::agent::gated_tool::GatedTool<T>` — a `daimon::tool::Tool`
+wrapper that consults a `local_code::permissions::PermissionGate` (tier + project allow/deny list +
+pluggable `PermissionPrompter`) *inside its own `execute()`* before delegating to the wrapped tool.
+Because both `Agent::prompt` and `Agent::prompt_stream` call `execute()` (or `execute_erased`,
+which dispatches to the same `execute`) unconditionally, gating works identically under streaming
+and non-streaming — there is exactly one enforcement mechanism, used everywhere, and no
+`daimon::middleware::Middleware` is used anywhere in this plan. The permission *decision* logic
+(`PermissionGate::check`, `PermissionPrompter` trait) is fully decoupled from how a prompt is
+rendered — a `StdioPrompter` renders it over plain stdin/stdout for this phase; the TUI phase later
+provides an `ntui`-rendering implementation of the same trait with zero changes to `PermissionGate`,
+and reuses this exact `GatedTool<T>` (imported, not redefined) for its own streaming agent
+construction. `local_code::agent::build::register_all_tools` is the single function that registers
+every available tool (each wrapped in `GatedTool`) onto an `AgentBuilder`; `build_agent` calls it to
+produce a `daimon::agent::Agent` for the headless path. `register_all_tools` in this phase only
+knows about the six built-ins — Phase 5 (MCP client) later extends its signature in place to also
+register MCP-discovered tools (see this plan's Self-review notes for the explicit follow-up), and
+Phase 4 (TUI rebuild) calls the very same function so the TUI never drifts out of sync with the
+headless path. `local_code::agent::headless::run_headless` drives one `agent.prompt()` call to
+completion for the `-p` CLI flag, defaulting the permission tier to `full-auto` (overridable via
+`--permission-mode`).
 
 **Tech Stack:** Rust 2024 edition, `daimon` 0.16.0 (features `openai`, `ollama`, `macros`), `tokio`
 1.x (`full`), `regex`, `walkdir`, `glob`, `serde_json`, `clap` (derive), `tempfile` (dev-dependency).
@@ -55,8 +69,22 @@ Types/functions later phases will depend on (must be imported verbatim, not rede
   `/permissions` slash command (Phase 3) will read/write through this.
 - `local_code::agent::provider::{build_model, ProviderError}` — the `/model` slash command
   (Phase 3) will call this when switching connections mid-session.
-- `local_code::agent::build::build_agent` — constructs the `daimon::agent::Agent` the TUI phase
-  will drive interactively via `agent.prompt_stream(...)` instead of `agent.prompt(...)`.
+- `local_code::agent::gated_tool::GatedTool` — the *only* permission-enforcement wrapper in the
+  whole project. Defined once, here, and imported verbatim by Phase 3 (its own
+  `build_streaming_agent`), Phase 4 (`build_streaming_agent_with_history`), and Phase 5 (MCP tools
+  are wrapped in `GatedTool<NamespacedMcpTool>` before registration) — never redefined.
+- `local_code::agent::build::register_all_tools` — registers every available tool (each already
+  wrapped in `GatedTool`) onto an `AgentBuilder`. This phase's version only knows about the six
+  built-ins; Phase 5 extends its signature in place to add MCP-discovered tools, and both the
+  headless path (`build_agent`, this phase) and the TUI path (Phase 4's
+  `build_streaming_agent_with_history`/`rebuild_agent`) call this one function so they can never
+  register a different tool set from each other.
+- `local_code::agent::build::build_agent` — constructs the `daimon::agent::Agent` for headless use
+  via `register_all_tools`. The TUI phase builds its own streaming-oriented sibling
+  (`build_streaming_agent`, later `build_streaming_agent_with_history`) that also calls
+  `register_all_tools`, rather than reusing `build_agent` itself (which hardcodes a
+  non-conversation-preserving `AgentBuilder::new()` construction) — but both ultimately register the
+  identical, `GatedTool`-wrapped tool set.
 - `local_code::agent::headless::run_headless` — called directly by the CLI's `-p` flag; the
   session-persistence phase will wrap it to also serialize the resulting `AgentResponse.messages`.
 
@@ -73,9 +101,10 @@ Types/functions later phases will depend on (must be imported verbatim, not rede
 - Create: `src/permissions/stdio.rs` — `StdioPrompter`
 - Create: `src/agent/mod.rs` — re-exports
 - Create: `src/agent/provider.rs` — `build_model`, `ProviderError`
-- Create: `src/agent/tools.rs` — the six `#[tool_fn]` tools + `PermissionDeniedTool`
-- Create: `src/agent/middleware.rs` — `PermissionMiddleware`
-- Create: `src/agent/build.rs` — `build_agent`
+- Create: `src/agent/tools.rs` — the six `#[tool_fn]` tools
+- Create: `src/agent/gated_tool.rs` — `GatedTool<T>` (the canonical, project-wide permission
+  enforcement wrapper)
+- Create: `src/agent/build.rs` — `register_all_tools`, `build_agent`
 - Create: `src/agent/headless.rs` — `run_headless`
 - Modify: `src/cli/mod.rs` — add `-p/--prompt`, `--connection`, `--permission-mode` top-level flags, async `run`
 - Modify: `src/main.rs` — `#[tokio::main] async fn main()`
@@ -140,12 +169,13 @@ pub use stdio::StdioPrompter;
 ```rust
 pub mod provider;
 pub mod tools;
-pub mod middleware;
+pub mod gated_tool;
 pub mod build;
 pub mod headless;
 
 pub use provider::{build_model, ProviderError};
-pub use build::build_agent;
+pub use gated_tool::GatedTool;
+pub use build::{build_agent, register_all_tools};
 pub use headless::run_headless;
 ```
 
@@ -184,9 +214,9 @@ plan, all within this same session — no task is left unfinished at the end of 
 //! Built-in tools, filled in by Task 7.
 ```
 
-`src/agent/middleware.rs`:
+`src/agent/gated_tool.rs`:
 ```rust
-//! Permission-enforcing daimon Middleware, filled in by Task 6.
+//! The canonical permission-gated Tool wrapper, filled in by Task 6.
 ```
 
 `src/agent/build.rs`:
@@ -1142,125 +1172,71 @@ git commit -m "feat: add StdioPrompter for plain-terminal permission prompts"
 
 ---
 
-### Task 6: `PermissionMiddleware` — wiring the gate into the ReAct loop
+### Task 6: `GatedTool<T>` — the canonical, streaming-safe permission enforcement wrapper
 
 **Files:**
-- Modify: `src/agent/tools.rs` (add `PermissionDeniedTool` only — the rest of Task 7's tools come later)
-- Create: `src/agent/middleware.rs`
+- Create: `src/agent/gated_tool.rs`
 
-- [ ] **Step 1: Add `PermissionDeniedTool` to `src/agent/tools.rs`**
+This is the *one* permission-enforcement mechanism used everywhere in the project — headless
+(`Agent::prompt`, this phase), the TUI (`Agent::prompt_stream`, Phase 3), and MCP tools (Phase 5).
+It embeds the permission check *inside* each tool's own `execute()`, rather than relying on
+`daimon::middleware::Middleware`. This is a deliberate, verified choice, not an oversight: reading
+the real vendored `daimon-0.16.0` source (`src/agent/runner.rs`) shows that `Agent::prompt_stream`
+calls `tool.execute_erased(...)` directly and never runs the `Middleware` stack, while `Agent::prompt`
+does. A `Middleware`-based approach would therefore enforce permissions under `prompt` but silently
+do nothing under `prompt_stream` — exactly the kind of two-mechanisms-that-can-drift-apart risk this
+plan avoids by having exactly one mechanism, reused by every later phase without modification.
 
-Replace the Task 1 placeholder content of `src/agent/tools.rs` with:
-
-```rust
-//! Built-in tools. The six `#[tool_fn]` tools are added in Task 7; this file
-//! starts with the sentinel `PermissionDeniedTool` used by `PermissionMiddleware`
-//! to relay a denial reason back to the model as a normal tool result.
-
-use daimon::tool::{Tool, ToolOutput};
-
-/// Registered under the name `__permission_denied`. `PermissionMiddleware` rewrites
-/// a denied `ToolCall` to invoke this tool instead of the originally-requested one,
-/// with `{"message": "<reason>"}` as its arguments, so the model receives the
-/// specific denial reason/feedback as the tool result content rather than daimon's
-/// generic "skipped by middleware" text (which carries no information).
-pub struct PermissionDeniedTool;
-
-impl Tool for PermissionDeniedTool {
-    fn name(&self) -> &str {
-        "__permission_denied"
-    }
-
-    fn description(&self) -> &str {
-        "Internal sentinel tool used to relay permission denials. Not intended to be called by the model directly."
-    }
-
-    fn parameters_schema(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "message": { "type": "string" }
-            },
-            "required": ["message"]
-        })
-    }
-
-    async fn execute(&self, input: &serde_json::Value) -> daimon::Result<ToolOutput> {
-        let message = input
-            .get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("permission denied")
-            .to_string();
-        Ok(ToolOutput::error(message))
-    }
-}
-
-#[cfg(test)]
-mod permission_denied_tool_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn echoes_the_denial_message_as_an_error_output() {
-        let tool = PermissionDeniedTool;
-        let output = tool
-            .execute(&serde_json::json!({"message": "user declined: use a temp file instead"}))
-            .await
-            .unwrap();
-        assert!(output.is_error);
-        assert_eq!(output.content, "user declined: use a temp file instead");
-    }
-
-    #[tokio::test]
-    async fn falls_back_to_default_message_when_missing() {
-        let tool = PermissionDeniedTool;
-        let output = tool.execute(&serde_json::json!({})).await.unwrap();
-        assert!(output.is_error);
-        assert_eq!(output.content, "permission denied");
-    }
-}
-```
-
-- [ ] **Step 2: Run the tests to verify they fail, then pass**
-
-Run: `cargo test --lib agent::tools`
-Expected: PASS (2 tests).
-
-- [ ] **Step 3: Write the failing test for `PermissionMiddleware`**
+- [ ] **Step 1: Write the failing test**
 
 ```rust
-// src/agent/middleware.rs
+// src/agent/gated_tool.rs
 
 use std::sync::Arc;
 
-use daimon::middleware::{Middleware, MiddlewareAction};
-use daimon::tool::ToolCall;
+use daimon::tool::{Tool, ToolOutput};
 
 use crate::permissions::gate::{CheckOutcome, PermissionGate};
 
-/// A `daimon::middleware::Middleware` that consults a [`PermissionGate`] before
-/// every tool call. On denial, it rewrites the call to invoke
-/// `crate::agent::tools::PermissionDeniedTool` (registered as `__permission_denied`)
-/// with the denial reason, so the model sees exactly why the call didn't happen
-/// instead of daimon's generic "skipped by middleware" placeholder text.
-pub struct PermissionMiddleware {
+/// Wraps any `daimon::tool::Tool` so its own `execute` consults a
+/// [`PermissionGate`] before doing real work. Both `daimon::agent::Agent::prompt`
+/// and `Agent::prompt_stream` call a tool's `execute`/`execute_erased` to run it,
+/// so embedding the check here (rather than in a `daimon::middleware::Middleware`,
+/// which `prompt_stream` never invokes — confirmed by reading
+/// `daimon-0.16.0/src/agent/runner.rs`) makes permission enforcement work
+/// identically no matter which of the two the caller uses. This is the single
+/// enforcement mechanism for the whole project: headless mode (this phase's
+/// `build_agent`/`register_all_tools`), the TUI (Phase 3's `build_streaming_agent`),
+/// and MCP tools (Phase 5's `NamespacedMcpTool`, wrapped exactly like a built-in)
+/// all wrap every tool in `GatedTool` before registering it.
+pub struct GatedTool<T> {
+    inner: T,
     gate: Arc<PermissionGate>,
 }
 
-impl PermissionMiddleware {
-    pub fn new(gate: Arc<PermissionGate>) -> Self {
-        Self { gate }
+impl<T: Tool> GatedTool<T> {
+    pub fn new(inner: T, gate: Arc<PermissionGate>) -> Self {
+        Self { inner, gate }
     }
 }
 
-impl Middleware for PermissionMiddleware {
-    async fn on_tool_call(&self, call: &mut ToolCall) -> daimon::Result<MiddlewareAction> {
-        match self.gate.check(&call.name, &call.arguments).await {
-            CheckOutcome::Allowed => Ok(MiddlewareAction::Continue),
-            CheckOutcome::Denied(reason) => {
-                call.name = "__permission_denied".to_string();
-                call.arguments = serde_json::json!({ "message": reason });
-                Ok(MiddlewareAction::Continue)
-            }
+impl<T: Tool> Tool for GatedTool<T> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    async fn execute(&self, input: &serde_json::Value) -> daimon::Result<ToolOutput> {
+        match self.gate.check(self.inner.name(), input).await {
+            CheckOutcome::Allowed => self.inner.execute(input).await,
+            CheckOutcome::Denied(reason) => Ok(ToolOutput::error(reason)),
         }
     }
 }
@@ -1268,6 +1244,7 @@ impl Middleware for PermissionMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tools::{Bash, ReadFile, WriteFile};
     use crate::permissions::settings::PermissionSettings;
     use crate::permissions::types::{PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier};
     use std::future::Future;
@@ -1276,7 +1253,6 @@ mod tests {
     struct StubPrompter {
         decision: PermissionDecision,
     }
-
     impl PermissionPrompter for StubPrompter {
         fn prompt<'a>(
             &'a self,
@@ -1287,86 +1263,96 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn allowed_call_passes_through_unchanged() {
-        let gate = Arc::new(PermissionGate::new(
-            PermissionTier::FullAuto,
+    fn gate_with(tier: PermissionTier, decision: PermissionDecision) -> Arc<PermissionGate> {
+        Arc::new(PermissionGate::new(
+            tier,
             PermissionSettings::default(),
-            Arc::new(StubPrompter {
-                decision: PermissionDecision::Allow,
-            }),
-        ));
-        let mw = PermissionMiddleware::new(gate);
-
-        let mut call = ToolCall {
-            id: "1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({"command": "ls"}),
-        };
-        let action = mw.on_tool_call(&mut call).await.unwrap();
-        assert!(matches!(action, MiddlewareAction::Continue));
-        assert_eq!(call.name, "bash");
+            Arc::new(StubPrompter { decision }),
+        ))
     }
 
     #[tokio::test]
-    async fn denied_call_is_rewritten_to_permission_denied_tool() {
-        let gate = Arc::new(PermissionGate::new(
+    async fn read_only_gated_tool_never_prompts_and_executes() {
+        let gate = gate_with(
             PermissionTier::Ask,
-            PermissionSettings::default(),
-            Arc::new(StubPrompter {
-                decision: PermissionDecision::Deny {
-                    feedback: "do not delete files".into(),
-                },
-            }),
-        ));
-        let mw = PermissionMiddleware::new(gate);
-
-        let mut call = ToolCall {
-            id: "1".into(),
-            name: "bash".into(),
-            arguments: serde_json::json!({"command": "rm file.txt"}),
-        };
-        let action = mw.on_tool_call(&mut call).await.unwrap();
-        assert!(matches!(action, MiddlewareAction::Continue));
-        assert_eq!(call.name, "__permission_denied");
-        assert_eq!(call.arguments["message"], "do not delete files");
+            PermissionDecision::Deny {
+                feedback: "should never be reached".into(),
+            },
+        );
+        let tool = GatedTool::new(ReadFile, gate);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.txt");
+        std::fs::write(&file, "hello").unwrap();
+        let output = tool
+            .execute(&serde_json::json!({"path": file.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.content, "hello");
     }
 
     #[tokio::test]
-    async fn read_only_tool_never_consults_prompter() {
-        let gate = Arc::new(PermissionGate::new(
+    async fn denied_edit_tool_never_touches_the_filesystem() {
+        let gate = gate_with(
             PermissionTier::Ask,
-            PermissionSettings::default(),
-            Arc::new(StubPrompter {
-                decision: PermissionDecision::Deny {
-                    feedback: "should never be reached".into(),
-                },
-            }),
-        ));
-        let mw = PermissionMiddleware::new(gate);
+            PermissionDecision::Deny {
+                feedback: "no thanks".into(),
+            },
+        );
+        let tool = GatedTool::new(WriteFile, gate);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("out.txt");
+        let output = tool
+            .execute(&serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "content": "should not be written"
+            }))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert_eq!(output.content, "no thanks");
+        assert!(!file.exists());
+    }
 
-        let mut call = ToolCall {
-            id: "1".into(),
-            name: "read_file".into(),
-            arguments: serde_json::json!({"path": "x"}),
-        };
-        let action = mw.on_tool_call(&mut call).await.unwrap();
-        assert!(matches!(action, MiddlewareAction::Continue));
-        assert_eq!(call.name, "read_file");
+    #[tokio::test]
+    async fn allowed_bash_tool_executes() {
+        let gate = gate_with(PermissionTier::FullAuto, PermissionDecision::Allow);
+        let tool = GatedTool::new(Bash, gate);
+        let output = tool
+            .execute(&serde_json::json!({"command": "echo gated_ok"}))
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert!(output.content.contains("gated_ok"));
     }
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they fail, then pass**
+Note: this task's tests reference `crate::agent::tools::{Bash, ReadFile, WriteFile}`, which are
+defined by Task 7 — write this task's test module after Task 7's tools exist (swap the order in
+which you make these two tasks' tests pass if your workflow prefers tools before gating; the
+plan lists `GatedTool` first only because Task 8 needs both).
 
-Run: `cargo test --lib agent::middleware`
-Expected: replace the Task 1 placeholder with the content above; then PASS (3 tests).
+- [ ] **Step 2: Run the tests to verify they fail**
 
-- [ ] **Step 5: Commit**
+Run: `cargo test --lib agent::gated_tool`
+Expected: FAIL to compile — replace the Task 1 placeholder with the content above. If `agent::tools`
+is not yet implemented (Task 7 not yet done), implement Task 7 first, then return to this step.
+
+- [ ] **Step 3: Run the tests to verify they pass**
+
+Run: `cargo test --lib agent::gated_tool`
+Expected: PASS (3 tests). This is the load-bearing proof that permission enforcement survives
+regardless of which `daimon::agent::Agent` entry point (`prompt` or `prompt_stream`) a caller uses —
+`denied_edit_tool_never_touches_the_filesystem` in particular is the exact assertion Phase 3 will
+later re-run (unchanged, just imported) against `Agent::prompt_stream` to prove the same guarantee
+holds under streaming.
+
+- [ ] **Step 4: Commit**
 
 ```bash
-git add src/agent/tools.rs src/agent/middleware.rs
-git commit -m "feat: enforce permissions via a daimon Middleware layer"
+git add src/agent/gated_tool.rs
+git commit -m "feat: add GatedTool, the one permission-enforcement wrapper used by every phase"
 ```
 
 ---
@@ -1376,11 +1362,17 @@ git commit -m "feat: enforce permissions via a daimon Middleware layer"
 **Files:**
 - Modify: `src/agent/tools.rs`
 
-- [ ] **Step 1: Write the failing tests, appended to `src/agent/tools.rs`**
+- [ ] **Step 1: Write the failing tests, replacing the Task 1 placeholder in `src/agent/tools.rs`**
 
-Append below the existing `PermissionDeniedTool` content (do not remove it):
+Replace the whole file's content (there is nothing to preserve — Task 1's placeholder is just a doc
+comment):
 
 ```rust
+//! Built-in tools: the six `#[tool_fn]`-annotated functions below. Permission
+//! enforcement does not live in these bodies — see `crate::agent::gated_tool::GatedTool`,
+//! which wraps each of these before registration.
+
+use daimon::tool::ToolOutput;
 use daimon::tool_fn;
 
 /// Reads the full contents of a file at `path` (absolute or relative to the
@@ -1772,7 +1764,10 @@ proceed to Step 3.
 - [ ] **Step 3: Run the tests to verify they pass**
 
 Run: `cargo test --lib agent::tools`
-Expected: PASS (12 new tests + the 2 from Task 6 = 14 total in this module).
+Expected: PASS (12 tests in this module). Task 6's `GatedTool` tests, in
+`src/agent/gated_tool.rs`, import `ReadFile`/`WriteFile`/`Bash` from here — run
+`cargo test --lib agent::gated_tool` too once both tasks are done, to confirm those 3 tests also
+pass.
 
 - [ ] **Step 4: Commit**
 
@@ -1783,10 +1778,17 @@ git commit -m "feat: add read_file/write_file/edit_file/bash/grep/glob built-in 
 
 ---
 
-### Task 8: `build_agent` — wiring model, tools, and permission middleware together
+### Task 8: `register_all_tools`/`build_agent` — wiring model and `GatedTool`-wrapped tools together
 
 **Files:**
 - Create: `src/agent/build.rs`
+
+`register_all_tools` is the single shared function that registers every available tool onto an
+`AgentBuilder`. In this phase it only knows about the six built-ins (wrapped in `GatedTool`); Phase
+5 (MCP client) later extends its signature in place to also register MCP-discovered tools (see this
+plan's Self-review notes), and Phase 4 (TUI slash commands/persistence) calls this exact function
+from its own agent-rebuild path (`build_streaming_agent_with_history`) so the TUI and headless mode
+can never register a different tool set from each other.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1798,8 +1800,8 @@ use std::sync::Arc;
 use daimon::agent::{Agent, AgentBuilder};
 use daimon::model::SharedModel;
 
-use crate::agent::middleware::PermissionMiddleware;
-use crate::agent::tools::{Bash, EditFile, Glob, Grep, PermissionDeniedTool, ReadFile, WriteFile};
+use crate::agent::gated_tool::GatedTool;
+use crate::agent::tools::{Bash, EditFile, Glob, Grep, ReadFile, WriteFile};
 use crate::permissions::gate::PermissionGate;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are local-code, a coding assistant that talks only to \
@@ -1808,24 +1810,33 @@ search the codebase via your tools. Prefer edit_file for targeted changes over r
 files with write_file. Always explain what you're about to do before calling a tool that changes \
 the filesystem or runs a command.";
 
-/// Builds a `daimon::agent::Agent` wired with the six built-in tools, the sentinel
-/// `__permission_denied` tool, and a `PermissionMiddleware` backed by `gate`. This
-/// registry is intentionally append-only/generic (a plain `AgentBuilder`, not a
-/// hardcoded tool list baked into some larger type) so a later MCP-client phase can
-/// register additional tools onto the same builder before calling `.build()`.
+/// Registers every available tool onto `builder`, each wrapped in
+/// [`GatedTool`] so permission enforcement works identically whether the
+/// resulting `Agent` is later driven via `prompt` or `prompt_stream`. This
+/// phase's version registers only the six built-ins; Phase 5 (MCP client)
+/// extends this function's signature in place to add MCP-discovered tools
+/// (each also `GatedTool`-wrapped) — see this plan's Self-review notes for the
+/// explicit follow-up this leaves. Both the headless path (`build_agent`,
+/// below) and the TUI path (Phase 4's `build_streaming_agent_with_history`)
+/// call this one function, so they never drift apart.
+pub fn register_all_tools(builder: AgentBuilder, gate: Arc<PermissionGate>) -> AgentBuilder {
+    builder
+        .tool(GatedTool::new(ReadFile, gate.clone()))
+        .tool(GatedTool::new(WriteFile, gate.clone()))
+        .tool(GatedTool::new(EditFile, gate.clone()))
+        .tool(GatedTool::new(Bash, gate.clone()))
+        .tool(GatedTool::new(Grep, gate.clone()))
+        .tool(GatedTool::new(Glob, gate))
+}
+
+/// Builds a `daimon::agent::Agent` wired with the six `GatedTool`-wrapped
+/// built-in tools via [`register_all_tools`]. No `daimon::middleware::Middleware`
+/// is used anywhere — see `src/agent/gated_tool.rs` for why.
 pub fn build_agent(model: SharedModel, gate: Arc<PermissionGate>) -> daimon::Result<Agent> {
-    AgentBuilder::new()
+    let builder = AgentBuilder::new()
         .shared_model(model)
-        .system_prompt(DEFAULT_SYSTEM_PROMPT)
-        .tool(ReadFile)
-        .tool(WriteFile)
-        .tool(EditFile)
-        .tool(Bash)
-        .tool(Grep)
-        .tool(Glob)
-        .tool(PermissionDeniedTool)
-        .middleware(PermissionMiddleware::new(gate))
-        .build()
+        .system_prompt(DEFAULT_SYSTEM_PROMPT);
+    register_all_tools(builder, gate).build()
 }
 
 #[cfg(test)]
@@ -1912,7 +1923,7 @@ manually, then re-run.
 
 ```bash
 git add src/agent/build.rs Cargo.toml Cargo.lock
-git commit -m "feat: wire model, built-in tools, and permission middleware into an Agent"
+git commit -m "feat: wire model and GatedTool-wrapped built-in tools into an Agent via register_all_tools"
 ```
 
 ---
@@ -2463,10 +2474,11 @@ git commit -m "test: add ignored live integration tests against real OpenAI-comp
     allow/deny list is still consulted even at `full-auto` (`PermissionGate::check` checks
     `always_deny` before considering tier — Task 4).
   - Explicitly out of scope and not touched: TUI/`ntui` (Task list never imports `ntui`), slash
-    commands, MCP tool wiring (though `build_agent` uses a plain `AgentBuilder.tool(...)` chain
-    that a later phase can extend before `.build()`, per the plan's constraint), session
-    persistence/`/compact`/`/resume`, and AGENTS.md/CLAUDE.md loading (headless mode uses one
-    hardcoded system prompt string, called out explicitly in Task 9 and the traceability section).
+    commands, MCP tool wiring (though `register_all_tools`, Task 8, is a plain function taking an
+    `AgentBuilder` that Phase 5 extends in place to register MCP-discovered tools too — see the
+    explicit Phase-5 follow-up note below), session persistence/`/compact`/`/resume`, and
+    AGENTS.md/CLAUDE.md loading (headless mode uses one hardcoded system prompt string, called out
+    explicitly in Task 9 and the traceability section).
 
 - **No placeholders:** every `todo!()`/stub is confined to Task 1's scaffolding step and is fully
   replaced by the corresponding task's implementation later in this same plan (Task 1 Step 6
@@ -2476,33 +2488,50 @@ git commit -m "test: add ignored live integration tests against real OpenAI-comp
 
 - **Type consistency:** `PermissionTier`, `ToolKind`, `classify_tool`, `PermissionDecision`,
   `PermissionRequest`, `PermissionPrompter` (Task 3) are defined once and reused verbatim by
-  `PermissionGate` (Task 4), `StdioPrompter` (Task 5), `PermissionMiddleware` (Task 6), and the CLI
+  `PermissionGate` (Task 4), `StdioPrompter` (Task 5), `GatedTool` (Task 6), and the CLI
   (Task 10). `PermissionSettings`/`SettingsFile`/`load_settings` (Task 3) are reused by
   `PermissionGate::new` (Task 4) and `run_headless` (Task 9). `build_model`/`ProviderError` (Task
-  2) are reused by `run_headless` (Task 9) and both live integration tests (Task 11). `build_agent`
-  (Task 8) is reused by `run_headless` (Task 9) and both live integration tests (Task 11). All
-  imports of Phase 1 types (`Paths`, `Connection`, `ProviderKind`, `ConnectionsFile`,
-  `load_connections`, `SecretStore`) match the exact names/paths defined in
-  `docs/superpowers/plans/2026-07-06-foundation-config-connections.md` with no redefinition.
+  2) are reused by `run_headless` (Task 9) and both live integration tests (Task 11). `GatedTool`
+  (Task 6) is reused verbatim by Phase 3 (`build_streaming_agent`), Phase 4
+  (`build_streaming_agent_with_history`), and Phase 5 (MCP tools). `register_all_tools`/`build_agent`
+  (Task 8) are reused by `run_headless` (Task 9), both live integration tests (Task 11), Phase 4's
+  TUI agent-rebuild path, and Phase 5's MCP-tool wiring — all of these import `register_all_tools`
+  rather than reimplementing the tool-registration loop. All imports of Phase 1 types (`Paths`,
+  `Connection`, `ProviderKind`, `ConnectionsFile`, `load_connections`, `SecretStore`) match the exact
+  names/paths defined in `docs/superpowers/plans/2026-07-06-foundation-config-connections.md` with no
+  redefinition.
+
+- **Follow-up this plan explicitly leaves for Phase 5 (do not silently forget):**
+  `register_all_tools` (Task 8) as defined in this phase only registers the six built-in tools — it
+  has no way to know about MCP servers yet, since `local_code::mcp::tool::NamespacedMcpTool` and
+  `local_code::mcp::connect::connect_all` are Phase 5 types that don't exist during this phase's
+  implementation. Phase 5's own plan (`docs/superpowers/plans/2026-07-06-mcp-client.md`) must extend
+  `register_all_tools`'s signature *in place* (add an `mcp_tools: Vec<NamespacedMcpTool>` parameter,
+  wrap each in `GatedTool` exactly like the built-ins) rather than introduce a second, competing
+  registration function — this is called out explicitly in Phase 5's own Task 8, which is the task
+  that must land before this follow-up is considered resolved. Until Phase 5 is implemented,
+  `register_all_tools`/`build_agent` only ever produce an agent with the six built-ins, which is
+  correct and complete for this phase's own scope (headless mode with no MCP servers configured).
 
 - **API-compatibility risks worth flagging before implementation starts:**
-  1. **`#[tool_fn]` generates zero-field unit structs.** This is why permission enforcement could
-     not live inside tool bodies and had to be implemented as `daimon::middleware::Middleware`
-     instead — this is a real constraint of the vendored macro (confirmed by reading
-     `daimon-macros-0.16.0/src/lib.rs`), not a simplification of choice.
-  2. **`Middleware::on_tool_call`'s `ShortCircuit` path discards its payload.** Reading
-     `daimon-0.16.0/src/agent/runner.rs`'s `execute_tools_parallel`, a `MiddlewareAction::ShortCircuit(_)`
-     returned from `on_tool_call` is *ignored* — the tool call is always replaced with the literal
-     text `"skipped by middleware"` regardless of what the middleware returned. This plan avoids
-     that path entirely and instead has `PermissionMiddleware` return `Continue` after *rewriting*
-     the `ToolCall` to target the sentinel `__permission_denied` tool, which is how the actual
-     denial reason reaches the model. If a future `daimon` upgrade changes this behavior, revisit
-     `src/agent/middleware.rs`.
-  3. **No connection/timeout-tuning surface exposed yet.** `daimon`'s `OpenAi`/`Ollama` providers
+  1. **`#[tool_fn]` generates zero-field unit structs.** This is why permission enforcement cannot
+     live inside the macro-generated struct's own definition — it has to be layered on top via a
+     wrapper type instead. This is a real constraint of the vendored macro (confirmed by reading
+     `daimon-macros-0.16.0/src/lib.rs`), not a simplification of choice. `GatedTool<T>` (Task 6) is
+     that wrapper, and is deliberately *not* implemented as a `daimon::middleware::Middleware`: reading
+     `daimon-0.16.0/src/agent/runner.rs` confirms `Agent::prompt_stream` calls
+     `tool.execute_erased(...)` directly and never runs the `Middleware` stack (only `Agent::prompt`
+     does), and separately, a `MiddlewareAction::ShortCircuit(_)` returned from `on_tool_call` is
+     *ignored* by `execute_tools_parallel` — the call is always replaced with the literal text
+     `"skipped by middleware"` regardless of what the middleware returned, discarding any real denial
+     reason. Both of these are real defects in relying on `Middleware` for this purpose, and both are
+     why this plan uses `GatedTool` (embedding the check inside `execute()`, which every code path
+     calls) instead, uniformly, everywhere.
+  2. **No connection/timeout-tuning surface exposed yet.** `daimon`'s `OpenAi`/`Ollama` providers
      support `with_timeout`/`with_max_retries`/`with_keep_alive`, but this plan's `build_model`
      doesn't expose them (no such fields exist on Phase 1's `Connection` type). Fine for v1; a
      later phase should extend `Connection` if per-connection timeout tuning becomes necessary.
-  4. **`OpenAi::with_api_key` always sends an `Authorization: Bearer <key>` header**, even when
+  3. **`OpenAi::with_api_key` always sends an `Authorization: Bearer <key>` header**, even when
      `key` is an empty string (Task 2's `build_model` passes `api_key.unwrap_or_default()`).
      Confirmed via `daimon-0.16.0/src/model/openai.rs`: the header is unconditional. Most local
      servers ignore an empty/absent bearer token, but this is worth knowing if a specific backend
