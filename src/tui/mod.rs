@@ -7,5 +7,4 @@ pub mod gated_tool;
 pub mod permission_prompter;
 pub mod state;
 
-// TODO(task 7): re-enable once Task 7 lands
-// pub use app::{App, AppProps};
+pub use app::{App, AppProps};
