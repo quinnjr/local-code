@@ -126,6 +126,28 @@ fn load_one(path: &Path) -> Result<ConnectionsFile, ConnectionsError> {
     })
 }
 
+/// Overwrites the project-level connections.toml with exactly `connections`.
+/// Used by `connections remove` — removal always targets the project-level file
+/// since that's the file this CLI writes to (user-level file is hand-edited or
+/// written by `connections add` when the user chooses to save it there).
+pub fn save_connections(
+    dir: &Path,
+    connections: &[Connection],
+) -> Result<(), ConnectionsError> {
+    fs::create_dir_all(dir).map_err(|source| ConnectionsError::Read {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    let file = ConnectionsFile {
+        connections: connections.to_vec(),
+    };
+    let text = toml::to_string_pretty(&file).expect("Connection serializes without error");
+    fs::write(dir.join("connections.toml"), text).map_err(|source| ConnectionsError::Read {
+        path: dir.to_path_buf(),
+        source,
+    })
+}
+
 #[cfg(test)]
 mod merge_tests {
     use super::*;
@@ -206,5 +228,20 @@ default_model = "m2"
         let project_dir = tempdir().unwrap();
         let connections = load_connections(user_dir.path(), project_dir.path()).unwrap();
         assert!(connections.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = tempdir().unwrap();
+        let conn = Connection {
+            name: "roundtrip".into(),
+            provider: ProviderKind::OpenAiCompatible,
+            base_url: "http://localhost:8000/v1".into(),
+            default_model: "m".into(),
+            models: vec![],
+        };
+        save_connections(dir.path(), &[conn.clone()]).unwrap();
+        let loaded = load_connections(Path::new("/nonexistent"), dir.path()).unwrap();
+        assert_eq!(loaded, vec![conn]);
     }
 }
