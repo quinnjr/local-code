@@ -4,3 +4,4 @@ pub mod permissions;
 pub mod agent;
 pub mod memory;
 pub mod tui;
+pub mod mcp;
