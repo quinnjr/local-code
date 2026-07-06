@@ -1,7 +1,7 @@
-use crate::config::connection::{load_connections, save_connections, Connection};
+use crate::config::connection::{load_connections, save_connections, Connection, ProviderKind};
 use crate::config::paths::Paths;
 use crate::config::secrets::SecretStore;
-use std::io::Write;
+use std::io::{BufRead, Write};
 
 pub fn list<W: Write>(paths: &Paths, mut out: W) -> anyhow::Result<()> {
     let connections =
@@ -40,10 +40,65 @@ pub fn remove<W: Write>(paths: &Paths, name: &str, mut out: W) -> anyhow::Result
     Ok(())
 }
 
+pub fn add<R: BufRead, W: Write>(
+    paths: &Paths,
+    mut input: R,
+    mut out: W,
+) -> anyhow::Result<Connection> {
+    write!(out, "Connection name: ")?;
+    out.flush()?;
+    let name = read_line(&mut input)?;
+
+    write!(out, "Provider type (1=openai-compatible, 2=ollama): ")?;
+    out.flush()?;
+    let provider = match read_line(&mut input)?.trim() {
+        "2" => ProviderKind::Ollama,
+        _ => ProviderKind::OpenAiCompatible,
+    };
+
+    write!(out, "Base URL: ")?;
+    out.flush()?;
+    let base_url = read_line(&mut input)?;
+
+    write!(out, "Default model: ")?;
+    out.flush()?;
+    let default_model = read_line(&mut input)?;
+
+    write!(out, "API key (leave blank if none): ")?;
+    out.flush()?;
+    let api_key = read_line(&mut input)?;
+
+    let connection = Connection {
+        name,
+        provider,
+        base_url,
+        default_model,
+        models: vec![],
+    };
+
+    let mut connections =
+        load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
+    connections.retain(|c| c.name != connection.name);
+    connections.push(connection.clone());
+    save_connections(&paths.project_config_dir, &connections)?;
+
+    if !api_key.is_empty() {
+        SecretStore::set_api_key(&connection.name, &api_key)?;
+    }
+
+    writeln!(out, "Saved connection '{}'.", connection.name)?;
+    Ok(connection)
+}
+
+fn read_line<R: BufRead>(input: &mut R) -> anyhow::Result<String> {
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::connection::ProviderKind;
     use std::sync::Once;
     use tempfile::tempdir;
 
@@ -130,5 +185,45 @@ mod tests {
         let mut out = Vec::new();
         remove(&paths, "does-not-exist", &mut out).unwrap();
         assert!(String::from_utf8(out).unwrap().contains("No connection named"));
+    }
+
+    #[test]
+    fn add_writes_connection_and_key_from_transcript() {
+        use_mock_keyring();
+        let dir = tempdir().unwrap();
+        let paths = test_paths(dir.path());
+
+        let transcript = "local-vllm\n1\nhttp://localhost:8000/v1\nqwen2.5-coder-32b\nsk-test-789\n";
+        let mut out = Vec::new();
+        let connection = add(&paths, transcript.as_bytes(), &mut out).unwrap();
+
+        assert_eq!(connection.name, "local-vllm");
+        assert_eq!(connection.provider, ProviderKind::OpenAiCompatible);
+        assert_eq!(connection.base_url, "http://localhost:8000/v1");
+        assert_eq!(connection.default_model, "qwen2.5-coder-32b");
+
+        let saved = load_connections(&paths.user_config_dir, &paths.project_config_dir).unwrap();
+        assert_eq!(saved, vec![connection.clone()]);
+        assert_eq!(
+            SecretStore::get_api_key(&connection.name).unwrap(),
+            Some("sk-test-789".to_string())
+        );
+    }
+
+    #[test]
+    fn add_with_blank_api_key_stores_no_secret() {
+        use_mock_keyring();
+        let dir = tempdir().unwrap();
+        let paths = test_paths(dir.path());
+
+        let transcript = "home-ollama\n2\nhttp://localhost:11434\nllama3.1\n\n";
+        let mut out = Vec::new();
+        let connection = add(&paths, transcript.as_bytes(), &mut out).unwrap();
+
+        assert_eq!(connection.provider, ProviderKind::Ollama);
+        assert_eq!(
+            SecretStore::get_api_key(&connection.name).unwrap(),
+            None
+        );
     }
 }
