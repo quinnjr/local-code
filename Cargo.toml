@@ -1,0 +1,8 @@
+[package]
+name = "local-code"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ntui = "0.1.0"
+ntui-macros = "0.1.0"
