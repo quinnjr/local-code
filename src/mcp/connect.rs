@@ -75,6 +75,35 @@ pub async fn connect_one(
         .collect())
 }
 
+/// The outcome of attempting to connect to every configured MCP server:
+/// every tool successfully discovered (already namespaced), plus one
+/// [`McpConnectError`] per server that failed. A failure here is never fatal —
+/// callers register `tools` and separately log/report `errors`, so one
+/// misconfigured or offline server doesn't take down the built-in tools or any
+/// other, working, MCP server.
+pub struct McpDiscoveryReport {
+    pub tools: Vec<NamespacedMcpTool>,
+    pub errors: Vec<McpConnectError>,
+}
+
+/// Connects to every server in `configs`, collecting successes and failures
+/// independently. Servers are attempted concurrently.
+pub async fn connect_all(configs: &[McpServerConfig]) -> McpDiscoveryReport {
+    let attempts = configs.iter().map(connect_one);
+    let results = futures::future::join_all(attempts).await;
+
+    let mut tools = Vec::new();
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok(discovered) => tools.extend(discovered),
+            Err(e) => errors.push(e),
+        }
+    }
+
+    McpDiscoveryReport { tools, errors }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +132,45 @@ mod tests {
         };
         let result = connect_one(&config).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn one_broken_server_does_not_prevent_others_from_being_reported() {
+        let configs = vec![
+            McpServerConfig {
+                name: "broken-a".into(),
+                transport: McpTransportConfig::Stdio {
+                    command: "definitely-not-a-real-mcp-server-binary-xyz".into(),
+                    args: vec![],
+                },
+            },
+            McpServerConfig {
+                name: "broken-b".into(),
+                transport: McpTransportConfig::Http {
+                    url: "http://127.0.0.1:1".into(),
+                    headers: Default::default(),
+                },
+            },
+        ];
+
+        let report = connect_all(&configs).await;
+        assert!(report.tools.is_empty());
+        assert_eq!(report.errors.len(), 2);
+        let failed_names: Vec<_> = report
+            .errors
+            .iter()
+            .map(|e| match e {
+                McpConnectError::Connect { server, .. } => server.as_str(),
+            })
+            .collect();
+        assert!(failed_names.contains(&"broken-a"));
+        assert!(failed_names.contains(&"broken-b"));
+    }
+
+    #[tokio::test]
+    async fn empty_config_list_yields_empty_report() {
+        let report = connect_all(&[]).await;
+        assert!(report.tools.is_empty());
+        assert!(report.errors.is_empty());
     }
 }
