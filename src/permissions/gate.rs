@@ -68,6 +68,12 @@ impl PermissionGate {
 
         if kind == ToolKind::Bash {
             if let Some(command) = arguments.get("command").and_then(|v| v.as_str()) {
+                // NOTE(security, v1 limitation): this is substring matching over the raw
+                // command string, not a tokenized/parsed shell command. It is a best-effort
+                // safety net, not a hard security boundary — it can be bypassed by an
+                // adversarial or merely unlucky command string (e.g. extra whitespace,
+                // reordered flags, or splitting `rm -rf` into `rm -r -f`). A more robust
+                // (tokenized) matcher is a candidate for a future pass.
                 if self
                     .settings
                     .always_deny
@@ -98,7 +104,8 @@ impl PermissionGate {
     }
 
     async fn ask(&self, tool_name: &str, arguments: &serde_json::Value) -> CheckOutcome {
-        if self.session_allow.lock().await.contains(tool_name) {
+        let key = session_key(tool_name, arguments);
+        if self.session_allow.lock().await.contains(&key) {
             return CheckOutcome::Allowed;
         }
 
@@ -116,12 +123,29 @@ impl PermissionGate {
         match self.prompter.prompt(&request).await {
             PermissionDecision::Allow => CheckOutcome::Allowed,
             PermissionDecision::AllowAlwaysThisSession => {
-                self.session_allow.lock().await.insert(tool_name.to_string());
+                self.session_allow.lock().await.insert(key);
                 CheckOutcome::Allowed
             }
             PermissionDecision::Deny { feedback } => CheckOutcome::Denied(feedback),
         }
     }
+}
+
+/// Builds the key used to cache a "don't ask again this session" approval so that
+/// approving one specific call does not silently cover unrelated, potentially more
+/// dangerous calls to the same tool. For `bash`, the key includes the exact command
+/// string (approving `cargo test` must not also cover `rm -rf /`). For calls with a
+/// `path` argument (`write_file`/`edit_file`), the key includes the path (approving
+/// an edit to `foo.rs` must not also cover writing to `/etc/passwd`). Falls back to
+/// just `tool_name` when neither field is present.
+fn session_key(tool_name: &str, arguments: &serde_json::Value) -> String {
+    if let Some(command) = arguments.get("command").and_then(|v| v.as_str()) {
+        return format!("bash:{command}");
+    }
+    if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
+        return format!("{tool_name}:{path}");
+    }
+    tool_name.to_string()
 }
 
 fn describe_call(tool_name: &str, arguments: &serde_json::Value) -> String {
@@ -230,21 +254,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_always_this_session_skips_future_prompts() {
+    async fn allow_always_this_session_skips_future_prompts_for_the_same_command_only() {
+        // A prompter that always answers AllowAlwaysThisSession, used to record the
+        // approval for the first ("cargo test") command.
         let gate = gate_with(PermissionTier::Ask, PermissionDecision::AllowAlwaysThisSession);
         let first = gate
             .check("bash", &serde_json::json!({"command": "cargo test"}))
             .await;
         assert_eq!(first, CheckOutcome::Allowed);
+        assert!(gate.session_allow.lock().await.contains("bash:cargo test"));
 
-        // Second call would deny if the prompter were consulted again; instead the
-        // gate's session_allow cache should short-circuit to Allowed.
+        // A *different* bash command must NOT be silently allowed by the cache
+        // entry recorded for "cargo test" — it must still go through `ask` and
+        // receive the prompter's actual (denying) decision.
         let gate_denying = PermissionGate::new(
             PermissionTier::Ask,
             PermissionSettings::default(),
             Arc::new(StubPrompter {
                 decision: PermissionDecision::Deny {
-                    feedback: "should not be reached".into(),
+                    feedback: "no".into(),
                 },
             }),
         );
@@ -252,11 +280,20 @@ mod tests {
             .session_allow
             .lock()
             .await
-            .insert("bash".to_string());
-        let second = gate_denying
+            .insert("bash:cargo test".to_string());
+
+        // Same command as cached: still allowed from cache, prompter not consulted.
+        let same_command = gate_denying
             .check("bash", &serde_json::json!({"command": "cargo test"}))
             .await;
-        assert_eq!(second, CheckOutcome::Allowed);
+        assert_eq!(same_command, CheckOutcome::Allowed);
+
+        // Different, more dangerous command: must NOT leak the cached approval;
+        // must go through the (denying) prompter instead.
+        let different_command = gate_denying
+            .check("bash", &serde_json::json!({"command": "rm -rf /tmp/x"}))
+            .await;
+        assert_eq!(different_command, CheckOutcome::Denied("no".into()));
     }
 
     #[tokio::test]
