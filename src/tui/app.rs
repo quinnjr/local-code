@@ -126,6 +126,10 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     });
     let pending_permission =
         hooks.use_state(|| Option::<crate::permissions::types::PermissionRequest>::None);
+    // Known v1 limitation: once this is `Some` (the `/model` numbered list is
+    // showing), there is no cancel/escape path. Any keystroke that isn't a
+    // valid in-range digit is silently swallowed and this stays `Some`,
+    // leaving the user stuck until they press a valid digit.
     let pending_model_choice = hooks.use_state(|| {
         Option::<Vec<(crate::config::connection::Connection, String)>>::None
     });
@@ -246,6 +250,10 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 return;
             }
 
+            // No cancel/escape path exists here (wrong digit, letter, Enter,
+            // Escape, etc. all fall through to the trailing `return;` below
+            // without clearing `pending_model_choice`) — known v1 limitation,
+            // not a bug.
             if let Some(choices) = pending_model_choice.get() {
                 if let KeyCode::Char(c) = ev.code {
                     if let Some(digit) = c.to_digit(10) {
@@ -283,6 +291,10 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                             mcp_tools,
                                             pending_permission_for_rebuild,
                                         );
+                                        // Last-write-wins: if multiple `/model` selections somehow
+                                        // overlap in flight, whichever `set` call completes last
+                                        // wins regardless of submission order. Narrow window today
+                                        // since rebuild does no real I/O, but worth revisiting if it grows any.
                                         agent_and_responder.set(rebuilt);
                                         transcript_for_notice.update(|entries| {
                                             entries.push(TranscriptEntry::SystemNotice {
