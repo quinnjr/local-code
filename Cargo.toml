@@ -3,6 +3,33 @@ name = "local-code"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "local_code"
+path = "src/lib.rs"
+
+[[bin]]
+name = "local-code"
+path = "src/main.rs"
+
 [dependencies]
 ntui = "0.1.0"
 ntui-macros = "0.1.0"
+directories = "6.0"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+thiserror = "2"
+anyhow = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+[dev-dependencies]
+tempfile = "3"
