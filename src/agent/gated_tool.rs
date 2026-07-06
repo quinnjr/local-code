@@ -133,4 +133,41 @@ mod tests {
         assert!(!output.is_error);
         assert!(output.content.contains("gated_ok"));
     }
+
+    #[tokio::test]
+    async fn denied_mcp_shaped_tool_call_never_reaches_the_wrapped_tool() {
+        // Proves MCP tool calls are gated through the exact same mechanism as
+        // built-ins, not a separate (and therefore possibly-bypassable) path.
+        // A namespaced-style name (`fixture__dangerous`) falls through
+        // `classify_tool`'s `_ => ToolKind::Edit` default (locked down
+        // separately in `src/permissions/types.rs`), so the `Ask`-tier gate
+        // below prompts for it — denying that prompt must mean the wrapped
+        // tool's `execute` body never runs at all.
+        struct PanicsIfCalled;
+        impl Tool for PanicsIfCalled {
+            fn name(&self) -> &str {
+                "fixture__dangerous"
+            }
+            fn description(&self) -> &str {
+                "would do something irreversible if actually called"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _input: &serde_json::Value) -> daimon::Result<ToolOutput> {
+                panic!("must never be reached when the gate denies the call")
+            }
+        }
+
+        let gate = gate_with(
+            PermissionTier::Ask,
+            PermissionDecision::Deny {
+                feedback: "no".into(),
+            },
+        );
+        let tool = GatedTool::new(PanicsIfCalled, gate);
+        let output = tool.execute(&serde_json::json!({})).await.unwrap();
+        assert!(output.is_error);
+        assert_eq!(output.content, "no");
+    }
 }

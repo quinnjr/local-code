@@ -96,4 +96,16 @@ mod tests {
     fn unknown_tool_defaults_to_edit() {
         assert_eq!(classify_tool("some_future_mcp_tool"), ToolKind::Edit);
     }
+
+    #[test]
+    fn namespaced_mcp_tool_names_default_to_edit_not_read_only() {
+        // Mirrors the `{server_name}__{tool_name}` shape produced by
+        // `local_code::mcp::tool::NamespacedMcpTool::new` — asserting here
+        // (rather than only in `src/mcp/tool.rs`) keeps the permission
+        // default visible from the permissions module itself, since that is
+        // what a future edit to `classify_tool` is most likely to touch.
+        assert_eq!(classify_tool("filesystem__write_file"), ToolKind::Edit);
+        assert_eq!(classify_tool("filesystem__read_file"), ToolKind::Edit);
+        assert_eq!(classify_tool("some_remote_server__delete_everything"), ToolKind::Edit);
+    }
 }
