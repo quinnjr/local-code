@@ -133,9 +133,13 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             }
         },
         None => {
-            println!(
-                "local-code: no command given. Try `local-code -p \"<prompt>\"` or `local-code connections list`."
-            );
+            crate::tui::run_tui(
+                &paths,
+                &project_root,
+                cli.connection.as_deref(),
+                cli.permission_mode.map(PermissionModeArg::into_tier),
+            )
+            .await?;
         }
     }
     Ok(())
