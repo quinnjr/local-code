@@ -71,3 +71,140 @@ default_model = "llama3.1"
         assert_eq!(file, reparsed);
     }
 }
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectionsError {
+    #[error("failed to read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+}
+
+/// Loads and merges connections.toml from `user_config_dir` and `project_config_dir`.
+/// A connection in the project file replaces a user-level connection of the same name;
+/// otherwise entries from both files are kept, user-level first.
+pub fn load_connections(
+    user_config_dir: &Path,
+    project_config_dir: &Path,
+) -> Result<Vec<Connection>, ConnectionsError> {
+    let user_file = load_one(&user_config_dir.join("connections.toml"))?;
+    let project_file = load_one(&project_config_dir.join("connections.toml"))?;
+
+    let mut merged: Vec<Connection> = user_file.connections;
+    for project_conn in project_file.connections {
+        if let Some(existing) = merged.iter_mut().find(|c| c.name == project_conn.name) {
+            *existing = project_conn;
+        } else {
+            merged.push(project_conn);
+        }
+    }
+    Ok(merged)
+}
+
+fn load_one(path: &Path) -> Result<ConnectionsFile, ConnectionsError> {
+    if !path.exists() {
+        return Ok(ConnectionsFile::default());
+    }
+    let text = fs::read_to_string(path).map_err(|source| ConnectionsError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    toml::from_str(&text).map_err(|source| ConnectionsError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn write(dir: &Path, contents: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("connections.toml"), contents).unwrap();
+    }
+
+    #[test]
+    fn project_connection_overrides_user_connection_of_same_name() {
+        let user_dir = tempdir().unwrap();
+        let project_dir = tempdir().unwrap();
+
+        write(
+            user_dir.path(),
+            r#"
+[[connection]]
+name = "shared"
+provider = "openai-compatible"
+base_url = "http://user-host:8000/v1"
+default_model = "model-a"
+"#,
+        );
+        write(
+            project_dir.path(),
+            r#"
+[[connection]]
+name = "shared"
+provider = "openai-compatible"
+base_url = "http://project-host:8000/v1"
+default_model = "model-b"
+"#,
+        );
+
+        let connections = load_connections(user_dir.path(), project_dir.path()).unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(connections[0].base_url, "http://project-host:8000/v1");
+        assert_eq!(connections[0].default_model, "model-b");
+    }
+
+    #[test]
+    fn distinct_names_from_both_files_are_kept() {
+        let user_dir = tempdir().unwrap();
+        let project_dir = tempdir().unwrap();
+
+        write(
+            user_dir.path(),
+            r#"
+[[connection]]
+name = "user-conn"
+provider = "openai-compatible"
+base_url = "http://a/v1"
+default_model = "m"
+"#,
+        );
+        write(
+            project_dir.path(),
+            r#"
+[[connection]]
+name = "project-conn"
+provider = "ollama"
+base_url = "http://b"
+default_model = "m2"
+"#,
+        );
+
+        let connections = load_connections(user_dir.path(), project_dir.path()).unwrap();
+        let names: Vec<_> = connections.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["user-conn", "project-conn"]);
+    }
+
+    #[test]
+    fn missing_files_yield_empty_list_not_error() {
+        let user_dir = tempdir().unwrap();
+        let project_dir = tempdir().unwrap();
+        let connections = load_connections(user_dir.path(), project_dir.path()).unwrap();
+        assert!(connections.is_empty());
+    }
+}
