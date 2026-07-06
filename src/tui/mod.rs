@@ -163,6 +163,7 @@ pub async fn run_tui(
         system_context,
         mcp_tools,
         session_path,
+        user_state_dir: paths.user_state_dir.clone(),
     };
 
     ntui::render(ntui::element!(App(
@@ -176,7 +177,8 @@ pub async fn run_tui(
         initial_messages: props.initial_messages,
         system_context: props.system_context,
         mcp_tools: props.mcp_tools,
-        session_path: props.session_path
+        session_path: props.session_path,
+        user_state_dir: props.user_state_dir
     )))
     .await?;
     Ok(())

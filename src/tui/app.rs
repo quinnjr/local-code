@@ -54,6 +54,9 @@ pub struct AppProps {
     pub mcp_tools: Vec<crate::mcp::tool::NamespacedMcpTool>,
     /// The session file this instance persists to after every turn.
     pub session_path: std::path::PathBuf,
+    /// Needed only so `/clear` and future commands can resolve a fresh
+    /// session path without re-deriving `Paths` from scratch inside `App`.
+    pub user_state_dir: std::path::PathBuf,
 }
 
 impl Default for AppProps {
@@ -70,6 +73,7 @@ impl Default for AppProps {
             system_context: String::new(),
             mcp_tools: Vec::new(),
             session_path: std::path::PathBuf::new(),
+            user_state_dir: std::path::PathBuf::new(),
         }
     }
 }
@@ -108,6 +112,10 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let streaming = hooks.use_state(|| false);
     let usage = hooks.use_state(UsageSummary::default);
     let tier = hooks.use_state(|| props.initial_tier);
+    let session_path = hooks.use_state({
+        let initial = props.session_path.clone();
+        move || initial
+    });
     let pending_permission =
         hooks.use_state(|| Option::<crate::permissions::types::PermissionRequest>::None);
 
@@ -151,11 +159,27 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let usage = usage.clone();
         let streaming = streaming.clone();
         let agent = agent.clone();
+        let session_path = session_path.clone();
+        let connection_name = props.connection_name.clone();
+        let model_name = props.model_name.clone();
+        let tier = tier.clone();
         move || {
             let Some(input) = pending_turn_input.get() else {
                 return Cleanup::from(());
             };
-            let handle = tokio::spawn(run_turn(agent, input, transcript, usage, streaming, pending_turn_input));
+            let handle = tokio::spawn(run_turn(
+                agent,
+                input,
+                transcript,
+                usage,
+                streaming,
+                pending_turn_input,
+                session_path.clone(),
+                connection_name.clone(),
+                model_name.clone(),
+                tier.get(),
+                std::env::current_dir().unwrap_or_default(),
+            ));
             Cleanup::from(move || handle.abort())
         }
     });
@@ -169,6 +193,10 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let pending_permission = pending_permission.clone();
         let responder = responder.clone();
         let tier = tier.clone();
+        let session_path = session_path.clone();
+        let connection_name = props.connection_name.clone();
+        let model_name = props.model_name.clone();
+        let user_state_dir = props.user_state_dir.clone();
         move |ev, _ctx| {
             if pending_permission.get().is_some() {
                 let decision = match ev.code {
@@ -227,6 +255,11 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         dispatch_slash_command(command, &SlashContext {
                             transcript: transcript.clone(),
                             tier: tier.clone(),
+                            session_path: session_path.clone(),
+                            connection_name: connection_name.clone(),
+                            model_name: model_name.clone(),
+                            project_root: std::env::current_dir().unwrap_or_default(),
+                            user_state_dir: user_state_dir.clone(),
                         });
                         return;
                     }
@@ -268,6 +301,11 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
 struct SlashContext {
     transcript: ntui::State<Vec<TranscriptEntry>>,
     tier: ntui::State<PermissionTier>,
+    session_path: ntui::State<std::path::PathBuf>,
+    connection_name: String,
+    model_name: String,
+    project_root: std::path::PathBuf,
+    user_state_dir: std::path::PathBuf,
 }
 
 const HELP_TEXT: &str = "\
@@ -298,7 +336,31 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 });
             });
         }
-        // Tasks 9–15 fill in every remaining variant. Left unmatched here
+        SlashCommand::Clear => {
+            ctx.transcript.set(Vec::new());
+            let now = chrono::Utc::now();
+            let new_path = crate::session::paths::new_session_path(
+                &ctx.user_state_dir,
+                &ctx.project_root,
+                now,
+            );
+            let fresh = crate::session::types::SessionFile::new(
+                ctx.project_root.clone(),
+                ctx.connection_name.clone(),
+                ctx.model_name.clone(),
+                ctx.tier.get(),
+                now.to_rfc3339(),
+            );
+            if let Err(e) = crate::session::store::save_session(&new_path, &fresh) {
+                ctx.transcript.update(|entries| {
+                    entries.push(TranscriptEntry::SystemNotice {
+                        text: format!("cleared transcript, but failed to start a new session file: {e}"),
+                    });
+                });
+            }
+            ctx.session_path.set(new_path);
+        }
+        // Tasks 10–15 fill in every remaining variant. Left unmatched here
         // deliberately would be a compile error (the match is exhaustive),
         // which is why Task 9 (the very next task) adds `Clear` immediately
         // rather than leaving this plan in a non-compiling state at the end
@@ -321,6 +383,11 @@ async fn run_turn(
     usage: ntui::State<UsageSummary>,
     streaming: ntui::State<bool>,
     pending_turn_input: ntui::State<Option<String>>,
+    session_path: ntui::State<std::path::PathBuf>,
+    connection_name: String,
+    model_name: String,
+    tier: PermissionTier,
+    project_root: std::path::PathBuf,
 ) {
     let mut stream = match agent.prompt_stream(&input).await {
         Ok(s) => s,
@@ -395,6 +462,19 @@ async fn run_turn(
                 break;
             }
         }
+    }
+
+    if let Ok(messages) = agent.memory().get_messages_erased().await {
+        let mut session = crate::session::types::SessionFile::new(
+            project_root,
+            connection_name,
+            model_name,
+            tier,
+            chrono::Utc::now().to_rfc3339(),
+        );
+        session.entries = transcript.get();
+        session.messages = messages;
+        let _ = crate::session::store::save_session(&session_path.get(), &session);
     }
 
     streaming.set(false);
@@ -510,5 +590,69 @@ mod tests {
         let text = t.frame_text();
         assert!(text.contains("not a recognized command"), "{text}");
         assert!(!text.contains("Hello, world"), "must not have run a turn: {text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clear_resets_transcript_and_starts_a_new_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut props = test_props();
+        props.user_state_dir = dir.path().to_path_buf();
+        props.session_path = dir.path().join("original.json");
+        crate::session::store::save_session(
+            &props.session_path,
+            &crate::session::types::SessionFile::new(
+                std::path::PathBuf::from("/proj"),
+                "local-vllm".into(),
+                "m".into(),
+                PermissionTier::FullAuto,
+                "2026-07-06T00:00:00Z".into(),
+            ),
+        )
+        .unwrap();
+
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+        type_and_submit(&mut t, "hi there").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        assert!(t.frame_text().contains("Hello, world"));
+
+        type_and_submit(&mut t, "/clear").await;
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(!text.contains("hi there"), "{text}");
+        assert!(!text.contains("Hello, world"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_turn_is_persisted_to_the_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut props = test_props();
+        props.user_state_dir = dir.path().to_path_buf();
+        props.session_path = dir.path().join("session.json");
+        crate::session::store::save_session(
+            &props.session_path,
+            &crate::session::types::SessionFile::new(
+                std::path::PathBuf::from("/proj"),
+                "local-vllm".into(),
+                "m".into(),
+                PermissionTier::FullAuto,
+                "2026-07-06T00:00:00Z".into(),
+            ),
+        )
+        .unwrap();
+        let session_path = props.session_path.clone();
+
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+        type_and_submit(&mut t, "hi there").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+
+        let saved = crate::session::store::load_session(&session_path).unwrap();
+        assert!(saved.entries.iter().any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there")));
+        assert!(!saved.messages.is_empty());
     }
 }
