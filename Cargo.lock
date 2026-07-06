@@ -1570,6 +1570,7 @@ dependencies = [
  "clap",
  "daimon",
  "directories",
+ "futures",
  "glob",
  "keyring",
  "ntui",
