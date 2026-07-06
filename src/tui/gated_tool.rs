@@ -6,8 +6,9 @@ use daimon::agent::{Agent, AgentBuilder};
 use daimon::model::SharedModel;
 
 use crate::agent::build::register_all_tools;
-use crate::agent::gated_tool::GatedTool;
 use crate::permissions::gate::PermissionGate;
+#[cfg(test)]
+use crate::agent::gated_tool::GatedTool;
 
 const SYSTEM_PROMPT: &str = "You are local-code, a coding assistant that talks only to \
 local/local-network LLM backends. You can read, write, and edit files, run shell commands, and \
