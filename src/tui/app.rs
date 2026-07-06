@@ -222,14 +222,12 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     if text.trim().is_empty() {
                         return;
                     }
-                    if let Some(command_notice) = slash_command_placeholder(&text) {
-                        transcript.update(|entries| {
-                            entries.push(TranscriptEntry::UserTurn { text: text.clone() });
-                            entries.push(TranscriptEntry::SystemNotice {
-                                text: command_notice,
-                            });
-                        });
+                    if let Some(command) = crate::tui::slash::parse_slash_command(&text) {
                         input_buffer.set(String::new());
+                        dispatch_slash_command(command, &SlashContext {
+                            transcript: transcript.clone(),
+                            tier: tier.clone(),
+                        });
                         return;
                     }
                     transcript.update(|entries| {
@@ -262,16 +260,55 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     }
 }
 
-/// Recognizes that the input *is* a slash command and returns a clear notice
-/// that it isn't implemented until Phase 4, rather than sending `/model` etc.
-/// to the LLM as if it were a normal prompt. Phase 4 replaces the call site
-/// (in the `Enter` branch above) with real dispatch; this function itself can
-/// then be deleted.
-fn slash_command_placeholder(input: &str) -> Option<String> {
-    input
-        .trim()
-        .starts_with('/')
-        .then(|| format!("'{}' is a slash command; slash commands ship in a later phase.", input.trim()))
+/// Everything a slash-command handler needs, gathered in one place so
+/// `dispatch_slash_command`'s signature doesn't grow a new parameter per
+/// command. Tasks 10–15 extend this struct as each command's handler needs
+/// more state; every field added there is threaded through from the same
+/// `App` render this struct is built in.
+struct SlashContext {
+    transcript: ntui::State<Vec<TranscriptEntry>>,
+    tier: ntui::State<PermissionTier>,
+}
+
+const HELP_TEXT: &str = "\
+/model                     switch the active connection/model (history is kept)
+/connections list          list configured connections
+/connections remove <name> remove a configured connection
+/connections add           not supported in-TUI; run `local-code connections add` in a separate terminal
+/init                      generate/update AGENTS.md from a survey of this project
+/permissions               view or change the permission tier and allow/deny list
+/compact                   summarize older turns to free up context
+/resume                    switch to a previous session for this project
+/clear                     clear the transcript and start a fresh session
+/help                      show this message";
+
+fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashContext) {
+    use crate::tui::slash::SlashCommand;
+
+    match command {
+        SlashCommand::Help => {
+            ctx.transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice { text: HELP_TEXT.to_string() });
+            });
+        }
+        SlashCommand::Unknown { raw } => {
+            ctx.transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice {
+                    text: format!("'{raw}' is not a recognized command. Type /help to see the list."),
+                });
+            });
+        }
+        // Tasks 9–15 fill in every remaining variant. Left unmatched here
+        // deliberately would be a compile error (the match is exhaustive),
+        // which is why Task 9 (the very next task) adds `Clear` immediately
+        // rather than leaving this plan in a non-compiling state at the end
+        // of this task; see that task's Step 1.
+        other => unreachable!(
+            "SlashCommand::{other:?} is handled by a later task in this plan; if you see this at \
+             runtime while implementing Task 8 in isolation, that's expected — Task 9 replaces this \
+             arm before the plan is done"
+        ),
+    }
 }
 
 /// Drives one turn: streams `agent.prompt_stream(&input)`, folding each
@@ -455,12 +492,23 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn slash_command_input_shows_the_not_implemented_notice_instead_of_prompting_the_model() {
+    async fn help_command_lists_every_slash_command() {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
-        type_and_submit(&mut t, "/model").await;
+        type_and_submit(&mut t, "/help").await;
         t.tick().await.unwrap();
         let text = t.frame_text();
-        assert!(text.contains("slash commands ship in a later phase"), "{text}");
+        for command in ["/model", "/connections", "/init", "/permissions", "/compact", "/resume", "/clear", "/help"] {
+            assert!(text.contains(command), "missing {command} in help text: {text}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unrecognized_command_shows_a_clear_notice_instead_of_prompting_the_model() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/bogus").await;
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("not a recognized command"), "{text}");
         assert!(!text.contains("Hello, world"), "must not have run a turn: {text}");
     }
 }
