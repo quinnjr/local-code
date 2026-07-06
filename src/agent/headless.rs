@@ -3,11 +3,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::agent::build::build_agent;
+use crate::agent::build::build_agent_with_mcp_tools;
 use crate::agent::provider::build_model;
 use crate::config::connection::{load_connections, Connection};
+use crate::config::mcp_servers::load_mcp_servers;
 use crate::config::paths::Paths;
 use crate::config::secrets::SecretStore;
+use crate::mcp::connect::connect_all;
 use crate::permissions::gate::PermissionGate;
 use crate::permissions::settings::load_settings;
 use crate::permissions::stdio::StdioPrompter;
@@ -31,6 +33,8 @@ pub enum HeadlessError {
     Provider(#[from] crate::agent::provider::ProviderError),
     #[error("agent error: {0}")]
     Agent(#[from] daimon::DaimonError),
+    #[error("failed to load mcp-servers.toml: {0}")]
+    LoadMcpServers(crate::config::mcp_servers::McpServersError),
 }
 
 fn select_connection(
@@ -83,7 +87,14 @@ pub async fn run_headless(
         Arc::new(StdioPrompter::real()),
     ));
 
-    let agent = build_agent(model, gate)?;
+    let mcp_server_configs = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)
+        .map_err(HeadlessError::LoadMcpServers)?;
+    let mcp_report = connect_all(&mcp_server_configs).await;
+    for error in &mcp_report.errors {
+        eprintln!("warning: {error}");
+    }
+
+    let agent = build_agent_with_mcp_tools(model, gate, mcp_report.tools)?;
     let response = agent.prompt(prompt).await?;
     Ok(response.text().to_string())
 }
@@ -135,5 +146,39 @@ mod tests {
         let connections = vec![conn("a")];
         let result = select_connection(&connections, Some("does-not-exist"));
         assert!(matches!(result, Err(HeadlessError::ConnectionNotFound(name)) if name == "does-not-exist"));
+    }
+
+    #[tokio::test]
+    async fn mcp_report_errors_do_not_prevent_agent_construction() {
+        use crate::agent::build::build_agent_with_mcp_tools;
+        use crate::config::mcp_servers::{McpServerConfig, McpTransportConfig};
+        use crate::mcp::connect::{connect_all, McpConnectError};
+        use crate::permissions::settings::PermissionSettings;
+        use crate::permissions::stdio::StdioPrompter;
+
+        let configs = vec![McpServerConfig {
+            name: "broken".into(),
+            transport: McpTransportConfig::Stdio {
+                command: "definitely-not-a-real-mcp-server-binary-xyz".into(),
+                args: vec![],
+            },
+        }];
+        let report = connect_all(&configs).await;
+        assert!(report.tools.is_empty());
+        assert_eq!(report.errors.len(), 1);
+        assert!(matches!(report.errors[0], McpConnectError::Connect { .. }));
+
+        let connection = conn("dummy");
+        let model = crate::agent::provider::build_model(&connection, None).unwrap();
+        let gate = std::sync::Arc::new(crate::permissions::gate::PermissionGate::new(
+            crate::permissions::types::PermissionTier::FullAuto,
+            PermissionSettings::default(),
+            std::sync::Arc::new(StdioPrompter::real()),
+        ));
+
+        // The whole point: a fully-failed MCP discovery report still produces
+        // a working agent with just the built-in tools.
+        let agent = build_agent_with_mcp_tools(model, gate, report.tools);
+        assert!(agent.is_ok());
     }
 }

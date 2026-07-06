@@ -7,6 +7,7 @@ use daimon::model::SharedModel;
 
 use crate::agent::gated_tool::GatedTool;
 use crate::agent::tools::{Bash, EditFile, Glob, Grep, ReadFile, WriteFile};
+use crate::mcp::tool::NamespacedMcpTool;
 use crate::permissions::gate::PermissionGate;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are local-code, a coding assistant that talks only to \
@@ -16,31 +17,55 @@ files with write_file. Always explain what you're about to do before calling a t
 the filesystem or runs a command.";
 
 /// Registers every available tool onto `builder`, each wrapped in
-/// [`GatedTool`] so permission enforcement works identically whether the
-/// resulting `Agent` is later driven via `prompt` or `prompt_stream`. This
-/// phase's version registers only the six built-ins; a later MCP-client phase
-/// extends this function's signature in place to add MCP-discovered tools
-/// (each also `GatedTool`-wrapped). Both the headless path (`build_agent`,
-/// below) and a later TUI path call this one function, so they never drift
-/// apart.
-pub fn register_all_tools(builder: AgentBuilder, gate: Arc<PermissionGate>) -> AgentBuilder {
-    builder
+/// [`crate::agent::gated_tool::GatedTool`] so permission enforcement is
+/// identical for built-ins and MCP tools alike, under both `Agent::prompt` and
+/// `Agent::prompt_stream`. This is the one and only tool-registration function
+/// in the project — Phase 2 defined its non-MCP-aware form first (TDD
+/// progression, since `NamespacedMcpTool` didn't exist yet); this task extends
+/// its *signature* in place to add `mcp_tools`, rather than adding a second
+/// function, so headless mode (`build_agent`/`build_agent_with_mcp_tools`,
+/// below) and the TUI's agent-rebuild path can never register a different
+/// tool set from each other.
+pub fn register_all_tools(
+    builder: AgentBuilder,
+    gate: Arc<PermissionGate>,
+    mcp_tools: Vec<NamespacedMcpTool>,
+) -> AgentBuilder {
+    let mut builder = builder
         .tool(GatedTool::new(ReadFile, gate.clone()))
         .tool(GatedTool::new(WriteFile, gate.clone()))
         .tool(GatedTool::new(EditFile, gate.clone()))
         .tool(GatedTool::new(Bash, gate.clone()))
         .tool(GatedTool::new(Grep, gate.clone()))
-        .tool(GatedTool::new(Glob, gate))
+        .tool(GatedTool::new(Glob, gate.clone()));
+
+    for tool in mcp_tools {
+        builder = builder.tool(GatedTool::new(tool, gate.clone()));
+    }
+
+    builder
 }
 
-/// Builds a `daimon::agent::Agent` wired with the six `GatedTool`-wrapped
-/// built-in tools via [`register_all_tools`]. No `daimon::middleware::Middleware`
-/// is used anywhere — see `src/agent/gated_tool.rs` for why.
-pub fn build_agent(model: SharedModel, gate: Arc<PermissionGate>) -> daimon::Result<Agent> {
+/// Builds a `daimon::agent::Agent` wired with the six built-in tools plus any
+/// MCP-server-discovered tools passed in `mcp_tools`, via [`register_all_tools`]
+/// — every tool, built-in or MCP, is `GatedTool`-wrapped there, so there is no
+/// separate registry or enforcement path for MCP tools.
+pub fn build_agent_with_mcp_tools(
+    model: SharedModel,
+    gate: Arc<PermissionGate>,
+    mcp_tools: Vec<NamespacedMcpTool>,
+) -> daimon::Result<Agent> {
     let builder = AgentBuilder::new()
         .shared_model(model)
         .system_prompt(DEFAULT_SYSTEM_PROMPT);
-    register_all_tools(builder, gate).build()
+    register_all_tools(builder, gate, mcp_tools).build()
+}
+
+/// Builds an agent with only the six built-in tools (no MCP servers
+/// configured/connected). Kept as its own function, with its original Phase 2
+/// signature, so existing callers are unaffected by this plan.
+pub fn build_agent(model: SharedModel, gate: Arc<PermissionGate>) -> daimon::Result<Agent> {
+    build_agent_with_mcp_tools(model, gate, Vec::new())
 }
 
 #[cfg(test)]
@@ -106,5 +131,47 @@ mod tests {
         let agent = build_agent(model, test_gate()).unwrap();
         let response = agent.prompt("hello").await.unwrap();
         assert!(response.text().contains("echo: hello"));
+    }
+
+    #[test]
+    fn builds_successfully_with_additional_mcp_tools_registered() {
+        let model: SharedModel = Arc::new(EchoModel);
+
+        struct FakeMcpTool;
+        impl daimon::tool::Tool for FakeMcpTool {
+            fn name(&self) -> &str {
+                "fixture__echo"
+            }
+            fn description(&self) -> &str {
+                "fixture echo tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _input: &serde_json::Value) -> daimon::Result<daimon::tool::ToolOutput> {
+                Ok(daimon::tool::ToolOutput::text("fixture echo"))
+            }
+        }
+
+        // NamespacedMcpTool itself always wraps a real McpToolBridge (which
+        // needs a transport); to keep this test fast and dependency-free we
+        // assert the same *shape of contract* — "a plain Tool impl can be
+        // wrapped in GatedTool and added to the same register_all_tools
+        // builder chain build_agent uses" — via a structurally-identical fake
+        // tool rather than standing up an MCP client. Task 6's headless
+        // integration test proves the real NamespacedMcpTool path end to end.
+        let builder = AgentBuilder::new()
+            .shared_model(model)
+            .system_prompt(DEFAULT_SYSTEM_PROMPT)
+            .tool(GatedTool::new(FakeMcpTool, test_gate()));
+        let agent = register_all_tools(builder, test_gate(), Vec::new()).build();
+        assert!(agent.is_ok());
+    }
+
+    #[test]
+    fn build_agent_still_builds_with_zero_mcp_tools() {
+        let model: SharedModel = Arc::new(EchoModel);
+        let agent = build_agent(model, test_gate());
+        assert!(agent.is_ok());
     }
 }

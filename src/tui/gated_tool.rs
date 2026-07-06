@@ -27,7 +27,7 @@ pub fn build_streaming_agent(model: SharedModel, gate: Arc<PermissionGate>) -> d
     let builder = AgentBuilder::new()
         .shared_model(model)
         .system_prompt(SYSTEM_PROMPT);
-    register_all_tools(builder, gate).build()
+    register_all_tools(builder, gate, Vec::new()).build()
 }
 
 #[cfg(test)]
