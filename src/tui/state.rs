@@ -3,7 +3,7 @@
 /// One entry in the transcript, in display order. Cloned into `ntui::State` on
 /// every update, so kept cheap and flat (no `Rc`/`Arc` needed — clones are just
 /// string/vec copies of already-small turn data).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TranscriptEntry {
     /// A user-submitted prompt, rendered in a bordered box.
     UserTurn { text: String },
@@ -22,7 +22,7 @@ pub enum TranscriptEntry {
 /// A tool call's lifecycle, tracked as one mutable entry updated in place as
 /// `StreamEvent`s arrive (`ToolCallStart` creates it, `ToolCallDelta` appends to
 /// `arguments_json`, `ToolResult` fills in `result`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallEntry {
     pub id: String,
     pub name: String,
@@ -34,7 +34,7 @@ pub struct ToolCallEntry {
     pub expanded: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallResult {
     pub content: String,
     pub is_error: bool,
@@ -44,7 +44,7 @@ pub struct ToolCallResult {
 /// local-only connections (no cost model wired up in this phase) but the field
 /// is populated so a later non-local connection lights it up with no shape
 /// change, per the spec's footer note.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct UsageSummary {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -147,5 +147,33 @@ mod tests {
         assert_eq!(usage.input_tokens, 15);
         assert_eq!(usage.output_tokens, 25);
         assert!((usage.estimated_cost - 0.0015).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transcript_entry_round_trips_through_json() {
+        let entries = vec![
+            TranscriptEntry::UserTurn { text: "fix the bug".into() },
+            TranscriptEntry::ToolCall(ToolCallEntry {
+                id: "1".into(),
+                name: "edit_file".into(),
+                arguments_json: "{}".into(),
+                result: Some(ToolCallResult { content: "edited x.rs".into(), is_error: false }),
+                expanded: true,
+            }),
+            TranscriptEntry::AssistantText { text: "done".into() },
+            TranscriptEntry::PermissionResolved { description: "run rm".into(), allowed: false },
+            TranscriptEntry::SystemNotice { text: "note".into() },
+        ];
+        let json = serde_json::to_string(&entries).unwrap();
+        let back: Vec<TranscriptEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, entries);
+    }
+
+    #[test]
+    fn usage_summary_round_trips_through_json() {
+        let usage = UsageSummary { input_tokens: 10, output_tokens: 5, estimated_cost: 0.01 };
+        let json = serde_json::to_string(&usage).unwrap();
+        let back: UsageSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, usage);
     }
 }

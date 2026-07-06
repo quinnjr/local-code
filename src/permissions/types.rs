@@ -4,7 +4,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 /// How aggressively the agent may act without asking the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum PermissionTier {
     /// Every write/edit/bash call prompts (default).
     Ask,
@@ -107,5 +108,14 @@ mod tests {
         assert_eq!(classify_tool("filesystem__write_file"), ToolKind::Edit);
         assert_eq!(classify_tool("filesystem__read_file"), ToolKind::Edit);
         assert_eq!(classify_tool("some_remote_server__delete_everything"), ToolKind::Edit);
+    }
+
+    #[test]
+    fn permission_tier_round_trips_through_json() {
+        let tier = PermissionTier::AutoAcceptEdits;
+        let json = serde_json::to_string(&tier).unwrap();
+        assert_eq!(json, "\"auto-accept-edits\"");
+        let back: PermissionTier = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tier);
     }
 }
