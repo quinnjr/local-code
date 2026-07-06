@@ -133,6 +133,12 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let pending_model_choice = hooks.use_state(|| {
         Option::<Vec<(crate::config::connection::Connection, String)>>::None
     });
+    // Known v1 limitation, same shape as `pending_model_choice` above: once
+    // this is `true` (the `/permissions` numbered list is showing), there is
+    // no cancel/escape path. Any keystroke that isn't a valid digit is
+    // silently swallowed and this stays `true`, leaving the user stuck until
+    // they press a valid digit.
+    let pending_permissions_menu = hooks.use_state(|| false);
 
     let always_allow_snapshot = props.always_allow.clone();
     let always_deny_snapshot = props.always_deny.clone();
@@ -211,6 +217,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let streaming = streaming.clone();
         let pending_permission = pending_permission.clone();
         let pending_model_choice = pending_model_choice.clone();
+        let pending_permissions_menu = pending_permissions_menu.clone();
         let responder = responder.clone();
         let tier = tier.clone();
         let session_path = session_path.clone();
@@ -320,6 +327,29 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 return;
             }
 
+            // No cancel/escape path exists here either (same known v1
+            // limitation as `pending_model_choice` above) — a non-digit
+            // keystroke while the permissions menu is pending is silently
+            // swallowed without clearing `pending_permissions_menu`.
+            if pending_permissions_menu.get() {
+                let new_tier = match ev.code {
+                    KeyCode::Char('1') => Some(PermissionTier::Ask),
+                    KeyCode::Char('2') => Some(PermissionTier::AutoAcceptEdits),
+                    KeyCode::Char('3') => Some(PermissionTier::FullAuto),
+                    _ => None,
+                };
+                if let Some(new_tier) = new_tier {
+                    tier.set(new_tier);
+                    pending_permissions_menu.set(false);
+                    transcript.update(|entries| {
+                        entries.push(TranscriptEntry::SystemNotice {
+                            text: format!("permission tier set to {new_tier:?}"),
+                        });
+                    });
+                }
+                return;
+            }
+
             match ev.code {
                 KeyCode::Char('a') if ev.modifiers.contains(ntui::hooks::input::KeyModifiers::CONTROL) => {
                     let next = match tier.get() {
@@ -361,6 +391,9 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             user_config_dir: user_config_dir.clone(),
                             project_config_dir: project_config_dir.clone(),
                             pending_model_choice: pending_model_choice.clone(),
+                            always_allow: always_allow_snapshot.clone(),
+                            always_deny: always_deny_snapshot.clone(),
+                            pending_permissions_menu: pending_permissions_menu.clone(),
                         });
                         return;
                     }
@@ -410,6 +443,9 @@ struct SlashContext {
     user_config_dir: std::path::PathBuf,
     project_config_dir: std::path::PathBuf,
     pending_model_choice: ntui::State<Option<Vec<(crate::config::connection::Connection, String)>>>,
+    always_allow: Vec<String>,
+    always_deny: Vec<String>,
+    pending_permissions_menu: ntui::State<bool>,
 }
 
 const HELP_TEXT: &str = "\
@@ -509,7 +545,23 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 }
             }
         }
-        // Tasks 11–15 fill in every remaining variant. Left unmatched here
+        SlashCommand::Permissions => {
+            let current = ctx.tier.get();
+            let label = tier_label(current);
+            let text = format!(
+                "Current tier: {label}\n\
+                 1) ask\n2) auto-accept-edits\n3) full-auto\n\
+                 (press a digit key to switch, or Ctrl+A to cycle)\n\
+                 always-allow: {}\nalways-deny: {}",
+                if ctx.always_allow.is_empty() { "(none)".to_string() } else { ctx.always_allow.join(", ") },
+                if ctx.always_deny.is_empty() { "(none)".to_string() } else { ctx.always_deny.join(", ") },
+            );
+            ctx.transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice { text });
+            });
+            ctx.pending_permissions_menu.set(true);
+        }
+        // Tasks 12–15 fill in every remaining variant. Left unmatched here
         // deliberately would be a compile error (the match is exhaustive),
         // which is why Task 9 (the very next task) adds `Clear` immediately
         // rather than leaving this plan in a non-compiling state at the end
@@ -866,5 +918,17 @@ mod tests {
         type_and_submit(&mut t, "/model").await;
         t.tick().await.unwrap();
         assert!(t.frame_text().contains("no connections configured"), "{}", t.frame_text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permissions_command_shows_tier_and_lists_and_digit_press_changes_tier() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/permissions").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Current tier: full-auto"), "{}", t.frame_text());
+
+        t.send_key(KeyCode::Char('1')).unwrap();
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("[ask]"), "{}", t.frame_text());
     }
 }
