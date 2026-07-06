@@ -41,7 +41,7 @@ pub fn classify_tool(name: &str) -> ToolKind {
 
 /// A human-readable description of a pending tool call, shown to the user by
 /// whatever [`PermissionPrompter`] is in use.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PermissionRequest {
     pub tool_name: String,
     pub description: String,
