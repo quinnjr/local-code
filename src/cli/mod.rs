@@ -1,4 +1,5 @@
 pub mod connections;
+pub mod memory;
 
 use crate::agent::headless::run_headless;
 use crate::config::paths::Paths;
@@ -33,6 +34,11 @@ pub enum Command {
         #[command(subcommand)]
         action: ConnectionsAction,
     },
+    /// Inspect cross-session memory (search/core/add)
+    Memory {
+        #[command(subcommand)]
+        action: MemoryAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -40,6 +46,16 @@ pub enum ConnectionsAction {
     Add,
     List,
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+pub enum MemoryAction {
+    /// Keyword-search the buffer, daily files, recent.md, and archive.md
+    Search { query: String },
+    /// Print the always-loaded core-memories.md file in full
+    Core,
+    /// Append a manual entry to the short-term buffer
+    Add { text: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -103,6 +119,17 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             }
             ConnectionsAction::Remove { name } => {
                 connections::remove(&paths, &name, stdout())?;
+            }
+        },
+        Some(Command::Memory { action }) => match action {
+            MemoryAction::Search { query } => {
+                memory::search_command(&paths, &query, stdout())?;
+            }
+            MemoryAction::Core => {
+                memory::core_command(&paths, stdout())?;
+            }
+            MemoryAction::Add { text } => {
+                memory::add_command(&paths, &text, stdout())?;
             }
         },
         None => {
