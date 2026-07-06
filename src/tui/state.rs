@@ -16,6 +16,11 @@ pub enum TranscriptEntry {
     PermissionResolved { description: String, allowed: bool },
     /// A non-fatal system message (errors, and — until Phase 4 implements real
     /// dispatch — the "slash commands aren't implemented yet" notice).
+    ///
+    /// `text` is NOT auto-wrapped by the Transcript component's current layout
+    /// (available width isn't definite when `Text` is measured), so any text
+    /// expected to run past ~70-80 chars on a line must include explicit `\n`
+    /// breaks or it will be clipped mid-word at paint time.
     SystemNotice { text: String },
 }
 
