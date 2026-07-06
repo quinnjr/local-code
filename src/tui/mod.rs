@@ -3,7 +3,10 @@
 pub mod app;
 pub mod components;
 pub mod gated_tool;
+pub mod memory_seed;
 pub mod permission_prompter;
+pub mod rebuild;
+pub mod slash;
 pub mod state;
 
 pub use app::{App, AppProps};
