@@ -109,10 +109,11 @@ impl PartialEq for AppProps {
 /// (the number of items in the pending numbered list/menu). Returns `None`
 /// for non-digit keys, `0`, or any digit beyond `max`. Shared by all four
 /// "show a numbered list, then intercept the next digit press" pending-choice
-/// blocks in `use_input` below (`pending_permission`, `pending_model_choice`,
-/// `pending_permissions_menu`, `pending_resume_choice`) — extracted per code
-/// review after Task 11, which flagged the duplicated digit-matching
-/// boilerplate across what was then three (now four) near-identical blocks.
+/// blocks in `use_input` below (`pending_permission`, and `pending_menu`'s
+/// three variants `ModelChoice`, `PermissionsMenu`, `ResumeChoice`) —
+/// extracted per code review after Task 11, which flagged the duplicated
+/// digit-matching boilerplate across what was then three (now four)
+/// near-identical blocks.
 fn digit_key_to_index(code: KeyCode, max: usize) -> Option<usize> {
     if let KeyCode::Char(c) = code {
         if let Some(digit) = c.to_digit(10) {
@@ -130,6 +131,35 @@ fn tier_label(tier: PermissionTier) -> &'static str {
         PermissionTier::AutoAcceptEdits => "auto-accept-edits",
         PermissionTier::FullAuto => "full-auto",
     }
+}
+
+/// Which numbered-choice menu (if any) is currently intercepting digit
+/// keypresses in `use_input` below: `/model`'s connection/model list,
+/// `/permissions`'s tier list, or `/resume`'s session list. Collapses what
+/// were three separate `Option`/`bool` `ntui::State`s into one, since
+/// `use_input`'s priority chain only ever treats one of them as active at a
+/// time.
+///
+/// `pending_permission` (see `App`'s state below) is a fourth, related
+/// "pending numbered menu" but is deliberately kept as its own state rather
+/// than a variant here: it is threaded into `rebuild_agent`
+/// (`src/tui/rebuild.rs`) and `NtuiPermissionPrompter`
+/// (`src/tui/permission_prompter.rs`) as a concrete
+/// `ntui::State<Option<PermissionRequest>>`, which those modules set directly
+/// from inside a spawned tokio task (the permission gate's `prompt` future) —
+/// independent of `App`'s `use_input` closure entirely. Folding it into this
+/// enum would require changing those other modules' signatures.
+///
+/// Known v1 limitation, true of all three variants here (and of
+/// `pending_permission`): once one is active there is no cancel/escape path.
+/// Any keystroke that isn't a valid in-range digit is silently swallowed and
+/// the menu stays open until a valid digit is pressed.
+#[derive(Clone)]
+enum PendingMenu {
+    None,
+    ModelChoice(Vec<(crate::config::connection::Connection, String)>),
+    PermissionsMenu,
+    ResumeChoice(Vec<crate::session::types::SessionSummary>),
 }
 
 /// The TUI's single stateful root component. Owns the transcript, the input
@@ -153,26 +183,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     });
     let pending_permission =
         hooks.use_state(|| Option::<crate::permissions::types::PermissionRequest>::None);
-    // Known v1 limitation: once this is `Some` (the `/model` numbered list is
-    // showing), there is no cancel/escape path. Any keystroke that isn't a
-    // valid in-range digit is silently swallowed and this stays `Some`,
-    // leaving the user stuck until they press a valid digit.
-    let pending_model_choice = hooks.use_state(|| {
-        Option::<Vec<(crate::config::connection::Connection, String)>>::None
-    });
-    // Known v1 limitation, same shape as `pending_model_choice` above: once
-    // this is `true` (the `/permissions` numbered list is showing), there is
-    // no cancel/escape path. Any keystroke that isn't a valid digit is
-    // silently swallowed and this stays `true`, leaving the user stuck until
-    // they press a valid digit.
-    let pending_permissions_menu = hooks.use_state(|| false);
-    // Known v1 limitation, same shape as `pending_model_choice` above: once
-    // this is `Some` (the `/resume` numbered list is showing), there is no
-    // cancel/escape path. Any keystroke that isn't a valid in-range digit is
-    // silently swallowed and this stays `Some`, leaving the user stuck until
-    // they press a valid digit.
-    let pending_resume_choice =
-        hooks.use_state(|| Option::<Vec<crate::session::types::SessionSummary>>::None);
+    let pending_menu = hooks.use_state(|| PendingMenu::None);
 
     let always_allow_snapshot = props.always_allow.clone();
     let always_deny_snapshot = props.always_deny.clone();
@@ -275,9 +286,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let pending_turn_input = pending_turn_input.clone();
         let streaming = streaming.clone();
         let pending_permission = pending_permission.clone();
-        let pending_model_choice = pending_model_choice.clone();
-        let pending_permissions_menu = pending_permissions_menu.clone();
-        let pending_resume_choice = pending_resume_choice.clone();
+        let pending_menu = pending_menu.clone();
         let responder = responder.clone();
         let tier = tier.clone();
         let session_path = session_path.clone();
@@ -320,196 +329,185 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 return;
             }
 
-            // No cancel/escape path exists here (wrong digit, letter, Enter,
-            // Escape, etc. all fall through to the trailing `return;` below
-            // without clearing `pending_model_choice`) — known v1 limitation,
-            // not a bug.
-            if let Some(choices) = pending_model_choice.get() {
-                if let Some(idx) = digit_key_to_index(ev.code, choices.len()) {
-                    let (connection, model_name) = choices[idx].clone();
-                    pending_model_choice.set(None);
-                    let api_key =
-                        crate::config::secrets::SecretStore::get_api_key(&connection.name)
-                            .ok()
-                            .flatten();
-                    match crate::agent::provider::build_model(&connection, api_key) {
-                        Ok(new_model) => {
-                            let agent_for_history = agent.clone();
-                            let pending_permission_for_rebuild = pending_permission.clone();
-                            let agent_and_responder = agent_and_responder.clone();
-                            let current_model = current_model.clone();
-                            let model_for_state = new_model.clone();
-                            let transcript_for_notice = transcript.clone();
-                            let tier_value = tier.get();
-                            let always_allow = always_allow_snapshot.clone();
-                            let always_deny = always_deny_snapshot.clone();
-                            let system_context = system_context.clone();
-                            let mcp_tools = mcp_tools_snapshot.clone();
-                            let connection_display = connection_display.clone();
-                            let model_display = model_display.clone();
-                            let connection_name_for_display = connection.name.clone();
-                            let model_name_for_display = model_name.clone();
-                            tokio::spawn(async move {
-                                let history = agent_for_history
-                                    .memory()
-                                    .get_messages_erased()
-                                    .await
-                                    .unwrap_or_default();
-                                let rebuilt = crate::tui::rebuild::rebuild_agent(
-                                    new_model,
-                                    tier_value,
-                                    always_allow,
-                                    always_deny,
-                                    history,
-                                    &system_context,
-                                    mcp_tools,
-                                    pending_permission_for_rebuild,
-                                );
-                                // Last-write-wins: if multiple `/model` selections somehow
-                                // overlap in flight, whichever `set` call completes last
-                                // wins regardless of submission order. Narrow window today
-                                // since rebuild does no real I/O, but worth revisiting if it grows any.
-                                agent_and_responder.set(rebuilt);
-                                // Kept in lockstep with `agent_and_responder` above (Bug 2
-                                // fix): without this, `SlashContext.model` (built from
-                                // `current_model.get()` in the `Enter` branch below) would
-                                // keep pointing at the pre-switch model forever.
-                                current_model.set(model_for_state);
-                                // Kept in lockstep alongside `current_model` above: the
-                                // Header reads from these, not from `props`, so without
-                                // this it would keep showing the pre-switch connection
-                                // and model name forever after a successful `/model`.
-                                connection_display.set(connection_name_for_display);
-                                model_display.set(model_name_for_display);
-                                transcript_for_notice.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice {
-                                        text: format!(
-                                            "switched to {} · {}",
-                                            connection.name, model_name
-                                        ),
-                                    });
-                                });
-                            });
-                        }
-                        Err(e) => {
-                            transcript.update(|entries| {
-                                entries.push(TranscriptEntry::SystemNotice {
-                                    text: format!("failed to switch model: {e}"),
-                                });
-                            });
-                        }
-                    }
-                }
-                return;
-            }
-
-            // No cancel/escape path exists here either (same known v1
-            // limitation as `pending_model_choice` above) — a non-digit
-            // keystroke while the permissions menu is pending is silently
-            // swallowed without clearing `pending_permissions_menu`.
-            if pending_permissions_menu.get() {
-                let new_tier = digit_key_to_index(ev.code, 3).map(|idx| match idx {
-                    0 => PermissionTier::Ask,
-                    1 => PermissionTier::AutoAcceptEdits,
-                    _ => PermissionTier::FullAuto,
-                });
-                if let Some(new_tier) = new_tier {
-                    tier.set(new_tier);
-                    pending_permissions_menu.set(false);
-                    transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
-                            text: format!("permission tier set to {new_tier:?}"),
-                        });
-                    });
-                }
-                return;
-            }
-
-            // No cancel/escape path exists here either (same known v1
-            // limitation as the other pending-choice blocks above) — a
-            // non-digit keystroke while the resume list is pending is
-            // silently swallowed without clearing `pending_resume_choice`.
-            if let Some(sessions) = pending_resume_choice.get() {
-                if let Some(idx) = digit_key_to_index(ev.code, sessions.len()) {
-                    let summary = sessions[idx].clone();
-                    pending_resume_choice.set(None);
-                    match crate::session::store::load_session(&summary.path) {
-                        Ok(session) => {
-                            let paths_lookup = crate::config::connection::load_connections(
-                                &user_config_dir,
-                                &project_config_dir,
-                            );
-                            let resolved_connection = paths_lookup
+            match pending_menu.get() {
+                PendingMenu::ModelChoice(choices) => {
+                    if let Some(idx) = digit_key_to_index(ev.code, choices.len()) {
+                        let (connection, model_name) = choices[idx].clone();
+                        pending_menu.set(PendingMenu::None);
+                        let api_key =
+                            crate::config::secrets::SecretStore::get_api_key(&connection.name)
                                 .ok()
-                                .and_then(|conns| conns.into_iter().find(|c| c.name == session.connection_name));
-
-                            match resolved_connection {
-                                Some(mut connection) => {
-                                    connection.default_model = session.model_name.clone();
-                                    let api_key = crate::config::secrets::SecretStore::get_api_key(&connection.name)
-                                        .ok()
-                                        .flatten();
-                                    match crate::agent::provider::build_model(&connection, api_key) {
-                                        Ok(new_model) => {
-                                            let model_for_state = new_model.clone();
-                                            let rebuilt = crate::tui::rebuild::rebuild_agent(
-                                                new_model,
-                                                session.tier,
-                                                always_allow_snapshot.clone(),
-                                                always_deny_snapshot.clone(),
-                                                session.messages.clone(),
-                                                &system_context,
-                                                mcp_tools_snapshot.clone(),
-                                                pending_permission.clone(),
-                                            );
-                                            agent_and_responder.set(rebuilt);
-                                            // Kept in lockstep with `agent_and_responder`, mirroring
-                                            // the `/model` fix for Bug 2 above — without this,
-                                            // `SlashContext.model` (used by `/compact`) would keep
-                                            // pointing at the pre-resume model forever.
-                                            current_model.set(model_for_state);
-                                            // Kept in lockstep with `current_model` above,
-                                            // mirroring the `/model` fix: the Header reads
-                                            // from these, not from `props`, so without this
-                                            // it would keep showing the pre-resume
-                                            // connection/model name forever.
-                                            connection_display.set(connection.name.clone());
-                                            model_display.set(session.model_name.clone());
-                                            tier.set(session.tier);
-                                            transcript.set(session.entries.clone());
-                                            session_path.set(summary.path.clone());
-                                        }
-                                        Err(e) => {
-                                            transcript.update(|entries| {
-                                                entries.push(TranscriptEntry::SystemNotice {
-                                                    text: format!("failed to resume: could not build model: {e}"),
-                                                });
-                                            });
-                                        }
-                                    }
-                                }
-                                None => {
-                                    transcript.update(|entries| {
+                                .flatten();
+                        match crate::agent::provider::build_model(&connection, api_key) {
+                            Ok(new_model) => {
+                                let agent_for_history = agent.clone();
+                                let pending_permission_for_rebuild = pending_permission.clone();
+                                let agent_and_responder = agent_and_responder.clone();
+                                let current_model = current_model.clone();
+                                let model_for_state = new_model.clone();
+                                let transcript_for_notice = transcript.clone();
+                                let tier_value = tier.get();
+                                let always_allow = always_allow_snapshot.clone();
+                                let always_deny = always_deny_snapshot.clone();
+                                let system_context = system_context.clone();
+                                let mcp_tools = mcp_tools_snapshot.clone();
+                                let connection_display = connection_display.clone();
+                                let model_display = model_display.clone();
+                                let connection_name_for_display = connection.name.clone();
+                                let model_name_for_display = model_name.clone();
+                                tokio::spawn(async move {
+                                    let history = agent_for_history
+                                        .memory()
+                                        .get_messages_erased()
+                                        .await
+                                        .unwrap_or_default();
+                                    let rebuilt = crate::tui::rebuild::rebuild_agent(
+                                        new_model,
+                                        tier_value,
+                                        always_allow,
+                                        always_deny,
+                                        history,
+                                        &system_context,
+                                        mcp_tools,
+                                        pending_permission_for_rebuild,
+                                    );
+                                    // Last-write-wins: if multiple `/model` selections somehow
+                                    // overlap in flight, whichever `set` call completes last
+                                    // wins regardless of submission order. Narrow window today
+                                    // since rebuild does no real I/O, but worth revisiting if it grows any.
+                                    agent_and_responder.set(rebuilt);
+                                    // Kept in lockstep with `agent_and_responder` above (Bug 2
+                                    // fix): without this, `SlashContext.model` (built from
+                                    // `current_model.get()` in the `Enter` branch below) would
+                                    // keep pointing at the pre-switch model forever.
+                                    current_model.set(model_for_state);
+                                    // Kept in lockstep alongside `current_model` above: the
+                                    // Header reads from these, not from `props`, so without
+                                    // this it would keep showing the pre-switch connection
+                                    // and model name forever after a successful `/model`.
+                                    connection_display.set(connection_name_for_display);
+                                    model_display.set(model_name_for_display);
+                                    transcript_for_notice.update(|entries| {
                                         entries.push(TranscriptEntry::SystemNotice {
                                             text: format!(
-                                                "failed to resume: connection '{}' no longer exists; run `local-code connections list`",
-                                                session.connection_name
+                                                "switched to {} · {}",
+                                                connection.name, model_name
                                             ),
                                         });
                                     });
-                                }
+                                });
+                            }
+                            Err(e) => {
+                                transcript.update(|entries| {
+                                    entries.push(TranscriptEntry::SystemNotice {
+                                        text: format!("failed to switch model: {e}"),
+                                    });
+                                });
                             }
                         }
-                        Err(e) => {
-                            transcript.update(|entries| {
-                                entries.push(TranscriptEntry::SystemNotice {
-                                    text: format!("failed to load session: {e}"),
-                                });
+                    }
+                    return;
+                }
+                PendingMenu::PermissionsMenu => {
+                    let new_tier = digit_key_to_index(ev.code, 3).map(|idx| match idx {
+                        0 => PermissionTier::Ask,
+                        1 => PermissionTier::AutoAcceptEdits,
+                        _ => PermissionTier::FullAuto,
+                    });
+                    if let Some(new_tier) = new_tier {
+                        tier.set(new_tier);
+                        pending_menu.set(PendingMenu::None);
+                        transcript.update(|entries| {
+                            entries.push(TranscriptEntry::SystemNotice {
+                                text: format!("permission tier set to {new_tier:?}"),
                             });
+                        });
+                    }
+                    return;
+                }
+                PendingMenu::ResumeChoice(sessions) => {
+                    if let Some(idx) = digit_key_to_index(ev.code, sessions.len()) {
+                        let summary = sessions[idx].clone();
+                        pending_menu.set(PendingMenu::None);
+                        match crate::session::store::load_session(&summary.path) {
+                            Ok(session) => {
+                                let paths_lookup = crate::config::connection::load_connections(
+                                    &user_config_dir,
+                                    &project_config_dir,
+                                );
+                                let resolved_connection = paths_lookup
+                                    .ok()
+                                    .and_then(|conns| conns.into_iter().find(|c| c.name == session.connection_name));
+
+                                match resolved_connection {
+                                    Some(mut connection) => {
+                                        connection.default_model = session.model_name.clone();
+                                        let api_key = crate::config::secrets::SecretStore::get_api_key(&connection.name)
+                                            .ok()
+                                            .flatten();
+                                        match crate::agent::provider::build_model(&connection, api_key) {
+                                            Ok(new_model) => {
+                                                let model_for_state = new_model.clone();
+                                                let rebuilt = crate::tui::rebuild::rebuild_agent(
+                                                    new_model,
+                                                    session.tier,
+                                                    always_allow_snapshot.clone(),
+                                                    always_deny_snapshot.clone(),
+                                                    session.messages.clone(),
+                                                    &system_context,
+                                                    mcp_tools_snapshot.clone(),
+                                                    pending_permission.clone(),
+                                                );
+                                                agent_and_responder.set(rebuilt);
+                                                // Kept in lockstep with `agent_and_responder`, mirroring
+                                                // the `/model` fix for Bug 2 above — without this,
+                                                // `SlashContext.model` (used by `/compact`) would keep
+                                                // pointing at the pre-resume model forever.
+                                                current_model.set(model_for_state);
+                                                // Kept in lockstep with `current_model` above,
+                                                // mirroring the `/model` fix: the Header reads
+                                                // from these, not from `props`, so without this
+                                                // it would keep showing the pre-resume
+                                                // connection/model name forever.
+                                                connection_display.set(connection.name.clone());
+                                                model_display.set(session.model_name.clone());
+                                                tier.set(session.tier);
+                                                transcript.set(session.entries.clone());
+                                                session_path.set(summary.path.clone());
+                                            }
+                                            Err(e) => {
+                                                transcript.update(|entries| {
+                                                    entries.push(TranscriptEntry::SystemNotice {
+                                                        text: format!("failed to resume: could not build model: {e}"),
+                                                    });
+                                                });
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        transcript.update(|entries| {
+                                            entries.push(TranscriptEntry::SystemNotice {
+                                                text: format!(
+                                                    "failed to resume: connection '{}' no longer exists; run `local-code connections list`",
+                                                    session.connection_name
+                                                ),
+                                            });
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                transcript.update(|entries| {
+                                    entries.push(TranscriptEntry::SystemNotice {
+                                        text: format!("failed to load session: {e}"),
+                                    });
+                                });
+                            }
                         }
                     }
+                    return;
                 }
-                return;
+                PendingMenu::None => {}
             }
 
             match ev.code {
@@ -552,11 +550,9 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             user_state_dir: user_state_dir.clone(),
                             user_config_dir: user_config_dir.clone(),
                             project_config_dir: project_config_dir.clone(),
-                            pending_model_choice: pending_model_choice.clone(),
+                            pending_menu: pending_menu.clone(),
                             always_allow: always_allow_snapshot.clone(),
                             always_deny: always_deny_snapshot.clone(),
-                            pending_permissions_menu: pending_permissions_menu.clone(),
-                            pending_resume_choice: pending_resume_choice.clone(),
                             agent: agent.clone(),
                             model: current_model.get(),
                         });
@@ -607,11 +603,9 @@ struct SlashContext {
     user_state_dir: std::path::PathBuf,
     user_config_dir: std::path::PathBuf,
     project_config_dir: std::path::PathBuf,
-    pending_model_choice: ntui::State<Option<Vec<(crate::config::connection::Connection, String)>>>,
+    pending_menu: ntui::State<PendingMenu>,
     always_allow: Vec<String>,
     always_deny: Vec<String>,
-    pending_permissions_menu: ntui::State<bool>,
-    pending_resume_choice: ntui::State<Option<Vec<crate::session::types::SessionSummary>>>,
     agent: Arc<Agent>,
     model: SharedModel,
 }
@@ -702,7 +696,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                             ),
                         });
                     });
-                    ctx.pending_model_choice.set(Some(choices.into_iter().take(9).collect()));
+                    ctx.pending_menu.set(PendingMenu::ModelChoice(choices.into_iter().take(9).collect()));
                 }
                 Err(e) => {
                     ctx.transcript.update(|entries| {
@@ -727,7 +721,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             ctx.transcript.update(|entries| {
                 entries.push(TranscriptEntry::SystemNotice { text });
             });
-            ctx.pending_permissions_menu.set(true);
+            ctx.pending_menu.set(PendingMenu::PermissionsMenu);
         }
         SlashCommand::ConnectionsList => {
             let paths = crate::config::paths::Paths {
@@ -943,7 +937,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                             text: format!("Select a session to resume (press the digit key):\n{}", listing.join("\n")),
                         });
                     });
-                    ctx.pending_resume_choice.set(Some(sessions.into_iter().take(9).collect()));
+                    ctx.pending_menu.set(PendingMenu::ResumeChoice(sessions.into_iter().take(9).collect()));
                 }
                 Err(e) => {
                     ctx.transcript.update(|entries| {
