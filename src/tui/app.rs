@@ -105,6 +105,25 @@ impl PartialEq for AppProps {
     }
 }
 
+/// Maps a numeric key press to a validated 0-based index, bounded by `max`
+/// (the number of items in the pending numbered list/menu). Returns `None`
+/// for non-digit keys, `0`, or any digit beyond `max`. Shared by all four
+/// "show a numbered list, then intercept the next digit press" pending-choice
+/// blocks in `use_input` below (`pending_permission`, `pending_model_choice`,
+/// `pending_permissions_menu`, `pending_resume_choice`) — extracted per code
+/// review after Task 11, which flagged the duplicated digit-matching
+/// boilerplate across what was then three (now four) near-identical blocks.
+fn digit_key_to_index(code: KeyCode, max: usize) -> Option<usize> {
+    if let KeyCode::Char(c) = code {
+        if let Some(digit) = c.to_digit(10) {
+            if digit >= 1 && (digit as usize) <= max {
+                return Some(digit as usize - 1);
+            }
+        }
+    }
+    None
+}
+
 fn tier_label(tier: PermissionTier) -> &'static str {
     match tier {
         PermissionTier::Ask => "ask",
@@ -147,6 +166,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     // silently swallowed and this stays `true`, leaving the user stuck until
     // they press a valid digit.
     let pending_permissions_menu = hooks.use_state(|| false);
+    // Known v1 limitation, same shape as `pending_model_choice` above: once
+    // this is `Some` (the `/resume` numbered list is showing), there is no
+    // cancel/escape path. Any keystroke that isn't a valid in-range digit is
+    // silently swallowed and this stays `Some`, leaving the user stuck until
+    // they press a valid digit.
+    let pending_resume_choice =
+        hooks.use_state(|| Option::<Vec<crate::session::types::SessionSummary>>::None);
 
     let always_allow_snapshot = props.always_allow.clone();
     let always_deny_snapshot = props.always_deny.clone();
@@ -237,6 +263,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let pending_permission = pending_permission.clone();
         let pending_model_choice = pending_model_choice.clone();
         let pending_permissions_menu = pending_permissions_menu.clone();
+        let pending_resume_choice = pending_resume_choice.clone();
         let responder = responder.clone();
         let tier = tier.clone();
         let session_path = session_path.clone();
@@ -255,14 +282,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let current_model = current_model.clone();
         move |ev, _ctx| {
             if pending_permission.get().is_some() {
-                let decision = match ev.code {
-                    KeyCode::Char('1') => Some(PermissionDecision::Allow),
-                    KeyCode::Char('2') => Some(PermissionDecision::AllowAlwaysThisSession),
-                    KeyCode::Char('3') => Some(PermissionDecision::Deny {
+                let decision = digit_key_to_index(ev.code, 3).map(|idx| match idx {
+                    0 => PermissionDecision::Allow,
+                    1 => PermissionDecision::AllowAlwaysThisSession,
+                    _ => PermissionDecision::Deny {
                         feedback: "denied via TUI".into(),
-                    }),
-                    _ => None,
-                };
+                    },
+                });
                 if let Some(decision) = decision {
                     let allowed = !matches!(decision, PermissionDecision::Deny { .. });
                     if let Some(request) = pending_permission.get() {
@@ -283,72 +309,68 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
             // without clearing `pending_model_choice`) — known v1 limitation,
             // not a bug.
             if let Some(choices) = pending_model_choice.get() {
-                if let KeyCode::Char(c) = ev.code {
-                    if let Some(digit) = c.to_digit(10) {
-                        if digit >= 1 && (digit as usize) <= choices.len() {
-                            let (connection, model_name) = choices[digit as usize - 1].clone();
-                            pending_model_choice.set(None);
-                            let api_key =
-                                crate::config::secrets::SecretStore::get_api_key(&connection.name)
-                                    .ok()
-                                    .flatten();
-                            match crate::agent::provider::build_model(&connection, api_key) {
-                                Ok(new_model) => {
-                                    let agent_for_history = agent.clone();
-                                    let pending_permission_for_rebuild = pending_permission.clone();
-                                    let agent_and_responder = agent_and_responder.clone();
-                                    let current_model = current_model.clone();
-                                    let model_for_state = new_model.clone();
-                                    let transcript_for_notice = transcript.clone();
-                                    let tier_value = tier.get();
-                                    let always_allow = always_allow_snapshot.clone();
-                                    let always_deny = always_deny_snapshot.clone();
-                                    let system_context = system_context.clone();
-                                    let mcp_tools = mcp_tools_snapshot.clone();
-                                    tokio::spawn(async move {
-                                        let history = agent_for_history
-                                            .memory()
-                                            .get_messages_erased()
-                                            .await
-                                            .unwrap_or_default();
-                                        let rebuilt = crate::tui::rebuild::rebuild_agent(
-                                            new_model,
-                                            tier_value,
-                                            always_allow,
-                                            always_deny,
-                                            history,
-                                            &system_context,
-                                            mcp_tools,
-                                            pending_permission_for_rebuild,
-                                        );
-                                        // Last-write-wins: if multiple `/model` selections somehow
-                                        // overlap in flight, whichever `set` call completes last
-                                        // wins regardless of submission order. Narrow window today
-                                        // since rebuild does no real I/O, but worth revisiting if it grows any.
-                                        agent_and_responder.set(rebuilt);
-                                        // Kept in lockstep with `agent_and_responder` above (Bug 2
-                                        // fix): without this, `SlashContext.model` (built from
-                                        // `current_model.get()` in the `Enter` branch below) would
-                                        // keep pointing at the pre-switch model forever.
-                                        current_model.set(model_for_state);
-                                        transcript_for_notice.update(|entries| {
-                                            entries.push(TranscriptEntry::SystemNotice {
-                                                text: format!(
-                                                    "switched to {} · {}",
-                                                    connection.name, model_name
-                                                ),
-                                            });
-                                        });
+                if let Some(idx) = digit_key_to_index(ev.code, choices.len()) {
+                    let (connection, model_name) = choices[idx].clone();
+                    pending_model_choice.set(None);
+                    let api_key =
+                        crate::config::secrets::SecretStore::get_api_key(&connection.name)
+                            .ok()
+                            .flatten();
+                    match crate::agent::provider::build_model(&connection, api_key) {
+                        Ok(new_model) => {
+                            let agent_for_history = agent.clone();
+                            let pending_permission_for_rebuild = pending_permission.clone();
+                            let agent_and_responder = agent_and_responder.clone();
+                            let current_model = current_model.clone();
+                            let model_for_state = new_model.clone();
+                            let transcript_for_notice = transcript.clone();
+                            let tier_value = tier.get();
+                            let always_allow = always_allow_snapshot.clone();
+                            let always_deny = always_deny_snapshot.clone();
+                            let system_context = system_context.clone();
+                            let mcp_tools = mcp_tools_snapshot.clone();
+                            tokio::spawn(async move {
+                                let history = agent_for_history
+                                    .memory()
+                                    .get_messages_erased()
+                                    .await
+                                    .unwrap_or_default();
+                                let rebuilt = crate::tui::rebuild::rebuild_agent(
+                                    new_model,
+                                    tier_value,
+                                    always_allow,
+                                    always_deny,
+                                    history,
+                                    &system_context,
+                                    mcp_tools,
+                                    pending_permission_for_rebuild,
+                                );
+                                // Last-write-wins: if multiple `/model` selections somehow
+                                // overlap in flight, whichever `set` call completes last
+                                // wins regardless of submission order. Narrow window today
+                                // since rebuild does no real I/O, but worth revisiting if it grows any.
+                                agent_and_responder.set(rebuilt);
+                                // Kept in lockstep with `agent_and_responder` above (Bug 2
+                                // fix): without this, `SlashContext.model` (built from
+                                // `current_model.get()` in the `Enter` branch below) would
+                                // keep pointing at the pre-switch model forever.
+                                current_model.set(model_for_state);
+                                transcript_for_notice.update(|entries| {
+                                    entries.push(TranscriptEntry::SystemNotice {
+                                        text: format!(
+                                            "switched to {} · {}",
+                                            connection.name, model_name
+                                        ),
                                     });
-                                }
-                                Err(e) => {
-                                    transcript.update(|entries| {
-                                        entries.push(TranscriptEntry::SystemNotice {
-                                            text: format!("failed to switch model: {e}"),
-                                        });
-                                    });
-                                }
-                            }
+                                });
+                            });
+                        }
+                        Err(e) => {
+                            transcript.update(|entries| {
+                                entries.push(TranscriptEntry::SystemNotice {
+                                    text: format!("failed to switch model: {e}"),
+                                });
+                            });
                         }
                     }
                 }
@@ -360,12 +382,11 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
             // keystroke while the permissions menu is pending is silently
             // swallowed without clearing `pending_permissions_menu`.
             if pending_permissions_menu.get() {
-                let new_tier = match ev.code {
-                    KeyCode::Char('1') => Some(PermissionTier::Ask),
-                    KeyCode::Char('2') => Some(PermissionTier::AutoAcceptEdits),
-                    KeyCode::Char('3') => Some(PermissionTier::FullAuto),
-                    _ => None,
-                };
+                let new_tier = digit_key_to_index(ev.code, 3).map(|idx| match idx {
+                    0 => PermissionTier::Ask,
+                    1 => PermissionTier::AutoAcceptEdits,
+                    _ => PermissionTier::FullAuto,
+                });
                 if let Some(new_tier) = new_tier {
                     tier.set(new_tier);
                     pending_permissions_menu.set(false);
@@ -374,6 +395,86 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             text: format!("permission tier set to {new_tier:?}"),
                         });
                     });
+                }
+                return;
+            }
+
+            // No cancel/escape path exists here either (same known v1
+            // limitation as the other pending-choice blocks above) — a
+            // non-digit keystroke while the resume list is pending is
+            // silently swallowed without clearing `pending_resume_choice`.
+            if let Some(sessions) = pending_resume_choice.get() {
+                if let Some(idx) = digit_key_to_index(ev.code, sessions.len()) {
+                    let summary = sessions[idx].clone();
+                    pending_resume_choice.set(None);
+                    match crate::session::store::load_session(&summary.path) {
+                        Ok(session) => {
+                            let paths_lookup = crate::config::connection::load_connections(
+                                &user_config_dir,
+                                &project_config_dir,
+                            );
+                            let resolved_connection = paths_lookup
+                                .ok()
+                                .and_then(|conns| conns.into_iter().find(|c| c.name == session.connection_name));
+
+                            match resolved_connection {
+                                Some(mut connection) => {
+                                    connection.default_model = session.model_name.clone();
+                                    let api_key = crate::config::secrets::SecretStore::get_api_key(&connection.name)
+                                        .ok()
+                                        .flatten();
+                                    match crate::agent::provider::build_model(&connection, api_key) {
+                                        Ok(new_model) => {
+                                            let model_for_state = new_model.clone();
+                                            let rebuilt = crate::tui::rebuild::rebuild_agent(
+                                                new_model,
+                                                session.tier,
+                                                always_allow_snapshot.clone(),
+                                                always_deny_snapshot.clone(),
+                                                session.messages.clone(),
+                                                &system_context,
+                                                mcp_tools_snapshot.clone(),
+                                                pending_permission.clone(),
+                                            );
+                                            agent_and_responder.set(rebuilt);
+                                            // Kept in lockstep with `agent_and_responder`, mirroring
+                                            // the `/model` fix for Bug 2 above — without this,
+                                            // `SlashContext.model` (used by `/compact`) would keep
+                                            // pointing at the pre-resume model forever.
+                                            current_model.set(model_for_state);
+                                            tier.set(session.tier);
+                                            transcript.set(session.entries.clone());
+                                            session_path.set(summary.path.clone());
+                                        }
+                                        Err(e) => {
+                                            transcript.update(|entries| {
+                                                entries.push(TranscriptEntry::SystemNotice {
+                                                    text: format!("failed to resume: could not build model: {e}"),
+                                                });
+                                            });
+                                        }
+                                    }
+                                }
+                                None => {
+                                    transcript.update(|entries| {
+                                        entries.push(TranscriptEntry::SystemNotice {
+                                            text: format!(
+                                                "failed to resume: connection '{}' no longer exists; run `local-code connections list`",
+                                                session.connection_name
+                                            ),
+                                        });
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            transcript.update(|entries| {
+                                entries.push(TranscriptEntry::SystemNotice {
+                                    text: format!("failed to load session: {e}"),
+                                });
+                            });
+                        }
+                    }
                 }
                 return;
             }
@@ -422,6 +523,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             always_allow: always_allow_snapshot.clone(),
                             always_deny: always_deny_snapshot.clone(),
                             pending_permissions_menu: pending_permissions_menu.clone(),
+                            pending_resume_choice: pending_resume_choice.clone(),
                             agent: agent.clone(),
                             model: current_model.get(),
                         });
@@ -476,6 +578,7 @@ struct SlashContext {
     always_allow: Vec<String>,
     always_deny: Vec<String>,
     pending_permissions_menu: ntui::State<bool>,
+    pending_resume_choice: ntui::State<Option<Vec<crate::session::types::SessionSummary>>>,
     agent: Arc<Agent>,
     model: SharedModel,
 }
@@ -774,16 +877,50 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 }
             });
         }
-        // Tasks 14–15 fill in every remaining variant. Left unmatched here
-        // deliberately would be a compile error (the match is exhaustive),
-        // which is why Task 9 (the very next task) adds `Clear` immediately
-        // rather than leaving this plan in a non-compiling state at the end
-        // of this task; see that task's Step 1.
-        other => unreachable!(
-            "SlashCommand::{other:?} is handled by a later task in this plan; if you see this at \
-             runtime while implementing Task 8 in isolation, that's expected — Task 9 replaces this \
-             arm before the plan is done"
-        ),
+        SlashCommand::Resume => {
+            match crate::session::store::list_sessions(&ctx.user_state_dir, &ctx.project_root) {
+                Ok(sessions) if sessions.is_empty() => {
+                    ctx.transcript.update(|entries| {
+                        entries.push(TranscriptEntry::SystemNotice {
+                            text: "no previous sessions found for this project".to_string(),
+                        });
+                    });
+                }
+                Ok(sessions) => {
+                    let listing: Vec<String> = sessions
+                        .iter()
+                        .enumerate()
+                        .take(9)
+                        .map(|(i, s)| {
+                            format!(
+                                "{}) {} · {} · {}{}",
+                                i + 1,
+                                s.updated_at,
+                                s.connection_name,
+                                s.model_name,
+                                s.first_user_turn_preview
+                                    .as_ref()
+                                    .map(|p| format!(" · \"{p}\""))
+                                    .unwrap_or_default()
+                            )
+                        })
+                        .collect();
+                    ctx.transcript.update(|entries| {
+                        entries.push(TranscriptEntry::SystemNotice {
+                            text: format!("Select a session to resume (press the digit key):\n{}", listing.join("\n")),
+                        });
+                    });
+                    ctx.pending_resume_choice.set(Some(sessions.into_iter().take(9).collect()));
+                }
+                Err(e) => {
+                    ctx.transcript.update(|entries| {
+                        entries.push(TranscriptEntry::SystemNotice {
+                            text: format!("failed to list sessions: {e}"),
+                        });
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -1692,5 +1829,58 @@ models = ["test-model"]
 
         assert!(t.frame_text().contains("wrote AGENTS.md"), "{}", t.frame_text());
         assert!(dir.path().join("AGENTS.md").exists());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resume_command_reports_no_previous_sessions_when_none_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut props = test_props();
+        props.user_state_dir = dir.path().to_path_buf();
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+        type_and_submit(&mut t, "/resume").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("no previous sessions found"), "{}", t.frame_text());
+    }
+
+    // `/resume`'s listing reads `list_sessions(&ctx.user_state_dir,
+    // &ctx.project_root)`, and `ctx.project_root` is sourced from
+    // `AppProps::project_root` (see `init_command_writes_agents_md`'s comment
+    // above on the same fix) — not `std::env::current_dir()`. `test_props()`
+    // defaults `project_root` to an empty `PathBuf` (via `AppProps::default`),
+    // so this test sets `props.project_root` explicitly to a fixed path and
+    // saves the session fixture under that *same* path, rather than relying
+    // on `std::env::current_dir()` coincidentally matching whatever
+    // `test_props()` defaults to.
+    #[tokio::test(start_paused = true)]
+    async fn resume_command_lists_existing_sessions_and_resuming_restores_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_root = std::path::PathBuf::from("/some/fixed/project-root");
+        let mut session = crate::session::types::SessionFile::new(
+            project_root.clone(),
+            "some-connection".into(),
+            "some-model".into(),
+            PermissionTier::FullAuto,
+            "2026-07-06T09:00:00Z".into(),
+        );
+        session.entries.push(TranscriptEntry::UserTurn { text: "earlier turn".into() });
+        let path = crate::session::paths::new_session_path(dir.path(), &project_root, chrono::Utc::now());
+        crate::session::store::save_session(&path, &session).unwrap();
+
+        let mut props = test_props();
+        props.user_state_dir = dir.path().to_path_buf();
+        props.project_root = project_root;
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+        type_and_submit(&mut t, "/resume").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("some-connection"), "{}", t.frame_text());
+
+        // Resuming when the session's connection is no longer configured
+        // (test_props() sets up no real connections.toml) surfaces the
+        // clear "connection no longer exists" notice rather than panicking —
+        // this exercises that failure path explicitly, since it's the
+        // reachable one without a full connections.toml fixture.
+        t.send_key(KeyCode::Char('1')).unwrap();
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("no longer exists"), "{}", t.frame_text());
     }
 }
