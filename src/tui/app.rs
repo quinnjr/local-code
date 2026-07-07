@@ -206,6 +206,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let connection_name = props.connection_name.clone();
         let model_name = props.model_name.clone();
         let tier = tier.clone();
+        let project_root = props.project_root.clone();
         move || {
             let Some(input) = pending_turn_input.get() else {
                 return Cleanup::from(());
@@ -221,7 +222,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 connection_name.clone(),
                 model_name.clone(),
                 tier.get(),
-                std::env::current_dir().unwrap_or_default(),
+                project_root.clone(),
             ));
             Cleanup::from(move || handle.abort())
         }
