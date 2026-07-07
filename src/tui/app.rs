@@ -6,13 +6,12 @@ use daimon::agent::Agent;
 use daimon::model::SharedModel;
 use daimon::stream::StreamEvent;
 use futures::StreamExt;
-use ntui::props::{Dimension, FlexDirection, TextWrap};
-use ntui::style::Color;
+use ntui::props::{Dimension, FlexDirection};
 use ntui::{component, element, Cleanup, Element, KeyCode};
 
 use crate::permissions::types::{PermissionDecision, PermissionTier};
 use crate::tui::components::transcript::{Transcript, TranscriptProps};
-use crate::tui::components::{Footer, FooterProps, Header, HeaderProps, InputBox, InputBoxProps};
+use crate::tui::components::{Dashboard, DashboardProps, Footer, FooterProps, InputBox, InputBoxProps};
 use crate::tui::permission_prompter::NtuiPermissionPrompter;
 use crate::tui::state::{
     find_tool_call_mut, toggle_last_tool_call_expanded, ToolCallEntry, ToolCallResult,
@@ -602,37 +601,19 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let mut body: Vec<Element> = Vec::new();
     body.push(
         element! {
-            Header(connection_name: connection_display.get(), model_name: model_display.get(), tier_label: tier_label(tier.get()).to_string())
+            Dashboard(
+                connection_name: connection_display.get(),
+                model_name: model_display.get(),
+                tier_label: tier_label(tier.get()).to_string(),
+                usage: usage.get(),
+                streaming: streaming.get(),
+                session_path: session_path.get().display().to_string(),
+                created_at: created_at.get(),
+                project_root: props.project_root.display().to_string(),
+            )
         }
         .with_key("header"),
     );
-    if transcript.get().is_empty() {
-        // Rendered one `Text` per line (rather than a single multi-line
-        // `Text`) with `TextWrap::Truncate`: ntui's `TextWrap::Wrap` path
-        // always runs content through its word-wrapper, which collapses runs
-        // of interior spaces to a single space — fine for prose, fatal for
-        // hand-spaced ASCII art. `Truncate` slices the raw string verbatim
-        // (only reflowing by dropping a trailing `…` if a line overflows the
-        // box), so the art's spacing survives untouched.
-        let mascot_lines: Vec<Element> = MASCOT
-            .lines()
-            .enumerate()
-            .map(|(i, line)| {
-                element! {
-                    Text(content: line.to_string(), color: Color::Cyan, wrap: TextWrap::Truncate)
-                }
-                .with_key(format!("mascot-line-{i}"))
-            })
-            .collect();
-        body.push(
-            element! {
-                View(flex_direction: FlexDirection::Column, padding: 1) {
-                    #(mascot_lines)
-                }
-            }
-            .with_key("mascot"),
-        );
-    }
     body.push(
         element! {
             Transcript(entries: transcript.get(), pending_permission: pending_permission.get())
@@ -681,13 +662,6 @@ struct SlashContext {
     agent: Arc<Agent>,
     model: SharedModel,
 }
-
-/// The project's ASCII-art mascot, shown once above an empty transcript at
-/// startup (see `App`'s render body) — never persisted to the session file
-/// and never re-shown once the first turn is submitted, since it's rendered
-/// purely from `transcript.get().is_empty()` rather than being seeded into
-/// `initial_entries`.
-const MASCOT: &str = include_str!("../../assets/mascot.txt");
 
 const HELP_TEXT: &str = "\
 /model                     switch the active connection/model (history is kept)
@@ -1605,39 +1579,6 @@ mod tests {
         // number.
         assert!(!text.contains("0 in / 0 out"), "usage should have accumulated: {text}");
         assert!(text.contains("ready"), "turn should have finished: {text}");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn mascot_shows_on_a_fresh_session_and_disappears_after_the_first_turn() {
-        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
-        assert!(t.frame_text().contains("_____..---.._"), "{}", t.frame_text());
-
-        type_and_submit(&mut t, "hi there").await;
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            t.tick().await.unwrap();
-        }
-
-        assert!(!t.frame_text().contains("_____..---.._"), "{}", t.frame_text());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn mascot_is_never_persisted_to_the_session_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut props = test_props();
-        props.user_state_dir = dir.path().to_path_buf();
-        let session_path = dir.path().join("session.json");
-        props.session_path = session_path.clone();
-        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
-
-        type_and_submit(&mut t, "hi there").await;
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            t.tick().await.unwrap();
-        }
-
-        let saved = crate::session::store::load_session(&session_path).unwrap();
-        assert!(!saved.entries.iter().any(|e| matches!(e, TranscriptEntry::SystemNotice { text } if text.contains("_____..---.._"))));
     }
 
     #[tokio::test(start_paused = true)]
