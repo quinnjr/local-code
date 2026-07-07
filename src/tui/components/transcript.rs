@@ -45,11 +45,24 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
         }
     });
 
+    // Each entry is rendered via its own `TranscriptEntryView` component
+    // (rather than inlining `render_entry`'s output directly) so ntui's
+    // fiber reconciler can skip re-running the render body for entries
+    // whose content hasn't changed since the last render (`update_fiber`'s
+    // `props_eq` check in `ntui`'s reconciler short-circuits before
+    // recursing when a `Component` fiber's props compare equal). Since
+    // `run_turn` only ever mutates the *last* entry while streaming, this
+    // means every earlier (unchanged) entry's rebuild is skipped on every
+    // streamed token, rather than being rebuilt from scratch on each
+    // `Transcript` render as before.
     let mut children: Vec<Element> = props
         .entries
         .iter()
         .enumerate()
-        .map(|(i, entry)| render_entry(entry).with_key(i.to_string()))
+        .map(|(i, entry)| {
+            Element::component::<TranscriptEntryView>(EntryProps { entry: entry.clone() })
+                .with_key(i.to_string())
+        })
         .collect();
 
     if let Some(request) = &props.pending_permission {
@@ -67,6 +80,29 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
             #(children)
         }
     }
+}
+
+/// Props for `TranscriptEntryView`, wrapping a single entry so it can be
+/// mounted as its own component fiber (see the doc comment at `Transcript`'s
+/// `children` construction above for why). `Default` is only ever exercised
+/// to satisfy `Component::Props`'s bound (this component is always mounted
+/// with a real entry via `element!`/`Element::component`, never defaulted).
+#[derive(Clone, PartialEq)]
+struct EntryProps {
+    entry: TranscriptEntry,
+}
+
+impl Default for EntryProps {
+    fn default() -> Self {
+        EntryProps {
+            entry: TranscriptEntry::SystemNotice { text: String::new() },
+        }
+    }
+}
+
+#[component]
+fn TranscriptEntryView(props: &EntryProps, _hooks: &mut ntui::Hooks) -> Element {
+    render_entry(&props.entry)
 }
 
 fn render_entry(entry: &TranscriptEntry) -> Element {
