@@ -1980,4 +1980,71 @@ models = ["test-model"]
         t.tick().await.unwrap();
         assert!(t.frame_text().contains("no longer exists"), "{}", t.frame_text());
     }
+
+    // Closes the coverage gap the test above deliberately leaves open: that
+    // test only exercises listing plus the "connection no longer exists"
+    // failure branch, since `test_props()` wires up no real connections.toml.
+    // This test follows `model_switch_updates_the_header_display`'s fixture
+    // pattern (a real `connections.toml` under tempdir-backed
+    // `user_config_dir`/`project_config_dir`) so the *success* branch of
+    // `/resume` — rebuilding the agent, restoring the transcript, and
+    // refreshing the Header — is exercised too.
+    #[tokio::test(start_paused = true)]
+    async fn resume_command_success_path_restores_transcript_and_updates_header() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let user_config_dir = tempfile::tempdir().unwrap();
+        let project_config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_config_dir.path().join("connections.toml"),
+            r#"
+[[connection]]
+name = "resumed-connection"
+provider = "ollama"
+base_url = "http://127.0.0.1:1"
+default_model = "irrelevant-default"
+models = ["irrelevant-default", "resumed-model"]
+"#,
+        )
+        .unwrap();
+
+        let project_root = std::path::PathBuf::from("/some/fixed/project-root");
+        let mut session = crate::session::types::SessionFile::new(
+            project_root.clone(),
+            "resumed-connection".into(),
+            "resumed-model".into(),
+            PermissionTier::Ask,
+            "2026-07-06T09:00:00Z".into(),
+        );
+        session.entries.push(TranscriptEntry::UserTurn { text: "earlier turn".into() });
+        let path = crate::session::paths::new_session_path(state_dir.path(), &project_root, chrono::Utc::now());
+        crate::session::store::save_session(&path, &session).unwrap();
+
+        let mut props = test_props();
+        props.user_state_dir = state_dir.path().to_path_buf();
+        props.user_config_dir = user_config_dir.path().to_path_buf();
+        props.project_config_dir = project_config_dir.path().to_path_buf();
+        props.project_root = project_root;
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        // Sanity check: the Header starts out showing test_props()'s
+        // original connection/model, exactly as it did before the fix this
+        // guards (Header staleness after in-TUI /model and /resume switches).
+        assert!(t.frame_text().contains("local-vllm"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "/resume").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("resumed-connection"), "{}", t.frame_text());
+
+        t.send_key(KeyCode::Char('1')).unwrap();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+
+        let text = t.frame_text();
+        assert!(!text.contains("no longer exists"), "{text}");
+        assert!(!text.contains("failed to resume"), "{text}");
+        assert!(text.contains("earlier turn"), "{text}");
+        assert!(text.contains("resumed-connection") && text.contains("resumed-model"), "{text}");
+    }
 }
