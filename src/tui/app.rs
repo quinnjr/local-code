@@ -70,6 +70,12 @@ pub struct AppProps {
     /// current directory — a mutation that would otherwise race any other
     /// test in the (parallel-by-default) suite that reads or depends on cwd.
     pub project_root: std::path::PathBuf,
+    /// The session's creation timestamp (`SessionFile::created_at`), seeded
+    /// once at mount (fresh launch or `--resume`) and kept in sync by
+    /// `/clear` and `/resume`'s in-TUI handlers. Lets `run_turn` avoid a
+    /// full session-file read+parse on every turn just to recover this one
+    /// already-known field (see `run_turn`'s `created_at` state).
+    pub created_at: String,
 }
 
 impl Default for AppProps {
@@ -90,6 +96,7 @@ impl Default for AppProps {
             user_config_dir: std::path::PathBuf::new(),
             project_config_dir: std::path::PathBuf::new(),
             project_root: std::path::PathBuf::new(),
+            created_at: String::new(),
         }
     }
 }
@@ -181,6 +188,14 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let initial = props.session_path.clone();
         move || initial
     });
+    // Mirrors `session_path`'s threading: seeded once from `props` (fresh
+    // launch or `--resume`), then kept in sync by `/clear` and `/resume`'s
+    // handlers below so `run_turn` never has to re-read the session file
+    // from disk just to recover this single static field.
+    let created_at = hooks.use_state({
+        let initial = props.created_at.clone();
+        move || initial
+    });
     let pending_permission =
         hooks.use_state(|| Option::<crate::permissions::types::PermissionRequest>::None);
     let pending_menu = hooks.use_state(|| PendingMenu::None);
@@ -254,6 +269,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let streaming = streaming.clone();
         let agent = agent.clone();
         let session_path = session_path.clone();
+        let created_at = created_at.clone();
         let connection_name = props.connection_name.clone();
         let model_name = props.model_name.clone();
         let tier = tier.clone();
@@ -270,6 +286,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 streaming,
                 pending_turn_input,
                 session_path.clone(),
+                created_at.clone(),
                 connection_name.clone(),
                 model_name.clone(),
                 tier.get(),
@@ -290,6 +307,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let responder = responder.clone();
         let tier = tier.clone();
         let session_path = session_path.clone();
+        let created_at = created_at.clone();
         let connection_name = props.connection_name.clone();
         let model_name = props.model_name.clone();
         let user_state_dir = props.user_state_dir.clone();
@@ -474,6 +492,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                 tier.set(session.tier);
                                                 transcript.set(session.entries.clone());
                                                 session_path.set(summary.path.clone());
+                                                created_at.set(session.created_at.clone());
                                             }
                                             Err(e) => {
                                                 transcript.update(|entries| {
@@ -544,6 +563,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             transcript: transcript.clone(),
                             tier: tier.clone(),
                             session_path: session_path.clone(),
+                            created_at: created_at.clone(),
                             connection_name: connection_name.clone(),
                             model_name: model_name.clone(),
                             project_root: project_root.clone(),
@@ -597,6 +617,7 @@ struct SlashContext {
     transcript: ntui::State<Vec<TranscriptEntry>>,
     tier: ntui::State<PermissionTier>,
     session_path: ntui::State<std::path::PathBuf>,
+    created_at: ntui::State<String>,
     connection_name: String,
     model_name: String,
     project_root: std::path::PathBuf,
@@ -641,6 +662,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
         SlashCommand::Clear => {
             ctx.transcript.set(Vec::new());
             let now = chrono::Utc::now();
+            let new_created_at = now.to_rfc3339();
             let new_path = crate::session::paths::new_session_path(
                 &ctx.user_state_dir,
                 &ctx.project_root,
@@ -651,7 +673,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 ctx.connection_name.clone(),
                 ctx.model_name.clone(),
                 ctx.tier.get(),
-                now.to_rfc3339(),
+                new_created_at.clone(),
             );
             if let Err(e) = crate::session::store::save_session(&new_path, &fresh) {
                 ctx.transcript.update(|entries| {
@@ -661,6 +683,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 });
             }
             ctx.session_path.set(new_path);
+            ctx.created_at.set(new_created_at);
         }
         SlashCommand::Model => {
             match crate::config::connection::load_connections(&ctx.user_config_dir, &ctx.project_config_dir) {
@@ -1076,6 +1099,7 @@ async fn run_turn(
     streaming: ntui::State<bool>,
     pending_turn_input: ntui::State<Option<String>>,
     session_path: ntui::State<std::path::PathBuf>,
+    created_at: ntui::State<String>,
     connection_name: String,
     model_name: String,
     tier: PermissionTier,
@@ -1210,15 +1234,12 @@ async fn run_turn(
 
     if let Ok(messages) = agent.memory().get_messages_erased().await {
         let now = chrono::Utc::now().to_rfc3339();
-        let created_at = crate::session::store::load_session(&session_path.get())
-            .map(|existing| existing.created_at)
-            .unwrap_or_else(|_| now.clone());
         let mut session = crate::session::types::SessionFile::new(
             project_root,
             connection_name,
             model_name,
             tier,
-            created_at,
+            created_at.get(),
         );
         session.updated_at = now;
         session.entries = transcript.get();
@@ -1384,6 +1405,7 @@ mod tests {
         let streaming = hooks.use_state(|| false);
         let pending_turn_input = hooks.use_state(|| Option::<String>::None);
         let session_path = hooks.use_state(std::path::PathBuf::new);
+        let created_at = hooks.use_state(|| "2026-01-01T00:00:00Z".to_string());
 
         hooks.use_effect((), {
             let slot = props.slot.clone();
@@ -1393,6 +1415,7 @@ mod tests {
             let streaming = streaming.clone();
             let pending_turn_input = pending_turn_input.clone();
             let session_path = session_path.clone();
+            let created_at = created_at.clone();
             move || {
                 let agent = Arc::new(match mode {
                     HarnessMode::ToolCall => Agent::builder()
@@ -1413,6 +1436,7 @@ mod tests {
                     streaming,
                     pending_turn_input,
                     session_path,
+                    created_at,
                     "local-vllm".into(),
                     "qwen2.5-coder-32b".into(),
                     PermissionTier::FullAuto,
@@ -1636,6 +1660,7 @@ mod tests {
         let mut props = test_props();
         props.user_state_dir = dir.path().to_path_buf();
         props.session_path = dir.path().join("session.json");
+        props.created_at = "2026-07-06T00:00:00Z".into();
         crate::session::store::save_session(
             &props.session_path,
             &crate::session::types::SessionFile::new(
@@ -1659,6 +1684,49 @@ mod tests {
         let saved = crate::session::store::load_session(&session_path).unwrap();
         assert!(saved.entries.iter().any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there")));
         assert!(!saved.messages.is_empty());
+        assert_eq!(saved.created_at, "2026-07-06T00:00:00Z");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_turn_persists_the_seeded_created_at_not_the_disk_value() {
+        // `run_turn` must source `created_at` from the seeded in-memory state
+        // (`props.created_at`, threaded through `use_state`), not by re-reading
+        // the session file off disk via `load_session(...)`. Seed the props
+        // with one timestamp and write a *different* timestamp into the
+        // on-disk session file first (mimicking what a stale disk read would
+        // still see) to make sure the two can't be confused: only the seeded
+        // value should ever end up back on disk after a turn completes.
+        let dir = tempfile::tempdir().unwrap();
+        let mut props = test_props();
+        props.user_state_dir = dir.path().to_path_buf();
+        props.session_path = dir.path().join("session.json");
+        props.created_at = "2099-01-01T00:00:00Z".into();
+        crate::session::store::save_session(
+            &props.session_path,
+            &crate::session::types::SessionFile::new(
+                std::path::PathBuf::from("/proj"),
+                "local-vllm".into(),
+                "m".into(),
+                PermissionTier::FullAuto,
+                "2026-07-06T00:00:00Z".into(),
+            ),
+        )
+        .unwrap();
+        let session_path = props.session_path.clone();
+
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+        type_and_submit(&mut t, "hi there").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+
+        let saved = crate::session::store::load_session(&session_path).unwrap();
+        assert_eq!(
+            saved.created_at, "2099-01-01T00:00:00Z",
+            "created_at should come from the seeded in-memory state, not the stale on-disk value"
+        );
+        assert_ne!(saved.created_at, "2026-07-06T00:00:00Z");
     }
 
     #[tokio::test(start_paused = true)]

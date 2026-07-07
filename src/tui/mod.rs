@@ -66,6 +66,10 @@ pub struct ResumedSession {
     /// falling back to `--connection`/the single-connection default.
     pub connection_name: String,
     pub model_name: String,
+    /// The session's original creation timestamp (`SessionFile::created_at`),
+    /// carried through so `run_tui` can seed `App`'s `created_at` state
+    /// without re-reading the session file it already loaded here.
+    pub created_at: String,
 }
 
 /// Mirrors `local_code::agent::headless::run_headless`'s connection-selection
@@ -171,27 +175,29 @@ pub async fn run_tui(
     }
     let mcp_tools = mcp_report.tools;
 
-    let (initial_tier, initial_entries, initial_messages, session_path) = match resume {
+    let (initial_tier, initial_entries, initial_messages, session_path, created_at) = match resume {
         Some(resumed) => (
             permission_mode_override.unwrap_or(resumed.tier),
             resumed.entries,
             resumed.messages,
             resumed.session_path,
+            resumed.created_at,
         ),
         None => {
             let now = chrono::Utc::now();
             let path = new_session_path(&paths.user_state_dir, project_root, now);
             let tier = permission_mode_override.unwrap_or(PermissionTier::Ask);
+            let created_at = now.to_rfc3339();
             let session = SessionFile::new(
                 project_root.to_path_buf(),
                 connection.name.clone(),
                 connection.default_model.clone(),
                 tier,
-                now.to_rfc3339(),
+                created_at.clone(),
             );
             crate::session::store::save_session(&path, &session)
                 .map_err(TuiSessionError::Session)?;
-            (tier, Vec::new(), Vec::new(), path)
+            (tier, Vec::new(), Vec::new(), path, created_at)
         }
     };
 
@@ -211,6 +217,7 @@ pub async fn run_tui(
         user_config_dir: paths.user_config_dir.clone(),
         project_config_dir: paths.project_config_dir.clone(),
         project_root: project_root.to_path_buf(),
+        created_at,
     };
 
     ntui::render(ntui::element!(App(
@@ -228,7 +235,8 @@ pub async fn run_tui(
         user_state_dir: props.user_state_dir,
         user_config_dir: props.user_config_dir,
         project_config_dir: props.project_config_dir,
-        project_root: props.project_root
+        project_root: props.project_root,
+        created_at: props.created_at
     )))
     .await?;
     Ok(())
