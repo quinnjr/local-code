@@ -166,6 +166,7 @@ pub async fn run_tui(
         user_state_dir: paths.user_state_dir.clone(),
         user_config_dir: paths.user_config_dir.clone(),
         project_config_dir: paths.project_config_dir.clone(),
+        project_root: project_root.to_path_buf(),
     };
 
     ntui::render(ntui::element!(App(
@@ -182,7 +183,8 @@ pub async fn run_tui(
         session_path: props.session_path,
         user_state_dir: props.user_state_dir,
         user_config_dir: props.user_config_dir,
-        project_config_dir: props.project_config_dir
+        project_config_dir: props.project_config_dir,
+        project_root: props.project_root
     )))
     .await?;
     Ok(())

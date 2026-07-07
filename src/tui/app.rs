@@ -63,6 +63,13 @@ pub struct AppProps {
     /// Needed so `/model` can call `load_connections` without re-deriving
     /// `Paths` from scratch inside `App`.
     pub project_config_dir: std::path::PathBuf,
+    /// The directory `/init` surveys and writes `AGENTS.md` into. Threaded
+    /// through props (rather than having the `Enter`-key handler call
+    /// `std::env::current_dir()` directly, as originally sketched) so tests
+    /// can point `/init` at a tempdir without mutating the process-global
+    /// current directory — a mutation that would otherwise race any other
+    /// test in the (parallel-by-default) suite that reads or depends on cwd.
+    pub project_root: std::path::PathBuf,
 }
 
 impl Default for AppProps {
@@ -82,6 +89,7 @@ impl Default for AppProps {
             user_state_dir: std::path::PathBuf::new(),
             user_config_dir: std::path::PathBuf::new(),
             project_config_dir: std::path::PathBuf::new(),
+            project_root: std::path::PathBuf::new(),
         }
     }
 }
@@ -236,6 +244,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let user_state_dir = props.user_state_dir.clone();
         let user_config_dir = props.user_config_dir.clone();
         let project_config_dir = props.project_config_dir.clone();
+        let project_root = props.project_root.clone();
         let agent = agent.clone();
         let agent_and_responder = agent_and_responder.clone();
         let always_allow_snapshot = always_allow_snapshot.clone();
@@ -404,7 +413,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             session_path: session_path.clone(),
                             connection_name: connection_name.clone(),
                             model_name: model_name.clone(),
-                            project_root: std::env::current_dir().unwrap_or_default(),
+                            project_root: project_root.clone(),
                             user_state_dir: user_state_dir.clone(),
                             user_config_dir: user_config_dir.clone(),
                             project_config_dir: project_config_dir.clone(),
@@ -730,6 +739,38 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                     compacted.extend(entries.split_off(keep_from));
                     *entries = compacted;
                 });
+            });
+        }
+        SlashCommand::Init => {
+            let model = ctx.model.clone();
+            let project_root = ctx.project_root.clone();
+            let transcript = ctx.transcript.clone();
+            transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice {
+                    text: "surveying the project and generating AGENTS.md…".to_string(),
+                });
+            });
+            tokio::spawn(async move {
+                let survey = crate::init::survey_project(&project_root);
+                match crate::init::generate_agents_md(&model, &survey).await {
+                    Ok(content) => match crate::init::write_agents_md(&project_root, &content) {
+                        Ok(()) => transcript.update(|entries| {
+                            entries.push(TranscriptEntry::SystemNotice {
+                                text: "wrote AGENTS.md".to_string(),
+                            });
+                        }),
+                        Err(e) => transcript.update(|entries| {
+                            entries.push(TranscriptEntry::SystemNotice {
+                                text: format!("/init failed to write AGENTS.md: {e}"),
+                            });
+                        }),
+                    },
+                    Err(e) => transcript.update(|entries| {
+                        entries.push(TranscriptEntry::SystemNotice {
+                            text: format!("/init failed: {e}"),
+                        });
+                    }),
+                }
             });
         }
         // Tasks 14–15 fill in every remaining variant. Left unmatched here
@@ -1623,5 +1664,32 @@ models = ["test-model"]
             "a successful compaction here would mean /compact used the stale \
              pre-switch model instead of the new one: {text}"
         );
+    }
+
+    // `/init` reads `ctx.project_root`, which is now sourced from
+    // `AppProps::project_root` rather than `std::env::current_dir()` (see
+    // that field's doc comment) — so this test points `/init` at a tempdir
+    // by setting `test_props().project_root` directly, with no
+    // `std::env::set_current_dir` involved. That sidesteps the flakiness the
+    // original plan flagged: a process-global cwd mutation would race any
+    // other test in this (parallel-by-default) suite that reads or depends
+    // on the current directory.
+    #[tokio::test(start_paused = true)]
+    async fn init_command_writes_agents_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"").unwrap();
+
+        let mut props = test_props();
+        props.project_root = dir.path().to_path_buf();
+
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+        type_and_submit(&mut t, "/init").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+
+        assert!(t.frame_text().contains("wrote AGENTS.md"), "{}", t.frame_text());
+        assert!(dir.path().join("AGENTS.md").exists());
     }
 }
