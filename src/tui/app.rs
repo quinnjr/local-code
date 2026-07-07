@@ -6,7 +6,7 @@ use daimon::agent::Agent;
 use daimon::model::SharedModel;
 use daimon::stream::StreamEvent;
 use futures::StreamExt;
-use ntui::props::{Dimension, FlexDirection};
+use ntui::props::{Dimension, FlexDirection, TextWrap};
 use ntui::style::Color;
 use ntui::{component, element, Cleanup, Element, KeyCode};
 
@@ -607,10 +607,27 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         .with_key("header"),
     );
     if transcript.get().is_empty() {
+        // Rendered one `Text` per line (rather than a single multi-line
+        // `Text`) with `TextWrap::Truncate`: ntui's `TextWrap::Wrap` path
+        // always runs content through its word-wrapper, which collapses runs
+        // of interior spaces to a single space — fine for prose, fatal for
+        // hand-spaced ASCII art. `Truncate` slices the raw string verbatim
+        // (only reflowing by dropping a trailing `…` if a line overflows the
+        // box), so the art's spacing survives untouched.
+        let mascot_lines: Vec<Element> = MASCOT
+            .lines()
+            .enumerate()
+            .map(|(i, line)| {
+                element! {
+                    Text(content: line.to_string(), color: Color::Cyan, wrap: TextWrap::Truncate)
+                }
+                .with_key(format!("mascot-line-{i}"))
+            })
+            .collect();
         body.push(
             element! {
-                View(padding: 1) {
-                    Text(content: MASCOT.to_string(), color: Color::Cyan)
+                View(flex_direction: FlexDirection::Column, padding: 1) {
+                    #(mascot_lines)
                 }
             }
             .with_key("mascot"),
@@ -636,7 +653,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     );
 
     element! {
-        View(flex_direction: FlexDirection::Column, height: Dimension::Percent(100.0), padding: 0) {
+        View(flex_direction: FlexDirection::Column, width: Dimension::Percent(100.0), height: Dimension::Percent(100.0), padding: 0) {
             #(body)
         }
     }
@@ -1593,7 +1610,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn mascot_shows_on_a_fresh_session_and_disappears_after_the_first_turn() {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
-        assert!(t.frame_text().contains("(@)"), "{}", t.frame_text());
+        assert!(t.frame_text().contains("_____..---.._"), "{}", t.frame_text());
 
         type_and_submit(&mut t, "hi there").await;
         for _ in 0..20 {
@@ -1601,7 +1618,7 @@ mod tests {
             t.tick().await.unwrap();
         }
 
-        assert!(!t.frame_text().contains("(@)"), "{}", t.frame_text());
+        assert!(!t.frame_text().contains("_____..---.._"), "{}", t.frame_text());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1620,7 +1637,7 @@ mod tests {
         }
 
         let saved = crate::session::store::load_session(&session_path).unwrap();
-        assert!(!saved.entries.iter().any(|e| matches!(e, TranscriptEntry::SystemNotice { text } if text.contains("(@)"))));
+        assert!(!saved.entries.iter().any(|e| matches!(e, TranscriptEntry::SystemNotice { text } if text.contains("_____..---.._"))));
     }
 
     #[tokio::test(start_paused = true)]

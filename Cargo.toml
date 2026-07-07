@@ -16,7 +16,7 @@ name = "mock_mcp_stdio_server"
 path = "src/bin/mock_mcp_stdio_server.rs"
 
 [dependencies]
-ntui = "0.1.0"
+ntui = "0.1.1"
 ntui-macros = "0.1.0"
 directories = "6.0"
 serde = { version = "1", features = ["derive"] }
