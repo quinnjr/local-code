@@ -25,6 +25,12 @@ pub struct Cli {
     /// Overrides the permission tier for `-p` (defaults to full-auto in headless mode).
     #[arg(long = "permission-mode", value_enum)]
     pub permission_mode: Option<PermissionModeArg>,
+
+    /// Resume a previous session for this project: lists recent sessions and
+    /// prompts for a choice (reading a line from stdin), or reopens the most
+    /// recent one automatically if exactly one exists.
+    #[arg(long)]
+    pub resume: bool,
 }
 
 #[derive(Subcommand)]
@@ -133,17 +139,158 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             }
         },
         None => {
+            let resume = if cli.resume {
+                let sessions = crate::session::store::list_sessions(&paths.user_state_dir, &project_root)?;
+                let chosen = select_session_to_resume(&sessions, stdin().lock(), stdout())?;
+                match chosen {
+                    Some(summary) => {
+                        let session = crate::session::store::load_session(&summary.path)?;
+                        Some(crate::tui::ResumedSession {
+                            session_path: summary.path,
+                            entries: session.entries,
+                            messages: session.messages,
+                            tier: session.tier,
+                        })
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+
             crate::tui::run_tui(
                 &paths,
                 &project_root,
                 cli.connection.as_deref(),
                 cli.permission_mode.map(PermissionModeArg::into_tier),
-                None,
+                resume,
             )
             .await?;
         }
     }
     Ok(())
+}
+
+use crate::session::types::SessionSummary;
+use std::io::{BufRead, Write};
+
+/// Resolves which session to resume from a listing, generic over
+/// `BufRead`/`Write` for the same testability reason Phase 1's `connections
+/// add` wizard is (`src/cli/connections.rs`). If exactly one session exists,
+/// it's returned without prompting ("reopens the most recent if
+/// unambiguous", per this plan's Architecture section); a blank line at the
+/// prompt also selects the most recent (index 1) as a convenient default.
+pub fn select_session_to_resume<R: BufRead, W: Write>(
+    sessions: &[SessionSummary],
+    mut input: R,
+    mut out: W,
+) -> anyhow::Result<Option<SessionSummary>> {
+    if sessions.is_empty() {
+        writeln!(out, "No previous sessions found for this project.")?;
+        return Ok(None);
+    }
+    if sessions.len() == 1 {
+        writeln!(out, "Resuming the only previous session ({}).", sessions[0].updated_at)?;
+        return Ok(Some(sessions[0].clone()));
+    }
+
+    writeln!(out, "Previous sessions for this project:")?;
+    for (i, s) in sessions.iter().enumerate() {
+        writeln!(
+            out,
+            "  {}) {} · {} · {}{}",
+            i + 1,
+            s.updated_at,
+            s.connection_name,
+            s.model_name,
+            s.first_user_turn_preview.as_ref().map(|p| format!(" · \"{p}\"")).unwrap_or_default()
+        )?;
+    }
+    write!(out, "Resume which session? [1-{}, blank for most recent]: ", sessions.len())?;
+    out.flush()?;
+
+    let mut line = String::new();
+    input.read_line(&mut line)?;
+    let trimmed = line.trim();
+    let index = if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= sessions.len()).map(|n| n - 1).unwrap_or(0)
+    };
+    Ok(Some(sessions[index].clone()))
+}
+
+#[cfg(test)]
+mod resume_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_resume_flag() {
+        let cli = Cli::parse_from(["local-code", "--resume"]);
+        assert!(cli.resume);
+    }
+
+    #[test]
+    fn resume_defaults_to_false() {
+        let cli = Cli::parse_from(["local-code"]);
+        assert!(!cli.resume);
+    }
+}
+
+#[cfg(test)]
+mod select_session_tests {
+    use super::*;
+
+    fn summary(connection: &str, updated_at: &str) -> SessionSummary {
+        SessionSummary {
+            path: format!("/sessions/{connection}.json").into(),
+            connection_name: connection.into(),
+            model_name: "m".into(),
+            updated_at: updated_at.into(),
+            first_user_turn_preview: None,
+        }
+    }
+
+    #[test]
+    fn returns_none_when_no_sessions_exist() {
+        let mut out = Vec::new();
+        let result = select_session_to_resume(&[], &b""[..], &mut out).unwrap();
+        assert!(result.is_none());
+        assert!(String::from_utf8(out).unwrap().contains("No previous sessions"));
+    }
+
+    #[test]
+    fn auto_selects_the_only_session_without_prompting() {
+        let sessions = vec![summary("only-one", "2026-07-06T00:00:00Z")];
+        let mut out = Vec::new();
+        let result = select_session_to_resume(&sessions, &b""[..], &mut out).unwrap();
+        assert_eq!(result.unwrap().connection_name, "only-one");
+    }
+
+    #[test]
+    fn blank_input_selects_the_most_recent() {
+        let sessions = vec![summary("newest", "2026-07-06T00:00:00Z"), summary("older", "2026-07-01T00:00:00Z")];
+        let mut out = Vec::new();
+        let result = select_session_to_resume(&sessions, &b"\n"[..], &mut out).unwrap();
+        assert_eq!(result.unwrap().connection_name, "newest");
+    }
+
+    #[test]
+    fn numeric_input_selects_by_index() {
+        let sessions = vec![summary("newest", "2026-07-06T00:00:00Z"), summary("older", "2026-07-01T00:00:00Z")];
+        let mut out = Vec::new();
+        let result = select_session_to_resume(&sessions, &b"2\n"[..], &mut out).unwrap();
+        assert_eq!(result.unwrap().connection_name, "older");
+    }
+
+    #[test]
+    fn out_of_range_input_falls_back_to_most_recent() {
+        let sessions = vec![summary("newest", "2026-07-06T00:00:00Z"), summary("older", "2026-07-01T00:00:00Z")];
+        let mut out = Vec::new();
+        let result = select_session_to_resume(&sessions, &b"99\n"[..], &mut out).unwrap();
+        assert_eq!(result.unwrap().connection_name, "newest");
+    }
 }
 
 #[cfg(test)]
