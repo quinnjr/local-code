@@ -14,6 +14,8 @@ pub enum InitError {
     Model(#[from] daimon::DaimonError),
     #[error("failed to write AGENTS.md: {0}")]
     Write(#[source] std::io::Error),
+    #[error("model returned an empty response; AGENTS.md left unchanged")]
+    EmptyResponse,
 }
 
 const INIT_SYSTEM_PROMPT: &str = "You are generating an AGENTS.md file for a coding project. \
@@ -33,7 +35,15 @@ pub async fn generate_agents_md(model: &SharedModel, survey: &ProjectSurvey) -> 
         max_tokens: Some(2048),
     };
     let response = model.generate_erased(&request).await?;
-    Ok(response.text().to_string())
+    let text = response.text().to_string();
+    // A blank/whitespace-only response is treated the same way
+    // `load_project_context` treats a blank AGENTS.md/CLAUDE.md: as meaningfully
+    // absent. Reject it here rather than letting `write_agents_md` silently
+    // overwrite a perfectly good existing AGENTS.md with nothing.
+    if text.trim().is_empty() {
+        return Err(InitError::EmptyResponse);
+    }
+    Ok(text)
 }
 
 /// Writes `content` to `<project_root>/AGENTS.md`, overwriting any existing
@@ -68,7 +78,11 @@ mod tests {
     #[tokio::test]
     async fn generate_agents_md_returns_the_models_text() {
         let model: SharedModel = Arc::new(FixedResponseModel("# AGENTS.md\n\nThis is a Rust crate.".into()));
-        let survey = ProjectSurvey { file_paths: vec!["Cargo.toml".into()], manifests: vec![] };
+        let survey = ProjectSurvey {
+            file_paths: vec!["Cargo.toml".into()],
+            manifests: vec![],
+            ..Default::default()
+        };
         let content = generate_agents_md(&model, &survey).await.unwrap();
         assert!(content.contains("This is a Rust crate."));
     }
@@ -80,6 +94,14 @@ mod tests {
         let written = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
         assert!(written.contains("content"));
         assert!(!dir.path().join("CLAUDE.md").exists());
+    }
+
+    #[tokio::test]
+    async fn generate_agents_md_rejects_a_blank_response() {
+        let model: SharedModel = Arc::new(FixedResponseModel("   \n\t  ".into()));
+        let survey = ProjectSurvey { file_paths: vec!["Cargo.toml".into()], ..Default::default() };
+        let err = generate_agents_md(&model, &survey).await.unwrap_err();
+        assert!(matches!(err, InitError::EmptyResponse));
     }
 
     #[test]

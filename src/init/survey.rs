@@ -13,6 +13,12 @@ pub struct ProjectSurvey {
     pub file_paths: Vec<String>,
     /// (relative path, file contents) pairs for recognized manifests.
     pub manifests: Vec<(String, String)>,
+    /// The true number of files encountered by the walk, regardless of
+    /// whether they made it into `file_paths` (which is capped at
+    /// `MAX_FILES_LISTED`). Lets callers detect and honestly disclose
+    /// truncation instead of reporting the capped `file_paths.len()` as if
+    /// it were the project's real file count.
+    pub total_files_seen: usize,
 }
 
 const RECOGNIZED_MANIFESTS: &[&str] = &[
@@ -50,6 +56,7 @@ pub fn survey_project(project_root: &Path) -> ProjectSurvey {
         let Ok(relative) = entry.path().strip_prefix(project_root) else { continue };
         let relative_str = relative.to_string_lossy().to_string();
 
+        survey.total_files_seen += 1;
         if survey.file_paths.len() < MAX_FILES_LISTED {
             survey.file_paths.push(relative_str.clone());
         }
@@ -105,5 +112,17 @@ mod tests {
         let survey = survey_project(dir.path());
         assert!(survey.file_paths.iter().any(|p| p == "notes.txt"));
         assert!(survey.manifests.is_empty());
+    }
+
+    #[test]
+    fn total_files_seen_counts_every_file_even_past_the_listed_cap() {
+        let dir = tempdir().unwrap();
+        for i in 0..(MAX_FILES_LISTED + 5) {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "x").unwrap();
+        }
+
+        let survey = survey_project(dir.path());
+        assert_eq!(survey.file_paths.len(), MAX_FILES_LISTED);
+        assert_eq!(survey.total_files_seen, MAX_FILES_LISTED + 5);
     }
 }
