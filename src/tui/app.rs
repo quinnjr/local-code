@@ -7,7 +7,8 @@ use daimon::model::SharedModel;
 use daimon::stream::StreamEvent;
 use futures::StreamExt;
 use ntui::props::{Dimension, FlexDirection};
-use ntui::{component, element, Cleanup, KeyCode};
+use ntui::style::Color;
+use ntui::{component, element, Cleanup, Element, KeyCode};
 
 use crate::permissions::types::{PermissionDecision, PermissionTier};
 use crate::tui::components::transcript::{Transcript, TranscriptProps};
@@ -598,12 +599,45 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         }
     });
 
+    let mut body: Vec<Element> = Vec::new();
+    body.push(
+        element! {
+            Header(connection_name: connection_display.get(), model_name: model_display.get(), tier_label: tier_label(tier.get()).to_string())
+        }
+        .with_key("header"),
+    );
+    if transcript.get().is_empty() {
+        body.push(
+            element! {
+                View(padding: 1) {
+                    Text(content: MASCOT.to_string(), color: Color::Cyan)
+                }
+            }
+            .with_key("mascot"),
+        );
+    }
+    body.push(
+        element! {
+            Transcript(entries: transcript.get(), pending_permission: pending_permission.get())
+        }
+        .with_key("transcript"),
+    );
+    body.push(
+        element! {
+            InputBox(buffer: input_buffer.get(), disabled: streaming.get())
+        }
+        .with_key("input"),
+    );
+    body.push(
+        element! {
+            Footer(usage: usage.get(), streaming: streaming.get())
+        }
+        .with_key("footer"),
+    );
+
     element! {
         View(flex_direction: FlexDirection::Column, height: Dimension::Percent(100.0), padding: 0) {
-            Header(connection_name: connection_display.get(), model_name: model_display.get(), tier_label: tier_label(tier.get()).to_string())
-            Transcript(entries: transcript.get(), pending_permission: pending_permission.get())
-            InputBox(buffer: input_buffer.get(), disabled: streaming.get())
-            Footer(usage: usage.get(), streaming: streaming.get())
+            #(body)
         }
     }
 }
@@ -630,6 +664,13 @@ struct SlashContext {
     agent: Arc<Agent>,
     model: SharedModel,
 }
+
+/// The project's ASCII-art mascot, shown once above an empty transcript at
+/// startup (see `App`'s render body) — never persisted to the session file
+/// and never re-shown once the first turn is submitted, since it's rendered
+/// purely from `transcript.get().is_empty()` rather than being seeded into
+/// `initial_entries`.
+const MASCOT: &str = include_str!("../../assets/mascot.txt");
 
 const HELP_TEXT: &str = "\
 /model                     switch the active connection/model (history is kept)
@@ -1547,6 +1588,39 @@ mod tests {
         // number.
         assert!(!text.contains("0 in / 0 out"), "usage should have accumulated: {text}");
         assert!(text.contains("ready"), "turn should have finished: {text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mascot_shows_on_a_fresh_session_and_disappears_after_the_first_turn() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        assert!(t.frame_text().contains("(@)"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "hi there").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+
+        assert!(!t.frame_text().contains("(@)"), "{}", t.frame_text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mascot_is_never_persisted_to_the_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut props = test_props();
+        props.user_state_dir = dir.path().to_path_buf();
+        let session_path = dir.path().join("session.json");
+        props.session_path = session_path.clone();
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "hi there").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+
+        let saved = crate::session::store::load_session(&session_path).unwrap();
+        assert!(!saved.entries.iter().any(|e| matches!(e, TranscriptEntry::SystemNotice { text } if text.contains("(@)"))));
     }
 
     #[tokio::test(start_paused = true)]
