@@ -187,6 +187,20 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let initial = props.model.clone().expect("AppProps::model is always Some");
         move || initial
     });
+    // Mirrors `current_model`'s Bug 2 fix, but for the `Header`'s displayed
+    // connection/model name: without this, a successful `/model` switch or
+    // `/resume` would correctly rebuild the agent yet leave the Header
+    // silently showing the connection/model the process launched with
+    // forever. Seeded from `props` at mount, then kept in lockstep with
+    // `agent_and_responder`/`current_model` at both switch sites below.
+    let connection_display = hooks.use_state({
+        let initial = props.connection_name.clone();
+        move || initial
+    });
+    let model_display = hooks.use_state({
+        let initial = props.model_name.clone();
+        move || initial
+    });
 
     let agent_and_responder = hooks.use_state({
         let model = props.model.clone().expect("AppProps::model is always Some");
@@ -280,6 +294,8 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let mcp_tools_snapshot = mcp_tools_snapshot.clone();
         let system_context = props.system_context.clone();
         let current_model = current_model.clone();
+        let connection_display = connection_display.clone();
+        let model_display = model_display.clone();
         move |ev, _ctx| {
             if pending_permission.get().is_some() {
                 let decision = digit_key_to_index(ev.code, 3).map(|idx| match idx {
@@ -329,6 +345,10 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             let always_deny = always_deny_snapshot.clone();
                             let system_context = system_context.clone();
                             let mcp_tools = mcp_tools_snapshot.clone();
+                            let connection_display = connection_display.clone();
+                            let model_display = model_display.clone();
+                            let connection_name_for_display = connection.name.clone();
+                            let model_name_for_display = model_name.clone();
                             tokio::spawn(async move {
                                 let history = agent_for_history
                                     .memory()
@@ -355,6 +375,12 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 // `current_model.get()` in the `Enter` branch below) would
                                 // keep pointing at the pre-switch model forever.
                                 current_model.set(model_for_state);
+                                // Kept in lockstep alongside `current_model` above: the
+                                // Header reads from these, not from `props`, so without
+                                // this it would keep showing the pre-switch connection
+                                // and model name forever after a successful `/model`.
+                                connection_display.set(connection_name_for_display);
+                                model_display.set(model_name_for_display);
                                 transcript_for_notice.update(|entries| {
                                     entries.push(TranscriptEntry::SystemNotice {
                                         text: format!(
@@ -442,6 +468,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                             // `SlashContext.model` (used by `/compact`) would keep
                                             // pointing at the pre-resume model forever.
                                             current_model.set(model_for_state);
+                                            // Kept in lockstep with `current_model` above,
+                                            // mirroring the `/model` fix: the Header reads
+                                            // from these, not from `props`, so without this
+                                            // it would keep showing the pre-resume
+                                            // connection/model name forever.
+                                            connection_display.set(connection.name.clone());
+                                            model_display.set(session.model_name.clone());
                                             tier.set(session.tier);
                                             transcript.set(session.entries.clone());
                                             session_path.set(summary.path.clone());
@@ -551,7 +584,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
 
     element! {
         View(flex_direction: FlexDirection::Column, height: Dimension::Percent(100.0), padding: 0) {
-            Header(connection_name: props.connection_name.clone(), model_name: props.model_name.clone(), tier_label: tier_label(tier.get()).to_string())
+            Header(connection_name: connection_display.get(), model_name: model_display.get(), tier_label: tier_label(tier.get()).to_string())
             Transcript(entries: transcript.get(), pending_permission: pending_permission.get())
             InputBox(buffer: input_buffer.get(), disabled: streaming.get())
             Footer(usage: usage.get(), streaming: streaming.get())
@@ -1801,6 +1834,70 @@ models = ["test-model"]
             !text.contains("compacted 22 older messages"),
             "a successful compaction here would mean /compact used the stale \
              pre-switch model instead of the new one: {text}"
+        );
+    }
+
+    /// Header staleness bug found in code review: `Header`'s
+    /// `connection_name`/`model_name` used to be read directly from
+    /// `props.connection_name`/`props.model_name` — a one-time snapshot taken
+    /// at mount and never refreshed — so after a successful `/model` switch
+    /// (which does correctly rebuild the agent and post a "switched to X · Y"
+    /// notice, per `model_switch_updates_the_model_compact_uses` above), the
+    /// Header kept silently showing the connection/model the process
+    /// launched with. This test proves the fix (`connection_display`/
+    /// `model_display`, kept in lockstep with `current_model` at the same
+    /// `/model` digit-press site) by asserting the Header's rendered text
+    /// shows the NEW connection/model name after switching, and no longer
+    /// shows `test_props()`'s original ones.
+    #[tokio::test(start_paused = true)]
+    async fn model_switch_updates_the_header_display() {
+        let user_config_dir = tempfile::tempdir().unwrap();
+        let project_config_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            user_config_dir.path().join("connections.toml"),
+            r#"
+[[connection]]
+name = "test-ollama"
+provider = "ollama"
+base_url = "http://127.0.0.1:1"
+default_model = "test-model"
+models = ["test-model"]
+"#,
+        )
+        .unwrap();
+
+        let mut props = test_props();
+        props.user_config_dir = user_config_dir.path().to_path_buf();
+        props.project_config_dir = project_config_dir.path().to_path_buf();
+
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        // Sanity check: the Header starts out showing test_props()'s
+        // original connection/model, exactly as it did before this fix.
+        assert!(t.frame_text().contains("local-vllm"), "{}", t.frame_text());
+        assert!(t.frame_text().contains("qwen2.5-coder-32b"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "/model").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("test-ollama"), "{}", t.frame_text());
+
+        t.send_key(KeyCode::Char('1')).unwrap();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        assert!(t.frame_text().contains("switched to test-ollama"), "{}", t.frame_text());
+
+        let text = t.frame_text();
+        assert!(
+            text.contains("test-ollama") && text.contains("test-model"),
+            "expected the Header to now show the NEW connection/model after \
+             the switch: {text}"
+        );
+        assert!(
+            !text.contains("local-vllm") && !text.contains("qwen2.5-coder-32b"),
+            "the Header still shows the ORIGINAL (pre-switch) connection/model \
+             — this is the staleness bug the fix addresses: {text}"
         );
     }
 
