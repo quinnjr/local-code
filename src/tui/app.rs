@@ -1050,6 +1050,24 @@ async fn flush_tool_call_batch(agent: &Agent, batch: &mut Vec<ToolCallEntry>) {
 /// turn: the user message (already added correctly by `daimon` itself), each
 /// iteration's tool-calls-then-results, and finally the assistant's closing
 /// text.
+/// Renders a `run_turn` failure as the text of a `TranscriptEntry::SystemNotice`.
+///
+/// `daimon::DaimonError` collapses every model-facing failure (HTTP, SDK,
+/// timeout, ...) into a single `Model(String)` variant, so there's no typed
+/// way to detect a timeout — this instead pattern-matches the stringified
+/// error for "timeout"/"timed out" (case-insensitively) so a stuck local
+/// model server (now bounded by the client's `.with_timeout(...)`) surfaces
+/// as a clear diagnosis instead of the generic `error: ...` wrapper.
+fn format_turn_error(e: impl std::fmt::Display) -> String {
+    let error_text = e.to_string();
+    let lower = error_text.to_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        format!("error: request timed out — the local model server may be unresponsive ({error_text})")
+    } else {
+        format!("error: {error_text}")
+    }
+}
+
 async fn run_turn(
     agent: Arc<Agent>,
     input: String,
@@ -1068,7 +1086,7 @@ async fn run_turn(
         Err(e) => {
             transcript.update(|entries| {
                 entries.push(TranscriptEntry::SystemNotice {
-                    text: format!("error: {e}"),
+                    text: format_turn_error(e),
                 });
             });
             streaming.set(false);
@@ -1170,7 +1188,7 @@ async fn run_turn(
             Err(e) => {
                 transcript.update(|entries| {
                     entries.push(TranscriptEntry::SystemNotice {
-                        text: format!("error: {e}"),
+                        text: format_turn_error(e),
                     });
                 });
                 break;

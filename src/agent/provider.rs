@@ -26,7 +26,8 @@ pub fn build_model(connection: &Connection, api_key: Option<String>) -> Result<S
             let key = api_key.unwrap_or_default();
             std::sync::Arc::new(
                 OpenAi::with_api_key(connection.default_model.clone(), key)
-                    .with_base_url(connection.base_url.clone()),
+                    .with_base_url(connection.base_url.clone())
+                    .with_timeout(std::time::Duration::from_secs(300)),
             )
         }
         ProviderKind::Ollama => std::sync::Arc::new(
@@ -61,6 +62,16 @@ mod tests {
         }
     }
 
+    // NOTE: these tests cannot assert that `.with_timeout(..)` actually took effect.
+    // `build_model` returns `SharedModel = Arc<dyn ErasedModel>` (see
+    // `daimon_core::model::ErasedModel`), which has no `Any`/downcast supertrait, no
+    // `Debug` bound, and no accessor for the configured timeout. `daimon`'s concrete
+    // `OpenAi` struct (daimon-0.16.0/src/model/openai.rs) stores `timeout` as a private
+    // field with no public getter, so even before erasure there is no way to read it
+    // back from outside the `daimon` crate. If the `.with_timeout(...)` call in
+    // `build_model` is ever dropped or reordered, these tests will keep passing with
+    // no signal of the regression — there is currently no introspection path available
+    // to close that gap.
     #[test]
     fn builds_openai_compatible_model_without_key() {
         let result = build_model(&openai_connection(), None);
