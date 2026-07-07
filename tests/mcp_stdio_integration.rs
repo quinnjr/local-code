@@ -1,9 +1,11 @@
-//! Exercises the real stdio MCP transport end to end: spawns
-//! `mock_mcp_stdio_server` (built as part of this crate, see `Cargo.toml`'s
-//! `[[bin]]` target) as a real child process, connects to it, discovers its
-//! one `echo` tool, and calls it — proving `daimon::mcp::StdioTransport` +
-//! `McpClient` + this plan's `connect_one`/`NamespacedMcpTool` work together
-//! against a real (if tiny) MCP server, not just an in-process mock.
+//! Exercises the real stdio MCP transport end to end: spawns the
+//! `local-code` binary itself in its hidden `__mcp_fixture_server` mode
+//! (see `main.rs` and `local_code::mcp::fixture_server`) as a real child
+//! process, connects to it, discovers its one `echo` tool, and calls it —
+//! proving `daimon::mcp::StdioTransport` + `McpClient` + this plan's
+//! `connect_one`/`NamespacedMcpTool` work together against a real (if tiny)
+//! MCP server, not just an in-process mock. This reuses the product's only
+//! `[[bin]]` target rather than shipping a second one just for tests.
 
 use local_code::config::mcp_servers::{McpServerConfig, McpTransportConfig};
 use local_code::mcp::connect::{connect_all, connect_one};
@@ -12,8 +14,8 @@ fn fixture_server_config(name: &str) -> McpServerConfig {
     McpServerConfig {
         name: name.to_string(),
         transport: McpTransportConfig::Stdio {
-            command: env!("CARGO_BIN_EXE_mock_mcp_stdio_server").to_string(),
-            args: vec![],
+            command: env!("CARGO_BIN_EXE_local-code").to_string(),
+            args: vec!["__mcp_fixture_server".to_string()],
         },
     }
 }

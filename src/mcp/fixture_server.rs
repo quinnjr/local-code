@@ -1,7 +1,10 @@
-//! Test-fixture MCP server. Not part of the `local-code` product surface —
-//! exists only so `tests/mcp_stdio_integration.rs` can exercise the real
-//! stdio transport (spawn + Content-Length framing + JSON-RPC) against a
-//! real child process instead of an in-process mock.
+//! Test-fixture MCP server, reachable only via the hidden
+//! `__mcp_fixture_server` CLI mode (see `main.rs`). Not part of the
+//! `local-code` product surface — exists only so
+//! `tests/mcp_stdio_integration.rs` can exercise the real stdio transport
+//! (spawn + Content-Length framing + JSON-RPC) against a real child
+//! process instead of an in-process mock, without shipping a second
+//! `[[bin]]` target.
 
 use std::io::{self, Read, Write};
 
@@ -42,7 +45,10 @@ fn write_message(stdout: &mut impl Write, body: &serde_json::Value) {
     let _ = stdout.flush();
 }
 
-fn main() {
+/// Runs the fixture MCP server loop against stdin/stdout until the pipe
+/// closes. Never returns an error to the caller by design — `main.rs` just
+/// runs this and exits.
+pub fn run() {
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
 
