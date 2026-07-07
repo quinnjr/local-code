@@ -150,6 +150,8 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
                             entries: session.entries,
                             messages: session.messages,
                             tier: session.tier,
+                            connection_name: session.connection_name,
+                            model_name: session.model_name,
                         })
                     }
                     None => None,

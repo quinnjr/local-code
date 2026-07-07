@@ -59,6 +59,13 @@ pub struct ResumedSession {
     pub entries: Vec<crate::tui::state::TranscriptEntry>,
     pub messages: Vec<Message>,
     pub tier: PermissionTier,
+    /// The connection/model the session was originally created under
+    /// (`SessionFile::connection_name`/`model_name`). Used by `run_tui` to
+    /// pick the *same* connection the transcript was generated against,
+    /// mirroring the in-TUI `/resume` command (`src/tui/app.rs`), instead of
+    /// falling back to `--connection`/the single-connection default.
+    pub connection_name: String,
+    pub model_name: String,
 }
 
 /// Mirrors `local_code::agent::headless::run_headless`'s connection-selection
@@ -92,6 +99,36 @@ fn select_connection(
     }
 }
 
+/// Resolves which connection/model `run_tui` should build the model against
+/// when resuming a previous session. A resumed session's own
+/// `connection_name`/`model_name` (the connection it was actually created
+/// under) always wins over `--connection`/the single-connection default —
+/// mirroring the in-TUI `/resume` command (`src/tui/app.rs`), and matching
+/// the plan's stated expectation that resuming reproduces "the same
+/// connection/model as before". A session's transcript is tied to a specific
+/// provider/model; silently replaying it against a different one (e.g.
+/// because `--connection` was also passed) risks confusing or broken
+/// behavior, so the explicit flag is intentionally ignored in this case
+/// rather than preferred.
+///
+/// Returns the resolved `Connection` with `default_model` overridden to the
+/// resumed session's `model_name`, or `ConnectionNotFound` if that connection
+/// no longer exists in config (e.g. it was removed since the session was
+/// created).
+fn resolve_connection_for_resume(
+    connections: &[Connection],
+    resumed_connection_name: &str,
+    resumed_model_name: &str,
+) -> Result<Connection, TuiSessionError> {
+    let mut connection = connections
+        .iter()
+        .find(|c| c.name == resumed_connection_name)
+        .cloned()
+        .ok_or_else(|| TuiSessionError::ConnectionNotFound(resumed_connection_name.to_string()))?;
+    connection.default_model = resumed_model_name.to_string();
+    Ok(connection)
+}
+
 /// Launches the interactive TUI: resolves the connection/model/settings
 /// (any of which can fail before a single terminal cell is drawn — errors here
 /// print a normal CLI error message, never a broken half-drawn screen), then
@@ -106,7 +143,14 @@ pub async fn run_tui(
     resume: Option<ResumedSession>,
 ) -> Result<(), TuiSessionError> {
     let connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
-    let connection = select_connection(&connections, connection_name)?;
+    let connection = match &resume {
+        Some(resumed) => resolve_connection_for_resume(
+            &connections,
+            &resumed.connection_name,
+            &resumed.model_name,
+        )?,
+        None => select_connection(&connections, connection_name)?,
+    };
 
     let api_key = SecretStore::get_api_key(&connection.name)?;
     let model = build_model(&connection, api_key)?;
@@ -238,6 +282,26 @@ mod tests {
         let result = select_connection(&connections, Some("does-not-exist"));
         assert!(
             matches!(result, Err(TuiSessionError::ConnectionNotFound(name)) if name == "does-not-exist")
+        );
+    }
+
+    #[test]
+    fn resolve_connection_for_resume_picks_the_sessions_own_connection_among_several() {
+        // Regression test for the Task 16 code-review bug: with 2+ configured
+        // connections, resuming a session must select the connection the
+        // session was actually created under, not the first/default one.
+        let connections = vec![conn("a"), conn("b")];
+        let result = resolve_connection_for_resume(&connections, "b", "session-model").unwrap();
+        assert_eq!(result.name, "b");
+        assert_eq!(result.default_model, "session-model");
+    }
+
+    #[test]
+    fn resolve_connection_for_resume_errors_when_sessions_connection_no_longer_exists() {
+        let connections = vec![conn("a")];
+        let result = resolve_connection_for_resume(&connections, "removed-connection", "m");
+        assert!(
+            matches!(result, Err(TuiSessionError::ConnectionNotFound(name)) if name == "removed-connection")
         );
     }
 }
