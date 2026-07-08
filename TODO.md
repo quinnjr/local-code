@@ -40,3 +40,9 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    looks like real markdown, or that `/compact`'s summary is actually shorter than the input).
    They'd miss a regression where the model returns garbage-but-nonempty text. Intentionally thin
    smoke-test bar, consistent with the pre-existing Phase 2 live tests.
+
+10. **Headless mode registers the `skill` tool but doesn't auto-inject skill context.** Like
+    limitation #7 (no AGENTS.md/CLAUDE.md context in headless), `-p` prompts get the `skill` tool
+    for model-invoked skills but never see the auto-injected bodies of `alwaysApply`/glob-matched
+    `.mdc` skills, since headless mode doesn't thread `extra_system_context` through at all.
+    Deliberate scoping decision, not a bug — fixing it is the same follow-up as #7's.
