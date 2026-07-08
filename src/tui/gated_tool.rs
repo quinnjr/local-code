@@ -30,7 +30,7 @@ pub fn build_streaming_agent(model: SharedModel, gate: Arc<PermissionGate>) -> d
     let builder = AgentBuilder::new()
         .shared_model(model)
         .system_prompt(SYSTEM_PROMPT);
-    register_all_tools(builder, gate, Vec::new()).build()
+    register_all_tools(builder, gate, Vec::new(), Vec::new()).build()
 }
 
 /// Identical to [`build_streaming_agent`] but (a) seeds the agent's memory
@@ -64,7 +64,7 @@ pub fn build_streaming_agent_with_history(
         .shared_model(model)
         .system_prompt(system_prompt)
         .memory(SeededMemory::new(initial_messages));
-    register_all_tools(builder, gate, mcp_tools).build()
+    register_all_tools(builder, gate, mcp_tools, Vec::new()).build()
 }
 
 #[cfg(test)]

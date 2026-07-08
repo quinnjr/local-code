@@ -94,7 +94,7 @@ pub async fn run_headless(
         eprintln!("warning: {error}");
     }
 
-    let agent = build_agent_with_mcp_tools(model, gate, mcp_report.tools)?;
+    let agent = build_agent_with_mcp_tools(model, gate, mcp_report.tools, Vec::new())?;
     let response = agent.prompt(prompt).await?;
     Ok(response.text().to_string())
 }
@@ -178,7 +178,7 @@ mod tests {
 
         // The whole point: a fully-failed MCP discovery report still produces
         // a working agent with just the built-in tools.
-        let agent = build_agent_with_mcp_tools(model, gate, report.tools);
+        let agent = build_agent_with_mcp_tools(model, gate, report.tools, Vec::new());
         assert!(agent.is_ok());
     }
 }
