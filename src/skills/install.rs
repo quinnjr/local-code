@@ -146,8 +146,7 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = mock_server_with_one_file().await;
-        let client = crate::skills::github::GithubClient::new(None);
-        let client = client_with_base(client, &server);
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
         let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
 
         install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
@@ -166,11 +165,89 @@ mod tests {
         let paths = test_paths(root.path());
         std::fs::create_dir_all(paths.project_config_dir.join("skills/pdf")).unwrap();
         let server = mock_server_with_one_file().await;
-        let client = client_with_base(crate::skills::github::GithubClient::new(None), &server);
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
         let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
 
         let result = install_skill(&client, &paths, Scope::Project, &source, "pdf").await;
         assert!(matches!(result, Err(InstallError::AlreadyInstalled(name)) if name == "pdf"));
+    }
+
+    #[tokio::test]
+    async fn install_fails_with_empty_directory_error_when_fetch_returns_no_files() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "abc123"})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server).await;
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
+        let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+
+        let result = install_skill(&client, &paths, Scope::Project, &source, "pdf").await;
+        assert!(matches!(result, Err(InstallError::EmptyDirectory(p)) if p == "skills/pdf"));
+
+        let target_dir = paths.project_config_dir.join("skills/pdf");
+        assert!(!target_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn installs_a_skill_into_global_scope() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let server = mock_server_with_one_file().await;
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
+        let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+
+        install_skill(&client, &paths, Scope::Global, &source, "pdf").await.unwrap();
+
+        let skill_md = paths.user_config_dir.join("skills/pdf/SKILL.md");
+        assert!(skill_md.exists());
+        let manifest_path = paths.user_config_dir.join("skills/pdf/.skill-manifest.json");
+        let manifest: InstalledSkillManifest = serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.commit_sha, "abc123");
+        assert_eq!(manifest.git_ref, "main");
+    }
+
+    #[tokio::test]
+    async fn failed_fetch_leaves_no_partial_target_directory() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+
+        // Point the raw-file download at a port nothing is listening on (port 1 is
+        // a privileged port no unprivileged process can bind, so it's reliably
+        // unreachable), so the download fails at the connection level (simulating
+        // a mid-fetch failure) rather than merely returning a non-2xx status —
+        // `fetch_directory_files` never checks the raw download's HTTP status, so
+        // a mocked 500 response would be "successfully" downloaded as file content.
+        let dead_download_url = "http://127.0.0.1:1/raw/SKILL.md".to_string();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "abc123"})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "SKILL.md", "path": "skills/pdf/SKILL.md", "type": "file",
+                 "download_url": dead_download_url}
+            ])))
+            .mount(&server).await;
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
+        let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+
+        let result = install_skill(&client, &paths, Scope::Project, &source, "pdf").await;
+        assert!(result.is_err());
+
+        let target_dir = paths.project_config_dir.join("skills/pdf");
+        assert!(!target_dir.exists());
     }
 
     #[test]
@@ -183,13 +260,5 @@ mod tests {
     fn default_name_falls_back_to_repo_when_no_path() {
         let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "".into(), git_ref: None };
         assert_eq!(default_name(&source), "widgets");
-    }
-
-    /// Test-only helper: rebuilds a `GithubClient` pointed at `server`'s URI.
-    /// `GithubClient::with_api_base` is `#[cfg(test)]`-only and private to
-    /// `skills::github`, so this helper lives here as a thin wrapper using
-    /// the same constructor via a re-exported test hook.
-    fn client_with_base(_unused: crate::skills::github::GithubClient, server: &MockServer) -> crate::skills::github::GithubClient {
-        crate::skills::github::GithubClient::new_for_test(None, server.uri())
     }
 }

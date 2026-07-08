@@ -156,7 +156,7 @@ impl GithubClient {
     /// Test-only: builds a client pointed at a fake API base (e.g. a
     /// `wiremock::MockServer`'s URI) instead of the real GitHub API.
     #[cfg(test)]
-    pub fn new_for_test(token: Option<String>, api_base: String) -> Self {
+    pub(crate) fn new_for_test(token: Option<String>, api_base: String) -> Self {
         Self { http: reqwest::Client::new(), api_base, token }
     }
 
