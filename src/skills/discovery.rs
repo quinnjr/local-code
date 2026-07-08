@@ -119,7 +119,16 @@ pub fn resolve_skill_context(skills: &[Skill], project_root: &Path) -> SkillCont
 }
 
 fn project_tree_matches_any_glob(project_root: &Path, globs: &[String]) -> bool {
-    let patterns: Vec<glob::Pattern> = globs.iter().filter_map(|g| glob::Pattern::new(g).ok()).collect();
+    let patterns: Vec<glob::Pattern> = globs
+        .iter()
+        .filter_map(|g| match glob::Pattern::new(g) {
+            Ok(pattern) => Some(pattern),
+            Err(error) => {
+                eprintln!("warning: skipping invalid glob pattern '{g}': {error}");
+                None
+            }
+        })
+        .collect();
     if patterns.is_empty() {
         return false;
     }
@@ -128,7 +137,11 @@ fn project_tree_matches_any_glob(project_root: &Path, globs: &[String]) -> bool 
             continue;
         }
         let Some(file_name) = entry.file_name().to_str() else { continue };
-        if patterns.iter().any(|p| p.matches(file_name)) {
+        let Ok(relative_path) = entry.path().strip_prefix(project_root) else { continue };
+        if patterns
+            .iter()
+            .any(|p| p.matches_path(relative_path) || p.matches(file_name))
+        {
             return true;
         }
     }
@@ -324,6 +337,27 @@ mod tests {
         let skills = vec![skill("pdf", LoadMode::Globs(vec!["*.pdf".to_string()]))];
         let context = resolve_skill_context(&skills, root.path());
         assert_eq!(context.injected.len(), 1);
+    }
+
+    #[test]
+    fn globs_skill_matches_path_shaped_glob_in_the_right_directory() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/doc.pdf"), "").unwrap();
+        let skills = vec![skill("pdf", LoadMode::Globs(vec!["src/*.pdf".to_string()]))];
+        let context = resolve_skill_context(&skills, root.path());
+        assert_eq!(context.injected.len(), 1);
+    }
+
+    #[test]
+    fn globs_skill_does_not_match_path_shaped_glob_in_the_wrong_directory() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("other")).unwrap();
+        std::fs::write(root.path().join("other/doc.pdf"), "").unwrap();
+        let skills = vec![skill("pdf", LoadMode::Globs(vec!["src/*.pdf".to_string()]))];
+        let context = resolve_skill_context(&skills, root.path());
+        assert!(context.injected.is_empty());
+        assert!(context.listing.is_empty());
     }
 
     #[test]
