@@ -29,7 +29,9 @@ Ollama. No cloud calls, no API keys required.
   in-TUI or via `local-code --resume`
 - MCP (Model Context Protocol) client support (stdio/HTTP/SSE/WebSocket)
   alongside built-in file/shell tools, configurable via `/mcp add`'s in-TUI
-  wizard or by hand-editing `mcp.toml`
+  wizard or by hand-editing `mcp.toml` — `${VAR_NAME}` references in
+  `mcp.toml` are expanded from the environment at load time, so secrets
+  (API keys, tokens) don't need to be stored in the file itself
 - Flat-file cross-session memory (`memory search` / `memory core` / `memory add`)
 - Headless mode (`local-code -p "..."`) for scripted, non-interactive use
 
