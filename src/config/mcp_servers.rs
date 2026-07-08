@@ -61,7 +61,7 @@ pub enum McpServersError {
     },
 }
 
-/// Loads and merges `mcp-servers.toml` from `user_config_dir` and
+/// Loads and merges `mcp.toml` from `user_config_dir` and
 /// `project_config_dir`. A server in the project file replaces a user-level
 /// server of the same name; otherwise servers from both files are kept,
 /// user-level first. Missing files yield an empty list, not an error — the same
@@ -70,8 +70,8 @@ pub fn load_mcp_servers(
     user_config_dir: &Path,
     project_config_dir: &Path,
 ) -> Result<Vec<McpServerConfig>, McpServersError> {
-    let user_file = load_one(&user_config_dir.join("mcp-servers.toml"))?;
-    let project_file = load_one(&project_config_dir.join("mcp-servers.toml"))?;
+    let user_file = load_one(&user_config_dir.join("mcp.toml"))?;
+    let project_file = load_one(&project_config_dir.join("mcp.toml"))?;
 
     let mut merged: Vec<McpServerConfig> = user_file.servers;
     for project_server in project_file.servers {
@@ -186,7 +186,7 @@ command = "some-mcp-server"
 
     fn write(dir: &Path, contents: &str) {
         fs::create_dir_all(dir).unwrap();
-        fs::write(dir.join("mcp-servers.toml"), contents).unwrap();
+        fs::write(dir.join("mcp.toml"), contents).unwrap();
     }
 
     #[test]

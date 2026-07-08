@@ -46,7 +46,7 @@ pub enum TuiSessionError {
     Tui(#[from] ntui::Error),
     #[error("failed to persist session: {0}")]
     Session(#[from] crate::session::store::SessionError),
-    #[error("failed to load mcp-servers.toml: {0}")]
+    #[error("failed to load mcp.toml: {0}")]
     LoadMcpServers(crate::config::mcp_servers::McpServersError),
 }
 

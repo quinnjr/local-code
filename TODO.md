@@ -10,7 +10,7 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
 
 2. **MCP tool discovery only happens once, at TUI startup.** `/model` and `/resume` rebuild the
    agent but reuse the already-discovered `NamespacedMcpTool`s rather than reconnecting to MCP
-   servers. A server added to `mcp-servers.toml` mid-session isn't picked up until a full TUI
+   servers. A server added to `mcp.toml` mid-session isn't picked up until a full TUI
    restart. Deliberate trade-off, not an oversight.
 
 3. **`/clear` doesn't rebuild the live agent object.** It resets the visible transcript and
