@@ -544,8 +544,140 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     }
                     return;
                 }
-                PendingMenu::McpAddWizard(_) => {
-                    // Real free-text handling added in a later task.
+                PendingMenu::McpAddWizard(wizard) => {
+                    if ev.code == KeyCode::Esc {
+                        pending_menu.set(PendingMenu::None);
+                        input_buffer.set(String::new());
+                        transcript.update(|entries| {
+                            entries.push(TranscriptEntry::SystemNotice {
+                                text: "cancelled /mcp add.".to_string(),
+                            });
+                        });
+                        return;
+                    }
+                    if let KeyCode::Char(c) = ev.code {
+                        input_buffer.update(|b| b.push(c));
+                        return;
+                    }
+                    if ev.code == KeyCode::Backspace {
+                        input_buffer.update(|b| {
+                            b.pop();
+                        });
+                        return;
+                    }
+                    if ev.code == KeyCode::Enter {
+                        let line = input_buffer.get();
+                        input_buffer.set(String::new());
+                        match crate::tui::mcp_wizard::advance(wizard, &line) {
+                            crate::tui::mcp_wizard::Advance::Continue(next_wizard, prompt) => {
+                                pending_menu.set(PendingMenu::McpAddWizard(next_wizard));
+                                transcript.update(|entries| {
+                                    entries.push(TranscriptEntry::SystemNotice { text: prompt });
+                                });
+                            }
+                            crate::tui::mcp_wizard::Advance::Invalid(same_wizard, message) => {
+                                pending_menu.set(PendingMenu::McpAddWizard(same_wizard));
+                                transcript.update(|entries| {
+                                    entries.push(TranscriptEntry::SystemNotice { text: message });
+                                });
+                            }
+                            crate::tui::mcp_wizard::Advance::Finalize(config) => {
+                                pending_menu.set(PendingMenu::McpAddConnecting);
+                                let server_name = config.name.clone();
+                                transcript.update(|entries| {
+                                    entries.push(TranscriptEntry::SystemNotice {
+                                        text: format!("connecting to '{server_name}'…"),
+                                    });
+                                });
+
+                                let transcript_for_task = transcript.clone();
+                                let pending_menu_for_task = pending_menu.clone();
+                                let mcp_tools_state_for_task = mcp_tools_state.clone();
+                                let user_config_dir_for_task = user_config_dir.clone();
+                                let project_config_dir_for_task = project_config_dir.clone();
+                                let agent_for_history = agent.clone();
+                                let agent_and_responder_for_task = agent_and_responder.clone();
+                                let pending_permission_for_task = pending_permission.clone();
+                                let tier_value = tier.get();
+                                let always_allow = always_allow_snapshot.clone();
+                                let always_deny = always_deny_snapshot.clone();
+                                let system_context_for_task = system_context.clone();
+                                let model_for_rebuild = current_model.get();
+
+                                tokio::spawn(async move {
+                                    let connect_result = crate::mcp::connect::connect_one(&config).await;
+
+                                    let mut merged = crate::config::mcp_servers::load_mcp_servers(
+                                        &user_config_dir_for_task,
+                                        &project_config_dir_for_task,
+                                    )
+                                    .unwrap_or_default();
+                                    merged.retain(|s| s.name != config.name);
+                                    merged.push(config.clone());
+                                    if let Err(e) = crate::config::mcp_servers::save_mcp_servers(
+                                        &project_config_dir_for_task,
+                                        &merged,
+                                    ) {
+                                        transcript_for_task.update(|entries| {
+                                            entries.push(TranscriptEntry::SystemNotice {
+                                                text: format!(
+                                                    "MCP server '{}' failed to save to mcp.toml: {e}",
+                                                    config.name
+                                                ),
+                                            });
+                                        });
+                                    }
+
+                                    match connect_result {
+                                        Ok(new_tools) => {
+                                            let tool_count = new_tools.len();
+                                            let mut tools = mcp_tools_state_for_task.get();
+                                            tools.extend(new_tools);
+                                            mcp_tools_state_for_task.set(tools.clone());
+
+                                            let history = agent_for_history
+                                                .memory()
+                                                .get_messages_erased()
+                                                .await
+                                                .unwrap_or_default();
+                                            let rebuilt = crate::tui::rebuild::rebuild_agent(
+                                                model_for_rebuild,
+                                                tier_value,
+                                                always_allow,
+                                                always_deny,
+                                                history,
+                                                &system_context_for_task,
+                                                tools,
+                                                pending_permission_for_task,
+                                            );
+                                            agent_and_responder_for_task.set(rebuilt);
+
+                                            transcript_for_task.update(|entries| {
+                                                entries.push(TranscriptEntry::SystemNotice {
+                                                    text: format!(
+                                                        "MCP server '{}' connected — {tool_count} tools added.",
+                                                        config.name
+                                                    ),
+                                                });
+                                            });
+                                        }
+                                        Err(e) => {
+                                            transcript_for_task.update(|entries| {
+                                                entries.push(TranscriptEntry::SystemNotice {
+                                                    text: format!(
+                                                        "MCP server '{}' saved, but failed to connect now: {e}. \
+                                                         It will be retried on next launch.",
+                                                        config.name
+                                                    ),
+                                                });
+                                            });
+                                        }
+                                    }
+                                    pending_menu_for_task.set(PendingMenu::None);
+                                });
+                            }
+                        }
+                    }
                     return;
                 }
                 PendingMenu::McpAddConnecting => {
@@ -1273,6 +1405,297 @@ mod tests {
             t.send_key(KeyCode::Char(c)).unwrap();
         }
         t.send_key(KeyCode::Enter).unwrap();
+    }
+
+    fn test_props_with_config_dir(dir: &std::path::Path) -> AppProps {
+        AppProps {
+            project_config_dir: dir.to_path_buf(),
+            user_config_dir: dir.join("user-config-unused"),
+            ..test_props()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_walks_through_the_http_branch_and_saves_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Server name:"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "remote-tools").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Choose a transport"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "4").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("HTTP URL:"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "http://127.0.0.1:1").await; // nothing listens here
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+        let text = t.frame_text();
+        assert!(text.contains("saved, but failed to connect now"), "{text}");
+
+        let saved = crate::config::mcp_servers::load_mcp_servers(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "remote-tools");
+    }
+
+    // Deliberately NOT `start_paused = true`, unlike its sibling tests: this
+    // branch spawns a real `npx` process. `npx` needs real wall-clock time
+    // (network round trip to the npm registry) to resolve the package name
+    // before it can fail, and a paused tokio clock fast-forwards `sleep()`s
+    // to zero real time, starving that real subprocess of the wall-clock
+    // progress it needs (verified by hand: under `start_paused` the connect
+    // task never got far enough to fail even after 20+ real seconds).
+    //
+    // Uses an unresolvable package name (unlike the plan's original example
+    // of a real, network-fetched package) so `npx` fails fast and
+    // deterministically via a 404 from the registry, rather than actually
+    // downloading and running a real MCP server — this test is about the
+    // wizard's step flow and save-to-disk result, not `connect_one`'s
+    // success path (already covered by `mcp/connect.rs`'s own tests).
+    #[tokio::test]
+    async fn mcp_add_wizard_npm_branch_collects_package_and_args_then_finalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "fs").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "1").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("npm package name:"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "definitely-not-a-real-npm-package-xyz-123").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Extra args"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "/tmp").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await; // blank line finishes the args loop
+        // Real wall-clock wait (see the `#[tokio::test]` doc comment above):
+        // poll until the save lands, up to a generous real-time budget.
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::mcp_servers::load_mcp_servers(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].transport,
+            crate::config::mcp_servers::McpTransportConfig::Stdio {
+                command: "npx".into(),
+                args: vec![
+                    "-y".into(),
+                    "definitely-not-a-real-npm-package-xyz-123".into(),
+                    "/tmp".into(),
+                ],
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_esc_cancels_mid_flow_without_saving_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "abandoned").await;
+        t.tick().await.unwrap();
+
+        t.send_key(KeyCode::Esc).unwrap();
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("cancelled /mcp add"), "{}", t.frame_text());
+
+        // Esc cancelled the wizard, so ordinary chat input works again —
+        // confirms pending_menu was actually reset to None, not left stuck.
+        type_and_submit(&mut t, "hello").await;
+        t.tick().await.unwrap();
+
+        let saved = crate::config::mcp_servers::load_mcp_servers(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(saved.is_empty());
+    }
+
+    // Deliberately NOT `start_paused = true` — same rationale as the npm
+    // branch test above (real `pipx` subprocess I/O needs real wall-clock
+    // time to progress).
+    #[tokio::test]
+    async fn mcp_add_wizard_pipx_branch_collects_package_and_args_then_finalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "pipx-tools").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "2").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("pipx package name:"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "some-pipx-pkg").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Extra args"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "").await; // no extra args, finish immediately
+        // Real wall-clock wait, same rationale as the npm branch test above.
+        let mut saved = Vec::new();
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::mcp_servers::load_mcp_servers(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].transport,
+            crate::config::mcp_servers::McpTransportConfig::Stdio {
+                command: "pipx".into(),
+                args: vec!["run".into(), "some-pipx-pkg".into()],
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_custom_stdio_branch_collects_command_and_args_then_finalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "custom-tools").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "3").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Command:"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "definitely-not-a-real-mcp-server-binary-xyz").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Args"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "--stdio").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await; // blank line finishes the args loop
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        let saved = crate::config::mcp_servers::load_mcp_servers(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].transport,
+            crate::config::mcp_servers::McpTransportConfig::Stdio {
+                command: "definitely-not-a-real-mcp-server-binary-xyz".into(),
+                args: vec!["--stdio".into()],
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_sse_branch_finalizes_with_sse_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "sse-tools").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "5").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("SSE URL:"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "http://127.0.0.1:1").await;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        let saved = crate::config::mcp_servers::load_mcp_servers(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].transport,
+            crate::config::mcp_servers::McpTransportConfig::Sse {
+                url: "http://127.0.0.1:1".into(),
+                headers: std::collections::HashMap::new(),
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_websocket_branch_finalizes_with_websocket_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "ws-tools").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "6").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("WebSocket URL:"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "ws://127.0.0.1:1").await;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        let saved = crate::config::mcp_servers::load_mcp_servers(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].transport,
+            crate::config::mcp_servers::McpTransportConfig::Websocket {
+                url: "ws://127.0.0.1:1".into(),
+            }
+        );
     }
 
     // --- Bug 1 fixtures: verifies `agent.memory()` ends up correctly -------
