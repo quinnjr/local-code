@@ -11,6 +11,7 @@ use crate::mcp::tool::NamespacedMcpTool;
 use crate::permissions::gate::PermissionGate;
 use crate::permissions::settings::PermissionSettings;
 use crate::permissions::types::{PermissionDecision, PermissionRequest, PermissionTier};
+use crate::skills::types::Skill;
 use crate::tui::gated_tool::build_streaming_agent_with_history;
 use crate::tui::permission_prompter::NtuiPermissionPrompter;
 
@@ -35,6 +36,7 @@ pub fn rebuild_agent(
     initial_messages: Vec<Message>,
     extra_system_context: &str,
     mcp_tools: Vec<NamespacedMcpTool>,
+    skills: Vec<Skill>,
     pending_permission: ntui::State<Option<PermissionRequest>>,
 ) -> (Arc<Agent>, Arc<PermissionGate>, ResponderHandle) {
     let prompter = NtuiPermissionPrompter::new(pending_permission);
@@ -48,6 +50,7 @@ pub fn rebuild_agent(
             initial_messages,
             extra_system_context,
             mcp_tools,
+            skills,
         )
         .expect("agent construction should not fail"),
     );
@@ -96,6 +99,7 @@ mod tests {
                     vec![],
                     vec![Message::user("seeded turn")],
                     "",
+                    Vec::new(),
                     Vec::new(),
                     pending,
                 );

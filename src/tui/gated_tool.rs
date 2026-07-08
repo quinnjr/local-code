@@ -8,6 +8,7 @@ use daimon::model::SharedModel;
 use crate::agent::build::register_all_tools;
 use crate::mcp::tool::NamespacedMcpTool;
 use crate::permissions::gate::PermissionGate;
+use crate::skills::types::Skill;
 use crate::tui::memory_seed::SeededMemory;
 use daimon::model::types::Message;
 #[cfg(test)]
@@ -53,6 +54,7 @@ pub fn build_streaming_agent_with_history(
     initial_messages: Vec<Message>,
     extra_system_context: &str,
     mcp_tools: Vec<NamespacedMcpTool>,
+    skills: Vec<Skill>,
 ) -> daimon::Result<Agent> {
     let system_prompt = if extra_system_context.trim().is_empty() {
         SYSTEM_PROMPT.to_string()
@@ -64,7 +66,7 @@ pub fn build_streaming_agent_with_history(
         .shared_model(model)
         .system_prompt(system_prompt)
         .memory(SeededMemory::new(initial_messages));
-    register_all_tools(builder, gate, mcp_tools, Vec::new()).build()
+    register_all_tools(builder, gate, mcp_tools, skills).build()
 }
 
 #[cfg(test)]
@@ -249,7 +251,7 @@ mod with_history_tests {
     async fn seeded_history_is_visible_to_the_next_turn() {
         let model: SharedModel = Arc::new(EchoModel);
         let initial = vec![Message::user("earlier turn"), Message::assistant("earlier reply")];
-        let agent = build_streaming_agent_with_history(model, gate(), initial, "", Vec::new()).unwrap();
+        let agent = build_streaming_agent_with_history(model, gate(), initial, "", Vec::new(), Vec::new()).unwrap();
 
         let response = agent.prompt("new turn").await.unwrap();
         // system prompt + 2 seeded + new user turn = 4 messages sent to the model
@@ -283,6 +285,7 @@ mod with_history_tests {
             gate(),
             vec![],
             "Project rule: never use unwrap().",
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();

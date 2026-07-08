@@ -52,6 +52,10 @@ pub struct AppProps {
     /// to a rebuilt agent reuses the same live connections rather than
     /// reconnecting to every configured server on every rebuild.
     pub mcp_tools: Vec<crate::mcp::tool::NamespacedMcpTool>,
+    /// Skills discovered once at `run_tui` startup (`skills::discovery::discover_skills`).
+    /// Threaded through every agent rebuild exactly like `mcp_tools`, so
+    /// `/model`/`/resume` never drop skills that were available at launch.
+    pub skills: Vec<crate::skills::types::Skill>,
     /// The session file this instance persists to after every turn.
     pub session_path: std::path::PathBuf,
     /// Needed only so `/clear` and future commands can resolve a fresh
@@ -91,6 +95,7 @@ impl Default for AppProps {
             initial_messages: Vec::new(),
             system_context: String::new(),
             mcp_tools: Vec::new(),
+            skills: Vec::new(),
             session_path: std::path::PathBuf::new(),
             user_state_dir: std::path::PathBuf::new(),
             user_config_dir: std::path::PathBuf::new(),
@@ -203,6 +208,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let always_allow_snapshot = props.always_allow.clone();
     let always_deny_snapshot = props.always_deny.clone();
     let mcp_tools_snapshot = props.mcp_tools.clone();
+    let skills_snapshot = props.skills.clone();
     // Tracks the currently-active model, kept in sync with `agent_and_responder`
     // on every `/model` switch (see the digit-press handler below) so
     // `SlashContext.model` (used by `/compact`'s summarization call) never
@@ -236,6 +242,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let initial_messages = props.initial_messages.clone();
         let system_context = props.system_context.clone();
         let mcp_tools = props.mcp_tools.clone();
+        let skills = props.skills.clone();
         let pending_permission = pending_permission.clone();
         move || {
             crate::tui::rebuild::rebuild_agent(
@@ -246,6 +253,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 initial_messages,
                 &system_context,
                 mcp_tools,
+                skills,
                 pending_permission,
             )
         }
@@ -319,6 +327,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let always_allow_snapshot = always_allow_snapshot.clone();
         let always_deny_snapshot = always_deny_snapshot.clone();
         let mcp_tools_snapshot = mcp_tools_snapshot.clone();
+        let skills_snapshot = skills_snapshot.clone();
         let system_context = props.system_context.clone();
         let current_model = current_model.clone();
         let connection_display = connection_display.clone();
@@ -369,6 +378,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 let always_deny = always_deny_snapshot.clone();
                                 let system_context = system_context.clone();
                                 let mcp_tools = mcp_tools_snapshot.clone();
+                                let skills = skills_snapshot.clone();
                                 let connection_display = connection_display.clone();
                                 let model_display = model_display.clone();
                                 let connection_name_for_display = connection.name.clone();
@@ -387,6 +397,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         history,
                                         &system_context,
                                         mcp_tools,
+                                        skills,
                                         pending_permission_for_rebuild,
                                     );
                                     // Last-write-wins: if multiple `/model` selections somehow
@@ -474,6 +485,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                     session.messages.clone(),
                                                     &system_context,
                                                     mcp_tools_snapshot.clone(),
+                                                    skills_snapshot.clone(),
                                                     pending_permission.clone(),
                                                 );
                                                 agent_and_responder.set(rebuilt);
