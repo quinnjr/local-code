@@ -39,7 +39,7 @@ fn read_message(stdin: &mut impl Read) -> Option<Vec<u8>> {
 
 fn write_message(stdout: &mut impl Write, body: &serde_json::Value) {
     let text = serde_json::to_string(body).expect("fixture responses always serialize");
-    let header = format!("Content-Length: {}\r\n\r\n", text.as_bytes().len());
+    let header = format!("Content-Length: {}\r\n\r\n", text.len());
     let _ = stdout.write_all(header.as_bytes());
     let _ = stdout.write_all(text.as_bytes());
     let _ = stdout.flush();
@@ -52,10 +52,7 @@ pub fn run() {
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
 
-    loop {
-        let Some(body) = read_message(&mut stdin) else {
-            break;
-        };
+    while let Some(body) = read_message(&mut stdin) {
         let Ok(request) = serde_json::from_slice::<serde_json::Value>(&body) else {
             continue;
         };

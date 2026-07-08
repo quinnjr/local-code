@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- **Breaking**: the MCP server config file was renamed from
+  `mcp-servers.toml` to `mcp.toml`. If you have an existing
+  `mcp-servers.toml` (project- or user-level), it's still read as a
+  fallback when `mcp.toml` doesn't exist, so nothing breaks immediately —
+  but rename it (`mv mcp-servers.toml mcp.toml`) at your convenience, since
+  the fallback only reads the old name, it never migrates it automatically,
+  and any future `/mcp add` or `mcp remove` will write a fresh `mcp.toml`
+  alongside the untouched old file.
+- Added a full `/mcp` command family (`list`/`remove`/`add`) — `/mcp add`
+  is an in-TUI wizard supporting npm/pipx/custom-stdio/HTTP/SSE/WebSocket
+  transports, with `Esc` to cancel and live agent reconnect on success.
+- Added `${VAR_NAME}` environment-variable interpolation in `mcp.toml`, so
+  secrets (API keys, tokens) don't need to be stored in the file itself.
+- Added SSE and WebSocket MCP transports.
+
 ## v0.1.0
 
 Initial release.

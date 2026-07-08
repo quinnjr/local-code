@@ -1,8 +1,6 @@
 // src/permissions/gate.rs
 
 use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -66,32 +64,32 @@ impl PermissionGate {
             return CheckOutcome::Allowed;
         }
 
-        if kind == ToolKind::Bash {
-            if let Some(command) = arguments.get("command").and_then(|v| v.as_str()) {
-                // NOTE(security, v1 limitation): this is substring matching over the raw
-                // command string, not a tokenized/parsed shell command. It is a best-effort
-                // safety net, not a hard security boundary — it can be bypassed by an
-                // adversarial or merely unlucky command string (e.g. extra whitespace,
-                // reordered flags, or splitting `rm -rf` into `rm -r -f`). A more robust
-                // (tokenized) matcher is a candidate for a future pass.
-                if self
-                    .settings
-                    .always_deny
-                    .iter()
-                    .any(|rule| command.contains(rule.as_str()))
-                {
-                    return CheckOutcome::Denied(format!(
-                        "command matches an always-deny rule and was blocked: {command}"
-                    ));
-                }
-                if self
-                    .settings
-                    .always_allow
-                    .iter()
-                    .any(|rule| command.contains(rule.as_str()))
-                {
-                    return CheckOutcome::Allowed;
-                }
+        if kind == ToolKind::Bash
+            && let Some(command) = arguments.get("command").and_then(|v| v.as_str())
+        {
+            // NOTE(security, v1 limitation): this is substring matching over the raw
+            // command string, not a tokenized/parsed shell command. It is a best-effort
+            // safety net, not a hard security boundary — it can be bypassed by an
+            // adversarial or merely unlucky command string (e.g. extra whitespace,
+            // reordered flags, or splitting `rm -rf` into `rm -r -f`). A more robust
+            // (tokenized) matcher is a candidate for a future pass.
+            if self
+                .settings
+                .always_deny
+                .iter()
+                .any(|rule| command.contains(rule.as_str()))
+            {
+                return CheckOutcome::Denied(format!(
+                    "command matches an always-deny rule and was blocked: {command}"
+                ));
+            }
+            if self
+                .settings
+                .always_allow
+                .iter()
+                .any(|rule| command.contains(rule.as_str()))
+            {
+                return CheckOutcome::Allowed;
             }
         }
 
@@ -169,6 +167,8 @@ fn describe_call(tool_name: &str, arguments: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
 
     struct StubPrompter {
         decision: PermissionDecision,

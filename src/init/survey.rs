@@ -61,12 +61,11 @@ pub fn survey_project(project_root: &Path) -> ProjectSurvey {
             survey.file_paths.push(relative_str.clone());
         }
 
-        if let Some(name) = entry.path().file_name().and_then(|n| n.to_str()) {
-            if RECOGNIZED_MANIFESTS.contains(&name) {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    survey.manifests.push((relative_str, content));
-                }
-            }
+        if let Some(name) = entry.path().file_name().and_then(|n| n.to_str())
+            && RECOGNIZED_MANIFESTS.contains(&name)
+            && let Ok(content) = std::fs::read_to_string(entry.path())
+        {
+            survey.manifests.push((relative_str, content));
         }
     }
 

@@ -10,6 +10,9 @@ pub enum SlashCommand {
     ConnectionsList,
     ConnectionsRemove { name: String },
     ConnectionsAddUnsupported,
+    McpList,
+    McpRemove { name: String },
+    McpAdd,
     Init,
     Permissions,
     Compact,
@@ -39,6 +42,12 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
             ["list"] | [] => SlashCommand::ConnectionsList,
             ["remove", name] => SlashCommand::ConnectionsRemove { name: name.to_string() },
             ["add"] => SlashCommand::ConnectionsAddUnsupported,
+            _ => SlashCommand::Unknown { raw: trimmed.to_string() },
+        },
+        "mcp" => match rest.as_slice() {
+            ["list"] | [] => SlashCommand::McpList,
+            ["remove", name] => SlashCommand::McpRemove { name: name.to_string() },
+            ["add"] => SlashCommand::McpAdd,
             _ => SlashCommand::Unknown { raw: trimmed.to_string() },
         },
         "init" => SlashCommand::Init,
@@ -97,5 +106,24 @@ mod tests {
     #[test]
     fn leading_and_trailing_whitespace_is_tolerated() {
         assert_eq!(parse_slash_command("  /help  "), Some(SlashCommand::Help));
+    }
+
+    #[test]
+    fn recognizes_mcp_commands() {
+        assert_eq!(parse_slash_command("/mcp"), Some(SlashCommand::McpList));
+        assert_eq!(parse_slash_command("/mcp list"), Some(SlashCommand::McpList));
+        assert_eq!(
+            parse_slash_command("/mcp remove filesystem"),
+            Some(SlashCommand::McpRemove { name: "filesystem".into() })
+        );
+        assert_eq!(parse_slash_command("/mcp add"), Some(SlashCommand::McpAdd));
+    }
+
+    #[test]
+    fn malformed_mcp_subcommand_is_unknown() {
+        assert_eq!(
+            parse_slash_command("/mcp bogus"),
+            Some(SlashCommand::Unknown { raw: "/mcp bogus".into() })
+        );
     }
 }

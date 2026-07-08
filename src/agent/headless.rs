@@ -33,7 +33,7 @@ pub enum HeadlessError {
     Provider(#[from] crate::agent::provider::ProviderError),
     #[error("agent error: {0}")]
     Agent(#[from] daimon::DaimonError),
-    #[error("failed to load mcp-servers.toml: {0}")]
+    #[error("failed to load mcp.toml: {0}")]
     LoadMcpServers(crate::config::mcp_servers::McpServersError),
 }
 

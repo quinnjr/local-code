@@ -1,6 +1,6 @@
 // src/mcp/connect.rs
 
-use daimon::mcp::{HttpTransport, McpClient, StdioTransport, WebSocketTransport};
+use daimon::mcp::{HttpTransport, McpClient, SseTransport, StdioTransport, WebSocketTransport};
 
 use crate::config::mcp_servers::{McpServerConfig, McpTransportConfig};
 use crate::mcp::tool::NamespacedMcpTool;
@@ -59,6 +59,20 @@ pub async fn connect_one(
                         server: config.name.clone(),
                         source,
                     })?;
+            McpClient::connect(transport)
+                .await
+                .map_err(|source| McpConnectError::Connect {
+                    server: config.name.clone(),
+                    source,
+                })?
+        }
+        McpTransportConfig::Sse { url, headers } => {
+            let transport = SseTransport::connect(url.clone(), headers.clone())
+                .await
+                .map_err(|source| McpConnectError::Connect {
+                    server: config.name.clone(),
+                    source,
+                })?;
             McpClient::connect(transport)
                 .await
                 .map_err(|source| McpConnectError::Connect {
@@ -132,6 +146,29 @@ mod tests {
         };
         let result = connect_one(&config).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn sse_transport_reports_a_connect_error_when_nothing_is_listening() {
+        let config = McpServerConfig {
+            name: "unreachable-sse".into(),
+            transport: McpTransportConfig::Sse {
+                url: "http://127.0.0.1:1".into(), // port 1: nothing listens here
+                headers: Default::default(),
+            },
+        };
+        let result = connect_one(&config).await;
+        assert!(matches!(result, Err(McpConnectError::Connect { server, .. }) if server == "unreachable-sse"));
+    }
+
+    #[tokio::test]
+    async fn websocket_transport_reports_a_connect_error_when_nothing_is_listening() {
+        let config = McpServerConfig {
+            name: "unreachable-ws".into(),
+            transport: McpTransportConfig::Websocket { url: "ws://127.0.0.1:1".into() },
+        };
+        let result = connect_one(&config).await;
+        assert!(matches!(result, Err(McpConnectError::Connect { server, .. }) if server == "unreachable-ws"));
     }
 
     #[tokio::test]
