@@ -1062,105 +1062,28 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
     }
 }
 
-/// Persists one ReAct iteration's completed tool calls into `agent.memory()`,
-/// mirroring exactly what `daimon`'s non-streaming `run_react_loop` does for
-/// the same shape of iteration (see this module's doc comment on `run_turn`
-/// for the full rationale): one `Message::assistant_with_tool_calls` covering
-/// every call in the batch, followed by one `Message::tool_result` per call,
-/// in order. `daimon::agent::Agent::prompt_stream` never writes any of this
-/// to memory itself — see the long comment on `run_turn` below.
-///
-/// If a call's `result` is `None` (the stream ended — errored or otherwise —
-/// before that call's `StreamEvent::ToolResult` arrived), an empty string is
-/// used as the tool result content rather than panicking; see `run_turn`'s
-/// doc comment for why this can't be fully avoided.
-async fn flush_tool_call_batch(agent: &Agent, batch: &mut Vec<ToolCallEntry>) {
-    if batch.is_empty() {
-        return;
-    }
-    let tool_calls: Vec<daimon::tool::ToolCall> = batch
-        .iter()
-        .map(|call| daimon::tool::ToolCall {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            arguments: serde_json::from_str(&call.arguments_json)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-        })
-        .collect();
-    let _ = agent
-        .memory()
-        .add_message_erased(daimon::model::types::Message::assistant_with_tool_calls(tool_calls))
-        .await;
-    for call in batch.iter() {
-        let content = call
-            .result
-            .as_ref()
-            .map(|r| r.content.clone())
-            .unwrap_or_default();
-        let _ = agent
-            .memory()
-            .add_message_erased(daimon::model::types::Message::tool_result(&call.id, content))
-            .await;
-    }
-    batch.clear();
-}
-
 /// Drives one turn: streams `agent.prompt_stream(&input)`, folding each
 /// `StreamEvent` into `transcript`/`usage`, then clears `streaming` and
 /// `pending_turn_input` so the next `Enter` can start a new turn.
 ///
-/// # Reconstructing what `daimon` fails to persist
+/// # Memory persistence is handled by `daimon` itself
 ///
-/// `daimon::agent::Agent::prompt_stream` (unlike its non-streaming sibling
-/// `run_react_loop`, which backs `Agent::prompt`) only ever calls
-/// `self.memory.add_message_erased` once per turn, for the user's own
-/// message — confirmed by reading `daimon` 0.16.0's
-/// `src/agent/runner.rs::prompt_stream` directly. Every assistant-with-tool-
+/// As of `daimon` 0.17.0's "consolidate API surface" release,
+/// `daimon::agent::Agent::prompt_stream` persists every assistant-with-tool-
 /// calls message, every tool-result message, and the final assistant text
-/// message are built into a function-local `messages` Vec used only to seed
-/// the next ReAct iteration's request, and are silently discarded once
-/// `prompt_stream`'s returned stream is dropped. Patching this in the
-/// vendored `daimon` crate would cost far more to maintain than reconstructing
-/// the same effect here, in the one function that actually drives every real
-/// turn in this TUI — so this function does that reconstruction itself,
-/// event by event, as `StreamEvent`s arrive:
-///
-/// - `local_batch` mirrors the transcript's own `ToolCallEntry` list for the
-///   *current* ReAct iteration only (started fresh after each flush):
-///   `ToolCallStart` pushes an entry, `ToolCallDelta` appends to its
-///   `arguments_json`, and `ToolResult` fills in its `result`.
-/// - Reading `prompt_stream`'s source precisely: within one iteration that
-///   has tool calls, `StreamEvent::Usage` is yielded *before* any of that
-///   iteration's `StreamEvent::ToolResult`s (`Usage` comes right after the
-///   inner per-iteration stream loop ends; the tool-execution loop that
-///   yields `ToolResult` runs afterward). So `Usage` cannot be used as the
-///   flush signal for a tool-calling iteration — at that point in the stream,
-///   none of the batch's results have arrived yet. Instead, `local_batch` is
-///   flushed to memory (via `flush_tool_call_batch`) the moment every entry
-///   in it has a `result` — which happens right after that iteration's last
-///   `ToolResult` arrives, and strictly before the next iteration's first
-///   `ToolCallStart` (there is no interleaving between iterations).
-/// - `Usage` firing with an *empty* `local_batch` means this iteration had no
-///   tool calls at all — exactly the `!had_tool_calls` branch in
-///   `prompt_stream`'s source, the one case where the model's text becomes
-///   the turn's final answer. `iteration_text` (accumulated the same way as
-///   the transcript's own `AssistantText`, but reset every iteration so text
-///   from a tool-calling iteration is correctly discarded, matching
-///   `prompt_stream`'s own per-iteration `text_buf`) is captured into
-///   `final_assistant_text` at that point.
-/// - After the stream ends (`Done`, an in-band `Error`, or the transport
-///   `Err`), any messages still in `local_batch` are flushed as a best
-///   effort — this only happens if the stream ended mid-iteration before all
-///   `ToolResult`s arrived, in which case whichever calls never got a result
-///   are persisted with empty-string content (see `flush_tool_call_batch`)
-///   rather than being dropped or panicking. `final_assistant_text`, if set,
-///   is then appended as one final `Message::assistant`.
-///
-/// This produces exactly the same message shapes, in exactly the same order,
-/// that `run_react_loop` would have written for an equivalent non-streaming
-/// turn: the user message (already added correctly by `daimon` itself), each
-/// iteration's tool-calls-then-results, and finally the assistant's closing
-/// text.
+/// message into `agent.memory()` itself, exactly matching what its
+/// non-streaming sibling `run_react_loop` (which backs `Agent::prompt`) does
+/// — confirmed by reading `daimon` 0.19.0's `src/agent/runner.rs::prompt_stream`
+/// directly (see `memory.add_message_erased` calls for the tool-calls
+/// message, each tool result, and the final assistant text). Earlier
+/// (`daimon` 0.16.0 and before), `prompt_stream` only ever persisted the
+/// user's own message, silently discarding everything else once the
+/// returned stream was dropped — this function used to reconstruct that
+/// missing persistence itself, event by event. That reconstruction has been
+/// removed now that `daimon` does it natively; duplicating it here would
+/// double-write every assistant/tool message into memory. This function now
+/// only needs to fold `StreamEvent`s into the `transcript`/`usage` UI state —
+/// `agent.memory()` is already correct by the time the stream ends.
 /// Renders a `run_turn` failure as the text of a `TranscriptEntry::SystemNotice`.
 ///
 /// `daimon::DaimonError` collapses every model-facing failure (HTTP, SDK,
@@ -1207,30 +1130,15 @@ async fn run_turn(
         }
     };
 
-    // See this function's doc comment above for the full rationale: these
-    // three locals reconstruct what `daimon::agent::Agent::prompt_stream`
-    // should have (but doesn't) persist into `agent.memory()` itself.
-    let mut local_batch: Vec<ToolCallEntry> = Vec::new();
-    let mut iteration_text = String::new();
-    let mut final_assistant_text: Option<String> = None;
-
     while let Some(event) = stream.next().await {
         match event {
             Ok(StreamEvent::TextDelta(delta)) => {
-                iteration_text.push_str(&delta);
                 transcript.update(|entries| match entries.last_mut() {
                     Some(TranscriptEntry::AssistantText { text }) => text.push_str(&delta),
                     _ => entries.push(TranscriptEntry::AssistantText { text: delta }),
                 });
             }
             Ok(StreamEvent::ToolCallStart { id, name }) => {
-                local_batch.push(ToolCallEntry {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments_json: String::new(),
-                    result: None,
-                    expanded: true,
-                });
                 transcript.update(|entries| {
                     entries.push(TranscriptEntry::ToolCall(ToolCallEntry {
                         id,
@@ -1242,9 +1150,6 @@ async fn run_turn(
                 });
             }
             Ok(StreamEvent::ToolCallDelta { id, arguments_delta }) => {
-                if let Some(call) = local_batch.iter_mut().find(|c| c.id == id) {
-                    call.arguments_json.push_str(&arguments_delta);
-                }
                 transcript.update(|entries| {
                     if let Some(call) = find_tool_call_mut(entries, &id) {
                         call.arguments_json.push_str(&arguments_delta);
@@ -1253,22 +1158,11 @@ async fn run_turn(
             }
             Ok(StreamEvent::ToolCallEnd { .. }) => {}
             Ok(StreamEvent::ToolResult { id, content, is_error }) => {
-                if let Some(call) = local_batch.iter_mut().find(|c| c.id == id) {
-                    call.result = Some(ToolCallResult { content: content.clone(), is_error });
-                }
                 transcript.update(|entries| {
                     if let Some(call) = find_tool_call_mut(entries, &id) {
                         call.result = Some(ToolCallResult { content, is_error });
                     }
                 });
-                // The moment every call in this iteration's batch has a
-                // result, the batch is complete — flush it now rather than
-                // waiting for `Usage` (which, per this function's doc
-                // comment, fires *before* these `ToolResult`s for a
-                // tool-calling iteration, not after).
-                if !local_batch.is_empty() && local_batch.iter().all(|c| c.result.is_some()) {
-                    flush_tool_call_batch(&agent, &mut local_batch).await;
-                }
             }
             Ok(StreamEvent::Usage {
                 input_tokens,
@@ -1277,17 +1171,6 @@ async fn run_turn(
                 ..
             }) => {
                 usage.update(|u| u.add(input_tokens, output_tokens, estimated_cost));
-                // `local_batch` is only still empty here if this iteration had
-                // no tool calls at all — i.e. this is (so far) the turn's
-                // final, text-only iteration. Capture it as the candidate
-                // final assistant message; a later iteration (if any) that
-                // also has no tool calls would overwrite it, but in practice
-                // `prompt_stream` always ends the loop right after such an
-                // iteration.
-                if local_batch.is_empty() {
-                    final_assistant_text = Some(iteration_text.clone());
-                }
-                iteration_text.clear();
             }
             Ok(StreamEvent::Error(message)) => {
                 transcript.update(|entries| {
@@ -1305,18 +1188,6 @@ async fn run_turn(
                 });
                 break;
             }
-        }
-    }
-
-    // Best-effort flush of any batch left incomplete by an early stream end
-    // (error mid-tool-call) — see `flush_tool_call_batch`'s doc comment.
-    flush_tool_call_batch(&agent, &mut local_batch).await;
-    if let Some(text) = final_assistant_text {
-        if !text.is_empty() {
-            let _ = agent
-                .memory()
-                .add_message_erased(daimon::model::types::Message::assistant(text))
-                .await;
         }
     }
 
@@ -1395,7 +1266,10 @@ mod tests {
         t.send_key(KeyCode::Enter).unwrap();
     }
 
-    // --- Bug 1 fixtures: `run_turn`'s memory-reconstruction fix -----------
+    // --- Bug 1 fixtures: verifies `agent.memory()` ends up correctly -------
+    // populated after a streamed turn. As of `daimon` 0.17.0+, `prompt_stream`
+    // persists these messages itself (see the doc comment on `run_turn`
+    // above); these tests just assert the end state.
     //
     // `run_turn` is exercised directly here (bypassing the full `App`
     // component and its slash-command/permission-gate machinery) via a
@@ -1536,13 +1410,12 @@ mod tests {
         element! { View {} }
     }
 
-    /// Bug 1, tool-calling case: before this fix, `run_turn` relied entirely
-    /// on `agent.prompt_stream`'s own (buggy) memory writes, which — per
-    /// direct inspection of `daimon` 0.16.0's `agent/runner.rs::prompt_stream`
-    /// — never call `add_message_erased` for anything but the user's own
-    /// message. This asserts `run_turn`'s reconstruction now persists both
-    /// the assistant-with-tool-calls message and the tool-result message
-    /// that `prompt_stream` silently dropped.
+    /// Bug 1, tool-calling case: as of `daimon` 0.17.0+, `Agent::prompt_stream`
+    /// persists both the assistant-with-tool-calls message and each
+    /// tool-result message into `agent.memory()` itself — this asserts that
+    /// end state directly (see the doc comment on `run_turn` above; on
+    /// `daimon` 0.16.0 this used to require a manual reconstruction that has
+    /// since been removed).
     #[tokio::test(start_paused = true)]
     async fn run_turn_persists_tool_call_and_result_messages_to_memory() {
         let slot = AgentSlot::default();
@@ -1586,9 +1459,9 @@ mod tests {
         assert_eq!(messages.len(), 4, "{messages:?}");
     }
 
-    /// Bug 1, plain-text case: proves the fix also covers turns with no tool
-    /// calls at all — before the fix, only the user's message ever made it
-    /// into memory; the assistant's reply was completely absent.
+    /// Bug 1, plain-text case: covers turns with no tool calls at all — both
+    /// the user's message and the assistant's plain-text reply should be in
+    /// `agent.memory()` after the stream ends.
     #[tokio::test(start_paused = true)]
     async fn run_turn_persists_plain_text_reply_to_memory() {
         let slot = AgentSlot::default();
@@ -1905,19 +1778,15 @@ mod tests {
         // test fragile regardless of whether compaction actually happened.
         let mut t = TestTerminal::new(80, 1000, Element::component::<App>(props.clone())).unwrap();
 
-        // `Agent::prompt_stream` (the streaming path `run_turn` uses) itself
-        // only ever calls `memory.add_message_erased` for the *user* half of
-        // each turn — confirmed by reading daimon 0.16.0's
-        // `agent/runner.rs::prompt_stream`, which has no `add_message_erased`
-        // call for the assistant's final text. `run_turn` now compensates for
-        // this (see its doc comment and the dedicated
-        // `run_turn_persists_plain_text_reply_to_memory` /
-        // `run_turn_persists_tool_call_and_result_messages_to_memory` tests
-        // above), reconstructing the missing assistant message itself — so
-        // each submitted turn here contributes 2 messages (user + assistant),
-        // not 1. This test still submits 25 turns (more than strictly needed
-        // now) so the resulting 50-message history clears `COMPACT_THRESHOLD`
-        // (20) with margin.
+        // `Agent::prompt_stream` (the streaming path `run_turn` uses) persists
+        // both the user message and the assistant's final text into
+        // `agent.memory()` itself as of daimon 0.17.0+ (see `run_turn`'s doc
+        // comment and the dedicated `run_turn_persists_plain_text_reply_to_memory`
+        // / `run_turn_persists_tool_call_and_result_messages_to_memory` tests
+        // above) — so each submitted turn here contributes 2 messages (user +
+        // assistant), not 1. This test still submits 25 turns (more than
+        // strictly needed now) so the resulting 50-message history clears
+        // `COMPACT_THRESHOLD` (20) with margin.
         for i in 0..25 {
             type_and_submit(&mut t, &format!("turn {i}")).await;
             for _ in 0..20 {
