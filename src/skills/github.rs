@@ -153,8 +153,10 @@ impl GithubClient {
         }
     }
 
+    /// Test-only: builds a client pointed at a fake API base (e.g. a
+    /// `wiremock::MockServer`'s URI) instead of the real GitHub API.
     #[cfg(test)]
-    fn with_api_base(token: Option<String>, api_base: String) -> Self {
+    pub fn new_for_test(token: Option<String>, api_base: String) -> Self {
         Self { http: reqwest::Client::new(), api_base, token }
     }
 
@@ -280,7 +282,7 @@ mod github_client_tests {
             .mount(&server)
             .await;
 
-        let client = GithubClient::with_api_base(None, server.uri());
+        let client = GithubClient::new_for_test(None, server.uri());
         let branch = client.resolve_default_branch("acme", "widgets").await.unwrap();
         assert_eq!(branch, "main");
     }
@@ -296,7 +298,7 @@ mod github_client_tests {
             .mount(&server)
             .await;
 
-        let client = GithubClient::with_api_base(None, server.uri());
+        let client = GithubClient::new_for_test(None, server.uri());
         let sha = client.resolve_commit_sha("acme", "widgets", "main").await.unwrap();
         assert_eq!(sha, "abc123");
     }
@@ -313,7 +315,7 @@ mod github_client_tests {
             .mount(&server)
             .await;
 
-        let client = GithubClient::with_api_base(Some("test-token".to_string()), server.uri());
+        let client = GithubClient::new_for_test(Some("test-token".to_string()), server.uri());
         let branch = client.resolve_default_branch("acme", "widgets").await.unwrap();
         assert_eq!(branch, "main");
     }
@@ -340,7 +342,7 @@ mod github_client_tests {
             .mount(&server)
             .await;
 
-        let client = GithubClient::with_api_base(None, server.uri());
+        let client = GithubClient::new_for_test(None, server.uri());
         let files = client.fetch_directory_files("acme", "widgets", "skills/pdf", "abc123").await.unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].relative_path, PathBuf::from("SKILL.md"));
@@ -385,7 +387,7 @@ mod github_client_tests {
         Mock::given(method("GET")).and(path("/raw/notes.md"))
             .respond_with(ResponseTemplate::new(200).set_body_string("notes")).mount(&server).await;
 
-        let client = GithubClient::with_api_base(None, server.uri());
+        let client = GithubClient::new_for_test(None, server.uri());
         let mut files = client.fetch_directory_files("acme", "widgets", "skills/pdf", "abc123").await.unwrap();
         files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         assert_eq!(files.len(), 2);
@@ -407,7 +409,7 @@ mod github_client_tests {
             .mount(&server)
             .await;
 
-        let client = GithubClient::with_api_base(None, server.uri());
+        let client = GithubClient::new_for_test(None, server.uri());
         let result = client.fetch_directory_files("acme", "widgets", "skills/pdf/SKILL.md", "abc123").await;
         assert!(matches!(result, Err(GithubError::NotADirectory(_))));
     }
@@ -421,7 +423,7 @@ mod github_client_tests {
             .mount(&server)
             .await;
 
-        let client = GithubClient::with_api_base(None, server.uri());
+        let client = GithubClient::new_for_test(None, server.uri());
         let result = client.resolve_default_branch("acme", "widgets").await;
         assert!(matches!(result, Err(GithubError::Api { status: 404, .. })));
     }
