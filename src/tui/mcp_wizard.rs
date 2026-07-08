@@ -45,14 +45,18 @@ pub enum Advance {
 const TRANSPORT_CHOICE_PROMPT: &str = "Choose a transport (press the digit key):\n\
      1) npm package\n2) pipx package\n3) custom stdio command\n4) HTTP URL\n5) SSE URL\n6) WebSocket URL";
 const ARGS_PROMPT: &str = "Extra args, one per line (blank line to finish): ";
+const NAME_PROMPT: &str = "Server name: ";
+const NPM_PACKAGE_PROMPT: &str = "npm package name: ";
+const PIPX_PACKAGE_PROMPT: &str = "pipx package name: ";
+const COMMAND_PROMPT: &str = "Command: ";
+const HTTP_URL_PROMPT: &str = "HTTP URL: ";
+const SSE_URL_PROMPT: &str = "SSE URL: ";
+const WEBSOCKET_URL_PROMPT: &str = "WebSocket URL: ";
 
 /// Starts a fresh wizard, returning its initial state and the first prompt
 /// to show the user.
 pub fn start() -> (McpAddWizard, String) {
-    (
-        McpAddWizard { name: String::new(), step: McpAddStep::AskName },
-        "Server name: ".to_string(),
-    )
+    (McpAddWizard { name: String::new(), step: McpAddStep::AskName }, NAME_PROMPT.to_string())
 }
 
 /// Feeds one line of user input (already trimmed of the trailing newline —
@@ -62,7 +66,7 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
     match wizard.step.clone() {
         McpAddStep::AskName => {
             if trimmed.is_empty() {
-                return Advance::Invalid(wizard, "Server name cannot be empty. Server name: ".to_string());
+                return Advance::Invalid(wizard, format!("Server name cannot be empty. {NAME_PROMPT}"));
             }
             Advance::Continue(
                 McpAddWizard { name: trimmed.to_string(), step: McpAddStep::AskTransportChoice },
@@ -72,27 +76,27 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
         McpAddStep::AskTransportChoice => match trimmed {
             "1" => Advance::Continue(
                 McpAddWizard { name: wizard.name, step: McpAddStep::AskNpmPackage },
-                "npm package name: ".to_string(),
+                NPM_PACKAGE_PROMPT.to_string(),
             ),
             "2" => Advance::Continue(
                 McpAddWizard { name: wizard.name, step: McpAddStep::AskPipxPackage },
-                "pipx package name: ".to_string(),
+                PIPX_PACKAGE_PROMPT.to_string(),
             ),
             "3" => Advance::Continue(
                 McpAddWizard { name: wizard.name, step: McpAddStep::AskCustomCommand },
-                "Command: ".to_string(),
+                COMMAND_PROMPT.to_string(),
             ),
             "4" => Advance::Continue(
                 McpAddWizard { name: wizard.name, step: McpAddStep::AskHttpUrl },
-                "HTTP URL: ".to_string(),
+                HTTP_URL_PROMPT.to_string(),
             ),
             "5" => Advance::Continue(
                 McpAddWizard { name: wizard.name, step: McpAddStep::AskSseUrl },
-                "SSE URL: ".to_string(),
+                SSE_URL_PROMPT.to_string(),
             ),
             "6" => Advance::Continue(
                 McpAddWizard { name: wizard.name, step: McpAddStep::AskWebsocketUrl },
-                "WebSocket URL: ".to_string(),
+                WEBSOCKET_URL_PROMPT.to_string(),
             ),
             _ => {
                 let msg = format!("'{trimmed}' isn't 1-6.\n{TRANSPORT_CHOICE_PROMPT}");
@@ -101,7 +105,7 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
         },
         McpAddStep::AskNpmPackage => {
             if trimmed.is_empty() {
-                return Advance::Invalid(wizard, "Package name cannot be empty. npm package name: ".to_string());
+                return Advance::Invalid(wizard, format!("Package name cannot be empty. {NPM_PACKAGE_PROMPT}"));
             }
             Advance::Continue(
                 McpAddWizard {
@@ -128,7 +132,7 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
         }
         McpAddStep::AskPipxPackage => {
             if trimmed.is_empty() {
-                return Advance::Invalid(wizard, "Package name cannot be empty. pipx package name: ".to_string());
+                return Advance::Invalid(wizard, format!("Package name cannot be empty. {PIPX_PACKAGE_PROMPT}"));
             }
             Advance::Continue(
                 McpAddWizard {
@@ -155,14 +159,14 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
         }
         McpAddStep::AskCustomCommand => {
             if trimmed.is_empty() {
-                return Advance::Invalid(wizard, "Command cannot be empty. Command: ".to_string());
+                return Advance::Invalid(wizard, format!("Command cannot be empty. {COMMAND_PROMPT}"));
             }
             Advance::Continue(
                 McpAddWizard {
                     name: wizard.name,
                     step: McpAddStep::AskCustomArgs { command: trimmed.to_string(), args: Vec::new() },
                 },
-                "Args, one per line (blank line to finish): ".to_string(),
+                ARGS_PROMPT.to_string(),
             )
         }
         McpAddStep::AskCustomArgs { command, mut args } => {
@@ -175,12 +179,12 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
             args.push(trimmed.to_string());
             Advance::Continue(
                 McpAddWizard { name: wizard.name, step: McpAddStep::AskCustomArgs { command, args } },
-                "Args, one per line (blank line to finish): ".to_string(),
+                ARGS_PROMPT.to_string(),
             )
         }
         McpAddStep::AskHttpUrl => {
             if trimmed.is_empty() {
-                return Advance::Invalid(wizard, "URL cannot be empty. HTTP URL: ".to_string());
+                return Advance::Invalid(wizard, format!("URL cannot be empty. {HTTP_URL_PROMPT}"));
             }
             Advance::Finalize(McpServerConfig {
                 name: wizard.name,
@@ -189,7 +193,7 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
         }
         McpAddStep::AskSseUrl => {
             if trimmed.is_empty() {
-                return Advance::Invalid(wizard, "URL cannot be empty. SSE URL: ".to_string());
+                return Advance::Invalid(wizard, format!("URL cannot be empty. {SSE_URL_PROMPT}"));
             }
             Advance::Finalize(McpServerConfig {
                 name: wizard.name,
@@ -198,7 +202,7 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
         }
         McpAddStep::AskWebsocketUrl => {
             if trimmed.is_empty() {
-                return Advance::Invalid(wizard, "URL cannot be empty. WebSocket URL: ".to_string());
+                return Advance::Invalid(wizard, format!("URL cannot be empty. {WEBSOCKET_URL_PROMPT}"));
             }
             Advance::Finalize(McpServerConfig {
                 name: wizard.name,

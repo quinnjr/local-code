@@ -1,9 +1,11 @@
-use crate::config::mcp_servers::{load_mcp_servers, save_mcp_servers, McpTransportConfig};
+use crate::config::mcp_servers::{load_mcp_servers_raw, save_mcp_servers, McpTransportConfig};
 use crate::config::paths::Paths;
 use std::io::Write;
 
 pub fn list<W: Write>(paths: &Paths, mut out: W) -> anyhow::Result<()> {
-    let servers = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)?;
+    // Raw (un-interpolated): display shows a `${VAR}` reference as typed
+    // rather than resolving and printing the real secret to the screen.
+    let servers = load_mcp_servers_raw(&paths.user_config_dir, &paths.project_config_dir)?;
     if servers.is_empty() {
         writeln!(out, "No MCP servers configured. Run `/mcp add` inside the TUI.")?;
         return Ok(());
@@ -23,7 +25,10 @@ pub fn list<W: Write>(paths: &Paths, mut out: W) -> anyhow::Result<()> {
 }
 
 pub fn remove<W: Write>(paths: &Paths, name: &str, mut out: W) -> anyhow::Result<()> {
-    let mut servers = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)?;
+    // Raw (un-interpolated): this list gets written straight back to disk
+    // below, and resolving ${VAR} here would permanently bake every other
+    // server's secret into mcp.toml as a plaintext literal.
+    let mut servers = load_mcp_servers_raw(&paths.user_config_dir, &paths.project_config_dir)?;
     let before = servers.len();
     servers.retain(|s| s.name != name);
     if servers.len() == before {
@@ -92,6 +97,68 @@ mod tests {
     }
 
     #[test]
+    fn list_shows_the_literal_var_reference_not_the_resolved_secret() {
+        unsafe { std::env::set_var("MCP_CLI_TEST_TOKEN", "should-not-appear-on-screen") };
+        let dir = tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        save_mcp_servers(
+            &paths.project_config_dir,
+            &[McpServerConfig {
+                name: "remote".into(),
+                transport: McpTransportConfig::Http {
+                    url: "http://x/${MCP_CLI_TEST_TOKEN}".into(),
+                    headers: HashMap::new(),
+                },
+            }],
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        list(&paths, &mut out).unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("${MCP_CLI_TEST_TOKEN}"));
+        assert!(!printed.contains("should-not-appear-on-screen"));
+
+        unsafe { std::env::remove_var("MCP_CLI_TEST_TOKEN") };
+    }
+
+    #[test]
+    fn remove_does_not_bake_a_sibling_servers_secret_into_mcp_toml() {
+        unsafe { std::env::set_var("MCP_CLI_TEST_SIBLING_TOKEN", "should-never-hit-disk") };
+        let dir = tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        save_mcp_servers(
+            &paths.project_config_dir,
+            &[
+                McpServerConfig {
+                    name: "gone".into(),
+                    transport: McpTransportConfig::Http { url: "http://x".into(), headers: HashMap::new() },
+                },
+                McpServerConfig {
+                    name: "kept".into(),
+                    transport: McpTransportConfig::Http {
+                        url: "http://y".into(),
+                        headers: HashMap::from([(
+                            "Authorization".to_string(),
+                            "Bearer ${MCP_CLI_TEST_SIBLING_TOKEN}".to_string(),
+                        )]),
+                    },
+                },
+            ],
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        remove(&paths, "gone", &mut out).unwrap();
+
+        let on_disk = std::fs::read_to_string(paths.project_config_dir.join("mcp.toml")).unwrap();
+        assert!(on_disk.contains("${MCP_CLI_TEST_SIBLING_TOKEN}"));
+        assert!(!on_disk.contains("should-never-hit-disk"));
+
+        unsafe { std::env::remove_var("MCP_CLI_TEST_SIBLING_TOKEN") };
+    }
+
+    #[test]
     fn remove_deletes_matching_server() {
         let dir = tempdir().unwrap();
         let paths = test_paths(dir.path());
@@ -107,7 +174,7 @@ mod tests {
         let mut out = Vec::new();
         remove(&paths, "gone", &mut out).unwrap();
 
-        let remaining = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir).unwrap();
+        let remaining = load_mcp_servers_raw(&paths.user_config_dir, &paths.project_config_dir).unwrap();
         assert!(remaining.is_empty());
     }
 

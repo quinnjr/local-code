@@ -162,6 +162,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_transport_reports_a_connect_error_when_nothing_is_listening() {
+        let config = McpServerConfig {
+            name: "unreachable-ws".into(),
+            transport: McpTransportConfig::Websocket { url: "ws://127.0.0.1:1".into() },
+        };
+        let result = connect_one(&config).await;
+        assert!(matches!(result, Err(McpConnectError::Connect { server, .. }) if server == "unreachable-ws"));
+    }
+
+    #[tokio::test]
     async fn one_broken_server_does_not_prevent_others_from_being_reported() {
         let configs = vec![
             McpServerConfig {

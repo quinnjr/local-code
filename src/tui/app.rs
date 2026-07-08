@@ -5,6 +5,7 @@ use std::sync::Arc;
 use daimon::agent::Agent;
 use daimon::model::SharedModel;
 use daimon::stream::StreamEvent;
+use daimon::tool::Tool;
 use futures::StreamExt;
 use ntui::props::{Dimension, FlexDirection};
 use ntui::{component, element, Cleanup, Element, KeyCode};
@@ -169,11 +170,15 @@ enum PendingMenu {
     ResumeChoice(Vec<crate::session::types::SessionSummary>),
     /// A `/mcp add` wizard is mid-flow, waiting for the next line of free-text
     /// input. Unlike the three variants above, this one supports `Esc` to
-    /// cancel (see a later task) — the only pending menu that does.
+    /// cancel — free-text entry has no other natural "back out" keystroke,
+    /// unlike a digit-only menu where an out-of-range digit is unambiguous.
     McpAddWizard(crate::tui::mcp_wizard::McpAddWizard),
     /// The wizard finished (`Advance::Finalize`) and its `connect_one` +
-    /// save + agent-rebuild is running in a spawned task. All input is
-    /// blocked (like `streaming`) until it resolves and resets this to
+    /// save + agent-rebuild is running in a spawned task, bounded by its own
+    /// 30s timeout. `Esc` here frees the input loop immediately without
+    /// waiting for the timeout (the background task keeps running and posts
+    /// its own notice when it finishes either way). All input is otherwise
+    /// blocked (like `streaming`) until the task resolves and resets this to
     /// `None`.
     McpAddConnecting,
 }
@@ -248,8 +253,10 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
 
     let agent_and_responder = hooks.use_state({
         let model = props.model.clone().expect("AppProps::model is always Some");
-        let always_allow = props.always_allow.clone();
-        let always_deny = props.always_deny.clone();
+        let permission_settings = crate::permissions::settings::PermissionSettings {
+            always_allow: props.always_allow.clone(),
+            always_deny: props.always_deny.clone(),
+        };
         let initial_tier = props.initial_tier;
         let initial_messages = props.initial_messages.clone();
         let system_context = props.system_context.clone();
@@ -259,8 +266,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
             crate::tui::rebuild::rebuild_agent(
                 model,
                 initial_tier,
-                always_allow,
-                always_deny,
+                permission_settings,
                 initial_messages,
                 &system_context,
                 mcp_tools,
@@ -392,21 +398,20 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 let connection_name_for_display = connection.name.clone();
                                 let model_name_for_display = model_name.clone();
                                 tokio::spawn(async move {
-                                    let history = agent_for_history
-                                        .memory()
-                                        .get_messages_erased()
-                                        .await
-                                        .unwrap_or_default();
-                                    let rebuilt = crate::tui::rebuild::rebuild_agent(
-                                        new_model,
-                                        tier_value,
+                                    let permission_settings = crate::permissions::settings::PermissionSettings {
                                         always_allow,
                                         always_deny,
-                                        history,
+                                    };
+                                    let rebuilt = crate::tui::rebuild::rebuild_agent_from_history(
+                                        &agent_for_history,
+                                        new_model,
+                                        tier_value,
+                                        permission_settings,
                                         &system_context,
                                         mcp_tools,
                                         pending_permission_for_rebuild,
-                                    );
+                                    )
+                                    .await;
                                     // Last-write-wins: if multiple `/model` selections somehow
                                     // overlap in flight, whichever `set` call completes last
                                     // wins regardless of submission order. Narrow window today
@@ -484,11 +489,14 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         match crate::agent::provider::build_model(&connection, api_key) {
                                             Ok(new_model) => {
                                                 let model_for_state = new_model.clone();
+                                                let permission_settings = crate::permissions::settings::PermissionSettings {
+                                                    always_allow: always_allow_snapshot.clone(),
+                                                    always_deny: always_deny_snapshot.clone(),
+                                                };
                                                 let rebuilt = crate::tui::rebuild::rebuild_agent(
                                                     new_model,
                                                     session.tier,
-                                                    always_allow_snapshot.clone(),
-                                                    always_deny_snapshot.clone(),
+                                                    permission_settings,
                                                     session.messages.clone(),
                                                     &system_context,
                                                     mcp_tools_state.get(),
@@ -605,19 +613,22 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 let model_for_rebuild = current_model.get();
 
                                 tokio::spawn(async move {
-                                    let connect_result = crate::mcp::connect::connect_one(&config).await;
-
-                                    let mut merged = crate::config::mcp_servers::load_mcp_servers(
+                                    // Save first, using the *raw* (un-interpolated) merged
+                                    // list — loading via the interpolating `load_mcp_servers`
+                                    // here would permanently bake every other server's
+                                    // `${VAR}` secret into mcp.toml as a resolved literal.
+                                    let mut merged = crate::config::mcp_servers::load_mcp_servers_raw(
                                         &user_config_dir_for_task,
                                         &project_config_dir_for_task,
                                     )
                                     .unwrap_or_default();
                                     merged.retain(|s| s.name != config.name);
                                     merged.push(config.clone());
-                                    if let Err(e) = crate::config::mcp_servers::save_mcp_servers(
+                                    let saved = crate::config::mcp_servers::save_mcp_servers(
                                         &project_config_dir_for_task,
                                         &merged,
-                                    ) {
+                                    );
+                                    if let Err(e) = &saved {
                                         transcript_for_task.update(|entries| {
                                             entries.push(TranscriptEntry::SystemNotice {
                                                 text: format!(
@@ -627,29 +638,47 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                             });
                                         });
                                     }
+                                    let saved = saved.is_ok();
+
+                                    // Resolve ${VAR} references before connecting — the
+                                    // wizard's config is raw user input, never passed
+                                    // through interpolation the way a disk-loaded config is.
+                                    let resolved_config = crate::config::mcp_servers::resolve_server_env(config.clone());
+                                    let connect_result = tokio::time::timeout(
+                                        std::time::Duration::from_secs(30),
+                                        crate::mcp::connect::connect_one(&resolved_config),
+                                    )
+                                    .await;
 
                                     match connect_result {
-                                        Ok(new_tools) => {
+                                        Ok(Ok(new_tools)) => {
                                             let tool_count = new_tools.len();
                                             let mut tools = mcp_tools_state_for_task.get();
+                                            // Drop any tools from a prior connection of a
+                                            // server with this same name first — otherwise
+                                            // daimon's tool registry silently keeps the OLD
+                                            // registration under the shared `{name}__{tool}`
+                                            // key and the newly (re)connected tools never
+                                            // actually take effect.
+                                            let prefix = format!("{}__", config.name);
+                                            tools.retain(|t| !t.name().starts_with(prefix.as_str()));
                                             tools.extend(new_tools);
                                             mcp_tools_state_for_task.set(tools.clone());
 
-                                            let history = agent_for_history
-                                                .memory()
-                                                .get_messages_erased()
-                                                .await
-                                                .unwrap_or_default();
-                                            let rebuilt = crate::tui::rebuild::rebuild_agent(
-                                                model_for_rebuild,
-                                                tier_value,
+                                            let permission_settings = crate::permissions::settings::PermissionSettings {
                                                 always_allow,
                                                 always_deny,
-                                                history,
+                                            };
+                                            let rebuilt = crate::tui::rebuild::rebuild_agent_from_history(
+                                                &agent_for_history,
+                                                model_for_rebuild,
+                                                tier_value,
+                                                permission_settings,
                                                 &system_context_for_task,
                                                 tools,
                                                 pending_permission_for_task,
-                                            );
+                                            )
+                                            .await;
                                             agent_and_responder_for_task.set(rebuilt);
 
                                             transcript_for_task.update(|entries| {
@@ -661,12 +690,31 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                 });
                                             });
                                         }
-                                        Err(e) => {
+                                        Ok(Err(e)) => {
+                                            let retry_note = if saved {
+                                                "It will be retried on next launch.".to_string()
+                                            } else {
+                                                "It was NOT saved, so it won't be retried — run /mcp add again.".to_string()
+                                            };
                                             transcript_for_task.update(|entries| {
                                                 entries.push(TranscriptEntry::SystemNotice {
                                                     text: format!(
-                                                        "MCP server '{}' saved, but failed to connect now: {e}. \
-                                                         It will be retried on next launch.",
+                                                        "MCP server '{}' failed to connect now: {e}. {retry_note}",
+                                                        config.name
+                                                    ),
+                                                });
+                                            });
+                                        }
+                                        Err(_elapsed) => {
+                                            let retry_note = if saved {
+                                                "It will be retried on next launch.".to_string()
+                                            } else {
+                                                "It was NOT saved, so it won't be retried — run /mcp add again.".to_string()
+                                            };
+                                            transcript_for_task.update(|entries| {
+                                                entries.push(TranscriptEntry::SystemNotice {
+                                                    text: format!(
+                                                        "MCP server '{}' timed out while connecting (30s). {retry_note}",
                                                         config.name
                                                     ),
                                                 });
@@ -681,6 +729,21 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     return;
                 }
                 PendingMenu::McpAddConnecting => {
+                    if ev.code == KeyCode::Esc {
+                        // The spawned connect+save+rebuild task keeps running in the
+                        // background (it's bounded by its own 30s timeout above and
+                        // always finishes by resetting pending_menu to None again) —
+                        // this just frees up the input loop immediately instead of
+                        // making the user wait out the full timeout.
+                        pending_menu.set(PendingMenu::None);
+                        transcript.update(|entries| {
+                            entries.push(TranscriptEntry::SystemNotice {
+                                text: "still connecting in the background — you can keep typing; \
+                                       a notice will appear here when it finishes."
+                                    .to_string(),
+                            });
+                        });
+                    }
                     return;
                 }
                 PendingMenu::None => {}
@@ -1440,7 +1503,7 @@ mod tests {
             t.tick().await.unwrap();
         }
         let text = t.frame_text();
-        assert!(text.contains("saved, but failed to connect now"), "{text}");
+        assert!(text.contains("failed to connect now"), "{text}");
 
         let saved = crate::config::mcp_servers::load_mcp_servers(
             std::path::Path::new("/nonexistent"),
@@ -1605,7 +1668,7 @@ mod tests {
 
         type_and_submit(&mut t, "definitely-not-a-real-mcp-server-binary-xyz").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("Args"), "{}", t.frame_text());
+        assert!(t.frame_text().contains("Extra args"), "{}", t.frame_text());
 
         type_and_submit(&mut t, "--stdio").await;
         t.tick().await.unwrap();
@@ -1650,6 +1713,9 @@ mod tests {
             t.tick().await.unwrap();
         }
 
+        let text = t.frame_text();
+        assert!(text.contains("failed to connect now"), "{text}");
+
         let saved = crate::config::mcp_servers::load_mcp_servers(
             std::path::Path::new("/nonexistent"),
             dir.path(),
@@ -1684,6 +1750,9 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             t.tick().await.unwrap();
         }
+
+        let text = t.frame_text();
+        assert!(text.contains("failed to connect now"), "{text}");
 
         let saved = crate::config::mcp_servers::load_mcp_servers(
             std::path::Path::new("/nonexistent"),
@@ -2534,3 +2603,4 @@ models = ["irrelevant-default", "resumed-model"]
         assert!(text.contains("resumed-connection") && text.contains("resumed-model"), "{text}");
     }
 }
+
