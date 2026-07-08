@@ -108,7 +108,15 @@ fn write_files(dir: &Path, files: &[FetchedFile], manifest: &InstalledSkillManif
 
 /// Re-resolves `name`'s pinned ref to a commit SHA; if it has changed since
 /// the manifest's recorded `commit_sha`, re-fetches and replaces the skill's
-/// files (manifest included) atomically, the same way `install_skill` does.
+/// files (manifest included), the same way `install_skill` does but with a
+/// weaker atomicity guarantee: the new files are written to a temp directory
+/// first (which fails safe, same as install), then the old directory is
+/// renamed aside to a backup path, then the temp directory is renamed into
+/// place, then the backup is removed. A crash after the second rename leaves
+/// the new skill fully installed, with only an orphaned backup directory
+/// left to clean up; a crash before it leaves the old skill untouched (either
+/// still in place, or recoverable from the backup). At no point does the
+/// skill's directory not exist at all.
 /// No-op (returns `Ok(false)`) if the ref hasn't moved. Returns `Ok(true)` if
 /// an update was applied.
 pub async fn update_skill(client: &GithubClient, paths: &Paths, scope: Scope, name: &str) -> Result<bool, InstallError> {
@@ -137,8 +145,13 @@ pub async fn update_skill(client: &GithubClient, paths: &Paths, scope: Scope, na
     }
     write_files(&temp_dir, &files, &new_manifest)?;
 
-    std::fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
+    let backup_dir = parent.join(format!(".{name}.replaced"));
+    if backup_dir.exists() {
+        std::fs::remove_dir_all(&backup_dir).map_err(|e| io_err(&backup_dir, e))?;
+    }
+    std::fs::rename(&dir, &backup_dir).map_err(|e| io_err(&dir, e))?;
     std::fs::rename(&temp_dir, &dir).map_err(|e| io_err(&dir, e))?;
+    std::fs::remove_dir_all(&backup_dir).map_err(|e| io_err(&backup_dir, e))?;
     Ok(true)
 }
 
@@ -176,8 +189,17 @@ pub fn list_skills(paths: &Paths) -> Result<Vec<InstalledSkillSummary>, InstallE
                 continue;
             }
             let manifest_path = skill_dir.join(".skill-manifest.json");
-            let Ok(manifest_text) = std::fs::read_to_string(&manifest_path) else { continue };
-            let Ok(manifest) = serde_json::from_str::<InstalledSkillManifest>(&manifest_text) else { continue };
+            let manifest_text = match std::fs::read_to_string(&manifest_path) {
+                Ok(text) => text,
+                Err(_) => continue, // no manifest at all — not a valid skill install, skip silently
+            };
+            let manifest = match serde_json::from_str::<InstalledSkillManifest>(&manifest_text) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("warning: skipping skill at {}: invalid manifest: {e}", skill_dir.display());
+                    continue;
+                }
+            };
             let name = entry.file_name().to_string_lossy().to_string();
             let path_suffix = if manifest.path.is_empty() { String::new() } else { format!("/{}", manifest.path) };
             summaries.push(InstalledSkillSummary {
@@ -444,6 +466,18 @@ mod tests {
     fn list_is_empty_when_nothing_installed() {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
+        let summaries = list_skills(&paths).unwrap();
+        assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn list_skips_a_skill_with_a_corrupt_manifest() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let broken_dir = paths.project_config_dir.join("skills/broken");
+        std::fs::create_dir_all(&broken_dir).unwrap();
+        std::fs::write(broken_dir.join(".skill-manifest.json"), "not valid json").unwrap();
+
         let summaries = list_skills(&paths).unwrap();
         assert!(summaries.is_empty());
     }
