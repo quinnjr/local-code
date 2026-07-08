@@ -33,6 +33,7 @@ Ollama. No cloud calls, no API keys required.
   `mcp.toml` are expanded from the environment at load time, so secrets
   (API keys, tokens) don't need to be stored in the file itself
 - Flat-file cross-session memory (`memory search` / `memory core` / `memory add`)
+- GitHub-backed skills (`skills install` / `skills list` / `skills remove` / `skills update`)
 - Headless mode (`local-code -p "..."`) for scripted, non-interactive use
 
 ## Getting started

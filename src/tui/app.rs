@@ -53,6 +53,10 @@ pub struct AppProps {
     /// to a rebuilt agent reuses the same live connections rather than
     /// reconnecting to every configured server on every rebuild.
     pub mcp_tools: Vec<crate::mcp::tool::NamespacedMcpTool>,
+    /// Skills discovered once at `run_tui` startup (`skills::discovery::discover_skills`).
+    /// Threaded through every agent rebuild exactly like `mcp_tools`, so
+    /// `/model`/`/resume` never drop skills that were available at launch.
+    pub skills: Vec<crate::skills::types::Skill>,
     /// The session file this instance persists to after every turn.
     pub session_path: std::path::PathBuf,
     /// Needed only so `/clear` and future commands can resolve a fresh
@@ -92,6 +96,7 @@ impl Default for AppProps {
             initial_messages: Vec::new(),
             system_context: String::new(),
             mcp_tools: Vec::new(),
+            skills: Vec::new(),
             session_path: std::path::PathBuf::new(),
             user_state_dir: std::path::PathBuf::new(),
             user_config_dir: std::path::PathBuf::new(),
@@ -226,6 +231,11 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let initial = props.mcp_tools.clone();
         move || initial
     });
+    // Plain snapshot (not a `State`) is fine for skills, unlike `mcp_tools`
+    // above — there is no in-TUI "add a skill" flow analogous to `/mcp add`
+    // that needs to mutate this at runtime; skills are only ever installed
+    // via the `local-code skills` CLI, outside a running TUI session.
+    let skills_snapshot = props.skills.clone();
     // Tracks the currently-active model, kept in sync with `agent_and_responder`
     // on every `/model` switch (see the digit-press handler below) so
     // `SlashContext.model` (used by `/compact`'s summarization call) never
@@ -261,6 +271,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let initial_messages = props.initial_messages.clone();
         let system_context = props.system_context.clone();
         let mcp_tools = props.mcp_tools.clone();
+        let skills = props.skills.clone();
         let pending_permission = pending_permission.clone();
         move || {
             crate::tui::rebuild::rebuild_agent(
@@ -270,6 +281,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 initial_messages,
                 &system_context,
                 mcp_tools,
+                skills,
                 pending_permission,
             )
         }
@@ -343,6 +355,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let always_allow_snapshot = always_allow_snapshot.clone();
         let always_deny_snapshot = always_deny_snapshot.clone();
         let mcp_tools_state = mcp_tools_state.clone();
+        let skills_snapshot = skills_snapshot.clone();
         let system_context = props.system_context.clone();
         let current_model = current_model.clone();
         let connection_display = connection_display.clone();
@@ -393,6 +406,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 let always_deny = always_deny_snapshot.clone();
                                 let system_context = system_context.clone();
                                 let mcp_tools = mcp_tools_state.get();
+                                let skills = skills_snapshot.clone();
                                 let connection_display = connection_display.clone();
                                 let model_display = model_display.clone();
                                 let connection_name_for_display = connection.name.clone();
@@ -409,6 +423,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         permission_settings,
                                         &system_context,
                                         mcp_tools,
+                                        skills,
                                         pending_permission_for_rebuild,
                                     )
                                     .await;
@@ -500,6 +515,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                     session.messages.clone(),
                                                     &system_context,
                                                     mcp_tools_state.get(),
+                                                    skills_snapshot.clone(),
                                                     pending_permission.clone(),
                                                 );
                                                 agent_and_responder.set(rebuilt);
@@ -601,6 +617,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 let transcript_for_task = transcript.clone();
                                 let pending_menu_for_task = pending_menu.clone();
                                 let mcp_tools_state_for_task = mcp_tools_state.clone();
+                                let skills_for_task = skills_snapshot.clone();
                                 let user_config_dir_for_task = user_config_dir.clone();
                                 let project_config_dir_for_task = project_config_dir.clone();
                                 let agent_for_history = agent.clone();
@@ -676,6 +693,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                 permission_settings,
                                                 &system_context_for_task,
                                                 tools,
+                                                skills_for_task,
                                                 pending_permission_for_task,
                                             )
                                             .await;

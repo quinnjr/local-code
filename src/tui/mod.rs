@@ -25,6 +25,7 @@ use crate::permissions::settings::load_settings;
 use crate::permissions::types::PermissionTier;
 use crate::session::paths::new_session_path;
 use crate::session::types::SessionFile;
+use crate::skills::discovery::{discover_skills, resolve_skill_context, render_skill_context};
 use daimon::model::types::Message;
 
 #[derive(Debug, thiserror::Error)]
@@ -162,6 +163,16 @@ pub async fn run_tui(
 
     let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;
     let system_context = load_project_context(paths, project_root);
+    let discovered_skills = discover_skills(paths);
+    let skill_context = resolve_skill_context(&discovered_skills, project_root);
+    let rendered_skill_context = render_skill_context(&skill_context);
+    let system_context = if rendered_skill_context.is_empty() {
+        system_context
+    } else if system_context.is_empty() {
+        rendered_skill_context
+    } else {
+        format!("{system_context}\n\n{rendered_skill_context}")
+    };
 
     // Discover MCP-server tools once at startup, exactly like run_headless
     // (Phase 5) does — a broken server is logged and skipped, never fatal,
@@ -213,6 +224,7 @@ pub async fn run_tui(
         initial_messages,
         system_context,
         mcp_tools,
+        skills: discovered_skills,
         session_path,
         user_state_dir: paths.user_state_dir.clone(),
         user_config_dir: paths.user_config_dir.clone(),
@@ -232,6 +244,7 @@ pub async fn run_tui(
         initial_messages: props.initial_messages,
         system_context: props.system_context,
         mcp_tools: props.mcp_tools,
+        skills: props.skills,
         session_path: props.session_path,
         user_state_dir: props.user_state_dir,
         user_config_dir: props.user_config_dir,

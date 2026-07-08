@@ -6,9 +6,11 @@ use daimon::agent::{Agent, AgentBuilder};
 use daimon::model::SharedModel;
 
 use crate::agent::gated_tool::GatedTool;
+use crate::agent::skill_tool::SkillTool;
 use crate::agent::tools::{Bash, EditFile, Glob, Grep, ReadFile, WriteFile};
 use crate::mcp::tool::NamespacedMcpTool;
 use crate::permissions::gate::PermissionGate;
+use crate::skills::types::Skill;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are local-code, a coding assistant that talks only to \
 local/local-network LLM backends. You can read, write, and edit files, run shell commands, and \
@@ -30,6 +32,7 @@ pub fn register_all_tools(
     builder: AgentBuilder,
     gate: Arc<PermissionGate>,
     mcp_tools: Vec<NamespacedMcpTool>,
+    skills: Vec<Skill>,
 ) -> AgentBuilder {
     let mut builder = builder
         .tool(GatedTool::new(ReadFile, gate.clone()))
@@ -37,7 +40,8 @@ pub fn register_all_tools(
         .tool(GatedTool::new(EditFile, gate.clone()))
         .tool(GatedTool::new(Bash, gate.clone()))
         .tool(GatedTool::new(Grep, gate.clone()))
-        .tool(GatedTool::new(Glob, gate.clone()));
+        .tool(GatedTool::new(Glob, gate.clone()))
+        .tool(GatedTool::new(SkillTool::new(skills), gate.clone()));
 
     for tool in mcp_tools {
         builder = builder.tool(GatedTool::new(tool, gate.clone()));
@@ -54,18 +58,25 @@ pub fn build_agent_with_mcp_tools(
     model: SharedModel,
     gate: Arc<PermissionGate>,
     mcp_tools: Vec<NamespacedMcpTool>,
+    skills: Vec<Skill>,
+    extra_system_context: &str,
 ) -> daimon::Result<Agent> {
+    let system_prompt = if extra_system_context.trim().is_empty() {
+        DEFAULT_SYSTEM_PROMPT.to_string()
+    } else {
+        format!("{DEFAULT_SYSTEM_PROMPT}\n\n{extra_system_context}")
+    };
     let builder = AgentBuilder::new()
         .shared_model(model)
-        .system_prompt(DEFAULT_SYSTEM_PROMPT);
-    register_all_tools(builder, gate, mcp_tools).build()
+        .system_prompt(system_prompt);
+    register_all_tools(builder, gate, mcp_tools, skills).build()
 }
 
 /// Builds an agent with only the six built-in tools (no MCP servers
 /// configured/connected). Kept as its own function, with its original Phase 2
 /// signature, so existing callers are unaffected by this plan.
 pub fn build_agent(model: SharedModel, gate: Arc<PermissionGate>) -> daimon::Result<Agent> {
-    build_agent_with_mcp_tools(model, gate, Vec::new())
+    build_agent_with_mcp_tools(model, gate, Vec::new(), Vec::new(), "")
 }
 
 #[cfg(test)]
@@ -164,7 +175,7 @@ mod tests {
             .shared_model(model)
             .system_prompt(DEFAULT_SYSTEM_PROMPT)
             .tool(GatedTool::new(FakeMcpTool, test_gate()));
-        let agent = register_all_tools(builder, test_gate(), Vec::new()).build();
+        let agent = register_all_tools(builder, test_gate(), Vec::new(), Vec::new()).build();
         assert!(agent.is_ok());
     }
 

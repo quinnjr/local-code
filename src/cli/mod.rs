@@ -1,6 +1,7 @@
 pub mod connections;
 pub mod mcp;
 pub mod memory;
+pub mod skills;
 
 use crate::agent::headless::run_headless;
 use crate::config::paths::Paths;
@@ -51,6 +52,11 @@ pub enum Command {
         #[command(subcommand)]
         action: MemoryAction,
     },
+    /// Manage skills (install/list/remove/update from GitHub)
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -75,6 +81,34 @@ pub enum MemoryAction {
     Core,
     /// Append a manual entry to the short-term buffer
     Add { text: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillsAction {
+    /// Install a skill from GitHub: owner/repo[/path][@ref]
+    Install {
+        spec: String,
+        /// Install into the global (user-level) scope instead of this project
+        #[arg(long)]
+        global: bool,
+        /// Override the derived skill name
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List installed skills across both scopes
+    List,
+    /// Remove an installed skill
+    Remove {
+        name: String,
+        #[arg(long)]
+        global: bool,
+    },
+    /// Re-fetch a skill (or all skills in scope) if its pinned ref has moved
+    Update {
+        name: Option<String>,
+        #[arg(long)]
+        global: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -160,6 +194,20 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             }
             MemoryAction::Add { text } => {
                 memory::add_command(&paths, &text, stdout())?;
+            }
+        },
+        Some(Command::Skills { action }) => match action {
+            SkillsAction::Install { spec, global, name } => {
+                skills::install(&paths, &spec, global, name.as_deref(), stdout()).await?;
+            }
+            SkillsAction::List => {
+                skills::list(&paths, stdout())?;
+            }
+            SkillsAction::Remove { name, global } => {
+                skills::remove(&paths, &name, global, stdout())?;
+            }
+            SkillsAction::Update { name, global } => {
+                skills::update(&paths, name.as_deref(), global, stdout()).await?;
             }
         },
         None => {
@@ -407,5 +455,61 @@ mod headless_cli_tests {
     fn requires_interactive_stdin_false_for_full_auto_and_none() {
         assert!(!requires_interactive_stdin(Some(PermissionTier::FullAuto)));
         assert!(!requires_interactive_stdin(None));
+    }
+}
+
+#[cfg(test)]
+mod skills_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_install_with_global_and_name() {
+        let cli = Cli::parse_from([
+            "local-code",
+            "skills",
+            "install",
+            "owner/repo",
+            "--global",
+            "--name",
+            "foo",
+        ]);
+        if let Some(Command::Skills { action }) = cli.command {
+            if let SkillsAction::Install { spec, global, name } = action {
+                assert_eq!(spec, "owner/repo");
+                assert!(global);
+                assert_eq!(name.as_deref(), Some("foo"));
+            } else {
+                panic!("expected SkillsAction::Install, got a different variant");
+            }
+        } else {
+            panic!("expected Some(Command::Skills)");
+        }
+    }
+
+    #[test]
+    fn parses_list() {
+        let cli = Cli::parse_from(["local-code", "skills", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Skills {
+                action: SkillsAction::List
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_remove_with_global() {
+        let cli = Cli::parse_from(["local-code", "skills", "remove", "foo", "--global"]);
+        if let Some(Command::Skills { action }) = cli.command {
+            if let SkillsAction::Remove { name, global } = action {
+                assert_eq!(name, "foo");
+                assert!(global);
+            } else {
+                panic!("expected SkillsAction::Remove, got a different variant");
+            }
+        } else {
+            panic!("expected Some(Command::Skills)");
+        }
     }
 }

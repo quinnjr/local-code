@@ -1,6 +1,7 @@
 pub mod provider;
 pub mod tools;
 pub mod gated_tool;
+pub mod skill_tool;
 pub mod build;
 pub mod headless;
 
