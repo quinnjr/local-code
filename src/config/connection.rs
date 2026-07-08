@@ -240,7 +240,7 @@ default_model = "m2"
             default_model: "m".into(),
             models: vec![],
         };
-        save_connections(dir.path(), &[conn.clone()]).unwrap();
+        save_connections(dir.path(), std::slice::from_ref(&conn)).unwrap();
         let loaded = load_connections(Path::new("/nonexistent"), dir.path()).unwrap();
         assert_eq!(loaded, vec![conn]);
     }

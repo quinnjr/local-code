@@ -1,4 +1,5 @@
 pub mod connections;
+pub mod mcp;
 pub mod memory;
 pub mod skills;
 
@@ -34,12 +35,17 @@ pub struct Cli {
     pub resume: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum Command {
     /// Manage LLM connections (add/list/remove)
     Connections {
         #[command(subcommand)]
         action: ConnectionsAction,
+    },
+    /// Manage MCP servers (list/remove; add is TUI-only via /mcp add)
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
     },
     /// Inspect cross-session memory (search/core/add)
     Memory {
@@ -53,14 +59,21 @@ pub enum Command {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
+pub enum McpAction {
+    Add,
+    List,
+    Remove { name: String },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ConnectionsAction {
     Add,
     List,
     Remove { name: String },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum MemoryAction {
     /// Keyword-search the buffer, daily files, recent.md, and archive.md
     Search { query: String },
@@ -70,7 +83,7 @@ pub enum MemoryAction {
     Add { text: String },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum SkillsAction {
     /// Install a skill from GitHub: owner/repo[/path][@ref]
     Install {
@@ -159,6 +172,17 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             }
             ConnectionsAction::Remove { name } => {
                 connections::remove(&paths, &name, stdout())?;
+            }
+        },
+        Some(Command::Mcp { action }) => match action {
+            McpAction::Add => {
+                mcp::add_unsupported(stdout())?;
+            }
+            McpAction::List => {
+                mcp::list(&paths, stdout())?;
+            }
+            McpAction::Remove { name } => {
+                mcp::remove(&paths, &name, stdout())?;
             }
         },
         Some(Command::Memory { action }) => match action {
@@ -341,6 +365,33 @@ mod select_session_tests {
         let mut out = Vec::new();
         let result = select_session_to_resume(&sessions, &b"99\n"[..], &mut out).unwrap();
         assert_eq!(result.unwrap().connection_name, "newest");
+    }
+}
+
+#[cfg(test)]
+mod mcp_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_mcp_list() {
+        let cli = Cli::parse_from(["local-code", "mcp", "list"]);
+        assert!(matches!(cli.command, Some(Command::Mcp { action: McpAction::List })));
+    }
+
+    #[test]
+    fn parses_mcp_remove_with_name() {
+        let cli = Cli::parse_from(["local-code", "mcp", "remove", "fs"]);
+        match cli.command {
+            Some(Command::Mcp { action: McpAction::Remove { name } }) => assert_eq!(name, "fs"),
+            other => panic!("expected Mcp::Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_mcp_add() {
+        let cli = Cli::parse_from(["local-code", "mcp", "add"]);
+        assert!(matches!(cli.command, Some(Command::Mcp { action: McpAction::Add })));
     }
 }
 

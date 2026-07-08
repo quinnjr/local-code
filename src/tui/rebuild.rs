@@ -19,20 +19,24 @@ pub type ResponderHandle = Arc<Mutex<Option<oneshot::Sender<PermissionDecision>>
 
 /// Builds a fresh `(Agent, PermissionGate, ResponderHandle)` triple: a new
 /// `NtuiPermissionPrompter` bound to `pending_permission`, a `PermissionGate`
-/// at `initial_tier` with `always_allow`/`always_deny`, and an `Agent` seeded
+/// at `initial_tier` with `permission_settings`, and an `Agent` seeded
 /// with `initial_messages`, `extra_system_context`, and `mcp_tools` (already
 /// `connect_all`-discovered `NamespacedMcpTool`s — `NamespacedMcpTool` is
 /// `Clone`, wrapping an `Arc<McpToolBridge>`, so the *same* live MCP
 /// connections can be handed to a freshly-rebuilt agent without reconnecting
 /// to every server again on `/model`/`/resume`). This is the single place
-/// that logic lives — `App`'s mount, `/model`, and `/resume` all call it
-/// instead of duplicating the construction sequence Phase 3 originally left
-/// inlined in `App`'s `hooks.use_state` initializer.
+/// that logic lives — `App`'s mount, `/model`, `/resume`, and `/mcp add` all
+/// call it instead of duplicating the construction sequence.
+///
+/// Takes `permission_settings: PermissionSettings` rather than separate
+/// `always_allow`/`always_deny: Vec<String>` parameters deliberately: two
+/// adjacent same-typed `Vec<String>` params are a real footgun a caller
+/// could transpose without a compile error, and `PermissionSettings` is the
+/// type this function builds internally anyway.
 pub fn rebuild_agent(
     model: SharedModel,
     initial_tier: PermissionTier,
-    always_allow: Vec<String>,
-    always_deny: Vec<String>,
+    permission_settings: PermissionSettings,
     initial_messages: Vec<Message>,
     extra_system_context: &str,
     mcp_tools: Vec<NamespacedMcpTool>,
@@ -41,8 +45,7 @@ pub fn rebuild_agent(
 ) -> (Arc<Agent>, Arc<PermissionGate>, ResponderHandle) {
     let prompter = NtuiPermissionPrompter::new(pending_permission);
     let responder = prompter.responder_handle();
-    let settings = PermissionSettings { always_allow, always_deny };
-    let gate = Arc::new(PermissionGate::new(initial_tier, settings, Arc::new(prompter)));
+    let gate = Arc::new(PermissionGate::new(initial_tier, permission_settings, Arc::new(prompter)));
     let agent = Arc::new(
         build_streaming_agent_with_history(
             model,
@@ -55,6 +58,35 @@ pub fn rebuild_agent(
         .expect("agent construction should not fail"),
     );
     (agent, gate, responder)
+}
+
+/// Reloads `old_agent`'s conversation history and calls [`rebuild_agent`]
+/// with it — the shared core of both `/model`'s and `/mcp add`'s rebuild
+/// flow (they differ only in what they do with the result: `/model` swaps
+/// the active model, `/mcp add` merges in newly-discovered tools). `/resume`
+/// does NOT use this — it rebuilds from a *loaded session's* messages, not
+/// the live agent's current history, so reloading would be wrong there.
+pub async fn rebuild_agent_from_history(
+    old_agent: &Agent,
+    model: SharedModel,
+    initial_tier: PermissionTier,
+    permission_settings: PermissionSettings,
+    extra_system_context: &str,
+    mcp_tools: Vec<NamespacedMcpTool>,
+    skills: Vec<Skill>,
+    pending_permission: ntui::State<Option<PermissionRequest>>,
+) -> (Arc<Agent>, Arc<PermissionGate>, ResponderHandle) {
+    let history = old_agent.memory().get_messages_erased().await.unwrap_or_default();
+    rebuild_agent(
+        model,
+        initial_tier,
+        permission_settings,
+        history,
+        extra_system_context,
+        mcp_tools,
+        skills,
+        pending_permission,
+    )
 }
 
 #[cfg(test)]
@@ -95,8 +127,7 @@ mod tests {
                 let (agent, _gate, _responder) = rebuild_agent(
                     model,
                     PermissionTier::FullAuto,
-                    vec![],
-                    vec![],
+                    PermissionSettings::default(),
                     vec![Message::user("seeded turn")],
                     "",
                     Vec::new(),

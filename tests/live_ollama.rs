@@ -2,6 +2,7 @@
 //!   - Ollama running locally (default `http://localhost:11434`) with a model
 //!     pulled that supports tool calling (e.g. `llama3.1`).
 //!   - `LOCAL_CODE_TEST_OLLAMA_MODEL` set to that model's name.
+//!
 //! Run with: `cargo test --test live_ollama -- --ignored --nocapture`
 
 use std::sync::Arc;
