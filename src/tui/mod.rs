@@ -3,6 +3,7 @@
 pub mod app;
 pub mod components;
 pub mod gated_tool;
+pub mod mcp_wizard;
 pub mod memory_seed;
 pub mod permission_prompter;
 pub mod rebuild;
