@@ -106,6 +106,90 @@ fn write_files(dir: &Path, files: &[FetchedFile], manifest: &InstalledSkillManif
     Ok(())
 }
 
+/// Re-resolves `name`'s pinned ref to a commit SHA; if it has changed since
+/// the manifest's recorded `commit_sha`, re-fetches and replaces the skill's
+/// files (manifest included) atomically, the same way `install_skill` does.
+/// No-op (returns `Ok(false)`) if the ref hasn't moved. Returns `Ok(true)` if
+/// an update was applied.
+pub async fn update_skill(client: &GithubClient, paths: &Paths, scope: Scope, name: &str) -> Result<bool, InstallError> {
+    let dir = skills_dir(paths, scope).join(name);
+    if !dir.exists() {
+        return Err(InstallError::NotInstalled(name.to_string()));
+    }
+    let manifest_text = std::fs::read_to_string(dir.join(".skill-manifest.json")).map_err(|e| io_err(&dir, e))?;
+    let manifest: InstalledSkillManifest = serde_json::from_str(&manifest_text)?;
+
+    let latest_sha = client.resolve_commit_sha(&manifest.owner, &manifest.repo, &manifest.git_ref).await?;
+    if latest_sha == manifest.commit_sha {
+        return Ok(false);
+    }
+
+    let files = client.fetch_directory_files(&manifest.owner, &manifest.repo, &manifest.path, &latest_sha).await?;
+    if files.is_empty() {
+        return Err(InstallError::EmptyDirectory(manifest.path.clone()));
+    }
+    let new_manifest = InstalledSkillManifest { commit_sha: latest_sha, ..manifest };
+
+    let parent = dir.parent().expect("skills dir always has a parent");
+    let temp_dir = parent.join(format!(".{name}.installing"));
+    if temp_dir.exists() {
+        std::fs::remove_dir_all(&temp_dir).map_err(|e| io_err(&temp_dir, e))?;
+    }
+    write_files(&temp_dir, &files, &new_manifest)?;
+
+    std::fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
+    std::fs::rename(&temp_dir, &dir).map_err(|e| io_err(&dir, e))?;
+    Ok(true)
+}
+
+/// Removes an installed skill's directory entirely.
+pub fn remove_skill(paths: &Paths, scope: Scope, name: &str) -> Result<(), InstallError> {
+    let dir = skills_dir(paths, scope).join(name);
+    if !dir.exists() {
+        return Err(InstallError::NotInstalled(name.to_string()));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, e))
+}
+
+/// One row of `local-code skills list` output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledSkillSummary {
+    pub name: String,
+    pub scope: Scope,
+    pub source: String, // "owner/repo/path@ref"
+}
+
+/// Lists every installed skill across both scopes (no shadowing applied here
+/// — `list` shows everything installed, including a global skill that's
+/// currently shadowed by a project skill of the same name, so the user can
+/// see what `remove --global` would affect).
+pub fn list_skills(paths: &Paths) -> Result<Vec<InstalledSkillSummary>, InstallError> {
+    let mut summaries = Vec::new();
+    for (dir, scope) in [
+        (paths.project_config_dir.join("skills"), Scope::Project),
+        (paths.user_config_dir.join("skills"), Scope::Global),
+    ] {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let skill_dir = entry.path();
+            if !skill_dir.is_dir() {
+                continue;
+            }
+            let manifest_path = skill_dir.join(".skill-manifest.json");
+            let Ok(manifest_text) = std::fs::read_to_string(&manifest_path) else { continue };
+            let Ok(manifest) = serde_json::from_str::<InstalledSkillManifest>(&manifest_text) else { continue };
+            let name = entry.file_name().to_string_lossy().to_string();
+            let path_suffix = if manifest.path.is_empty() { String::new() } else { format!("/{}", manifest.path) };
+            summaries.push(InstalledSkillSummary {
+                name,
+                scope,
+                source: format!("{}/{}{}@{}", manifest.owner, manifest.repo, path_suffix, manifest.git_ref),
+            });
+        }
+    }
+    Ok(summaries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +344,107 @@ mod tests {
     fn default_name_falls_back_to_repo_when_no_path() {
         let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "".into(), git_ref: None };
         assert_eq!(default_name(&source), "widgets");
+    }
+
+    #[tokio::test]
+    async fn update_is_a_noop_when_ref_has_not_moved() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let server = mock_server_with_one_file().await;
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
+        let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+
+        let updated = update_skill(&client, &paths, Scope::Project, "pdf").await.unwrap();
+        assert!(!updated);
+    }
+
+    #[tokio::test]
+    async fn update_refetches_when_ref_has_moved() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let server = mock_server_with_one_file().await;
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
+        let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+
+        // Point the commit-resolution mock at a new sha and change the file content.
+        // `with_priority(1)` is needed so these newly-mounted mocks take precedence
+        // over the still-mounted mocks from `mock_server_with_one_file` above, since
+        // wiremock falls back to insertion order when priority is tied (default: 5).
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "def456"})))
+            .with_priority(1)
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "SKILL.md", "path": "skills/pdf/SKILL.md", "type": "file",
+                 "download_url": format!("{}/raw/SKILL2.md", server.uri())}
+            ])))
+            .with_priority(1)
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/raw/SKILL2.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: pdf\ndescription: updated\n---\nnew body"))
+            .with_priority(1)
+            .mount(&server).await;
+
+        let updated = update_skill(&client, &paths, Scope::Project, "pdf").await.unwrap();
+        assert!(updated);
+        let content = std::fs::read_to_string(paths.project_config_dir.join("skills/pdf/SKILL.md")).unwrap();
+        assert!(content.contains("updated"));
+    }
+
+    #[tokio::test]
+    async fn update_errors_when_skill_not_installed() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let server = MockServer::start().await;
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
+        let result = update_skill(&client, &paths, Scope::Project, "nope").await;
+        assert!(matches!(result, Err(InstallError::NotInstalled(name)) if name == "nope"));
+    }
+
+    #[test]
+    fn remove_deletes_the_skill_directory() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let dir = paths.project_config_dir.join("skills/pdf");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "content").unwrap();
+
+        remove_skill(&paths, Scope::Project, "pdf").unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn remove_errors_when_not_installed() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let result = remove_skill(&paths, Scope::Project, "nope");
+        assert!(matches!(result, Err(InstallError::NotInstalled(name)) if name == "nope"));
+    }
+
+    #[tokio::test]
+    async fn list_reports_installed_skills_with_source_and_scope() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let server = mock_server_with_one_file().await;
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
+        let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+
+        let summaries = list_skills(&paths).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].name, "pdf");
+        assert_eq!(summaries[0].scope, Scope::Project);
+        assert_eq!(summaries[0].source, "acme/widgets/skills/pdf@main");
+    }
+
+    #[test]
+    fn list_is_empty_when_nothing_installed() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let summaries = list_skills(&paths).unwrap();
+        assert!(summaries.is_empty());
     }
 }
