@@ -292,4 +292,71 @@ mod with_history_tests {
         let response = agent.prompt("hi").await.unwrap();
         assert!(response.text().contains("Project rule: never use unwrap()."), "{}", response.text());
     }
+
+    #[tokio::test]
+    async fn a_skill_threaded_through_build_streaming_agent_with_history_is_callable() {
+        use crate::skills::types::{LoadMode, Scope};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A model stub that, on its first turn, requests the `skill` tool for
+        // "test-skill" (proving the tool was actually registered under that
+        // name), then on its second turn echoes back whatever content the
+        // tool result message carried (proving the skill's real body — not
+        // just some placeholder — made it through the round trip).
+        struct ToolCallingModel {
+            call_count: AtomicUsize,
+        }
+
+        impl daimon::model::Model for ToolCallingModel {
+            async fn generate(&self, request: &daimon::model::types::ChatRequest) -> daimon::Result<daimon::model::types::ChatResponse> {
+                let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    Ok(daimon::model::types::ChatResponse {
+                        message: Message::assistant_with_tool_calls(vec![daimon::tool::ToolCall {
+                            id: "call_1".into(),
+                            name: "skill".into(),
+                            arguments: serde_json::json!({"name": "test-skill"}),
+                        }]),
+                        stop_reason: daimon::model::types::StopReason::ToolUse,
+                        usage: Some(daimon::model::types::Usage::default()),
+                    })
+                } else {
+                    let tool_result = request
+                        .messages
+                        .last()
+                        .and_then(|m| m.content.clone())
+                        .unwrap_or_default();
+                    Ok(daimon::model::types::ChatResponse {
+                        message: Message::assistant(format!("skill said: {tool_result}")),
+                        stop_reason: daimon::model::types::StopReason::EndTurn,
+                        usage: Some(daimon::model::types::Usage::default()),
+                    })
+                }
+            }
+            async fn generate_stream(&self, _request: &daimon::model::types::ChatRequest) -> daimon::Result<daimon::stream::ResponseStream> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+
+        let skill = Skill {
+            name: "test-skill".to_string(),
+            description: "a fixture skill for wiring tests".to_string(),
+            scope: Scope::Project,
+            dir: std::path::PathBuf::from("/unused"),
+            body: "test skill body content".to_string(),
+            load_mode: LoadMode::ModelInvoked,
+        };
+
+        let model: SharedModel = Arc::new(ToolCallingModel {
+            call_count: AtomicUsize::new(0),
+        });
+        let agent = build_streaming_agent_with_history(model, gate(), vec![], "", Vec::new(), vec![skill]).unwrap();
+
+        let response = agent.prompt("please use the test skill").await.unwrap();
+        assert!(
+            response.text().contains("test skill body content"),
+            "expected the skill tool's real body to flow through the agent, got: {}",
+            response.text()
+        );
+    }
 }
