@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::config::paths::Paths;
 use crate::skills::frontmatter::{classify, parse_frontmatter};
-use crate::skills::types::{Scope, Skill};
+use crate::skills::types::{LoadMode, Scope, Skill};
 
 /// Scans both scope directories (`<project_config_dir>/skills/`,
 /// `<user_config_dir>/skills/`) for installed skills. Each immediate
@@ -81,9 +81,90 @@ fn load_skill_dir(dir: &Path, scope: Scope) -> Result<Skill, SkillLoadError> {
     })
 }
 
+/// The result of resolving which skills to auto-inject vs. list for the
+/// model, computed once at agent build/rebuild time (never re-evaluated
+/// per-turn — consistent with how `context::load_project_context` is
+/// already loaded once per build).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillContext {
+    /// `(name, body)` for every `AlwaysApply` skill and every `Globs` skill
+    /// whose pattern matched at least one file in the project tree.
+    pub injected: Vec<(String, String)>,
+    /// `(name, description)` for every `ModelInvoked` skill (including a
+    /// `Globs` skill whose pattern matched nothing — no: non-matching Globs
+    /// skills are dropped entirely, see `resolve_skill_context`).
+    pub listing: Vec<(String, String)>,
+}
+
+/// Classifies each discovered skill into `injected` or `listing`, matching
+/// `Globs` skills against `project_root`'s file tree (respecting the same
+/// ignore rules as the built-in `grep`/`glob` tools, via the `ignore` crate)
+/// exactly once. A `Globs` skill whose pattern matches nothing in the tree
+/// is dropped entirely — it is not auto-injected and not listed, since it
+/// isn't relevant to this project.
+pub fn resolve_skill_context(skills: &[Skill], project_root: &Path) -> SkillContext {
+    let mut context = SkillContext::default();
+    for skill in skills {
+        match &skill.load_mode {
+            LoadMode::AlwaysApply => context.injected.push((skill.name.clone(), skill.body.clone())),
+            LoadMode::ModelInvoked => context.listing.push((skill.name.clone(), skill.description.clone())),
+            LoadMode::Globs(globs) => {
+                if project_tree_matches_any_glob(project_root, globs) {
+                    context.injected.push((skill.name.clone(), skill.body.clone()));
+                }
+            }
+        }
+    }
+    context
+}
+
+fn project_tree_matches_any_glob(project_root: &Path, globs: &[String]) -> bool {
+    let patterns: Vec<glob::Pattern> = globs.iter().filter_map(|g| glob::Pattern::new(g).ok()).collect();
+    if patterns.is_empty() {
+        return false;
+    }
+    for entry in ignore::WalkBuilder::new(project_root).build().flatten() {
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let Some(file_name) = entry.file_name().to_str() else { continue };
+        if patterns.iter().any(|p| p.matches(file_name)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Renders a `SkillContext` into the text appended to the system prompt:
+/// the full bodies of injected skills, then a short listing directing the
+/// model to the `skill` tool for the rest. Returns an empty string if there
+/// is nothing to show (mirrors `context::load_project_context`'s behavior
+/// for "no files found").
+pub fn render_skill_context(context: &SkillContext) -> String {
+    let mut sections = Vec::new();
+
+    for (name, body) in &context.injected {
+        sections.push(format!("## Skill: {name}\n\n{body}"));
+    }
+
+    if !context.listing.is_empty() {
+        let mut listing = String::from(
+            "## Available skills\n\nThe following skills are available via the `skill` tool. \
+             Call `skill` with the skill's name to load its full instructions.\n\n",
+        );
+        for (name, description) in &context.listing {
+            listing.push_str(&format!("- `{name}`: {description}\n"));
+        }
+        sections.push(listing);
+    }
+
+    sections.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn test_paths(root: &Path) -> Paths {
@@ -184,5 +265,82 @@ mod tests {
 
         let skills = discover_skills(&paths, root.path());
         assert!(skills.is_empty());
+    }
+
+    fn skill(name: &str, load_mode: LoadMode) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            scope: Scope::Project,
+            dir: PathBuf::from("/unused"),
+            body: format!("{name} body"),
+            load_mode,
+        }
+    }
+
+    #[test]
+    fn always_apply_skill_is_injected() {
+        let root = tempdir().unwrap();
+        let skills = vec![skill("a", LoadMode::AlwaysApply)];
+        let context = resolve_skill_context(&skills, root.path());
+        assert_eq!(context.injected, vec![("a".to_string(), "a body".to_string())]);
+        assert!(context.listing.is_empty());
+    }
+
+    #[test]
+    fn model_invoked_skill_is_listed_not_injected() {
+        let root = tempdir().unwrap();
+        let skills = vec![skill("a", LoadMode::ModelInvoked)];
+        let context = resolve_skill_context(&skills, root.path());
+        assert!(context.injected.is_empty());
+        assert_eq!(context.listing, vec![("a".to_string(), "a description".to_string())]);
+    }
+
+    #[test]
+    fn globs_skill_is_injected_when_a_matching_file_exists() {
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("doc.pdf"), "").unwrap();
+        let skills = vec![skill("pdf", LoadMode::Globs(vec!["*.pdf".to_string()]))];
+        let context = resolve_skill_context(&skills, root.path());
+        assert_eq!(context.injected, vec![("pdf".to_string(), "pdf body".to_string())]);
+        assert!(context.listing.is_empty());
+    }
+
+    #[test]
+    fn globs_skill_is_dropped_entirely_when_nothing_matches() {
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("doc.txt"), "").unwrap();
+        let skills = vec![skill("pdf", LoadMode::Globs(vec!["*.pdf".to_string()]))];
+        let context = resolve_skill_context(&skills, root.path());
+        assert!(context.injected.is_empty());
+        assert!(context.listing.is_empty());
+    }
+
+    #[test]
+    fn globs_skill_matches_nested_files() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("nested")).unwrap();
+        std::fs::write(root.path().join("nested/doc.pdf"), "").unwrap();
+        let skills = vec![skill("pdf", LoadMode::Globs(vec!["*.pdf".to_string()]))];
+        let context = resolve_skill_context(&skills, root.path());
+        assert_eq!(context.injected.len(), 1);
+    }
+
+    #[test]
+    fn render_skill_context_is_empty_when_nothing_to_show() {
+        let rendered = render_skill_context(&SkillContext::default());
+        assert!(rendered.is_empty());
+    }
+
+    #[test]
+    fn render_skill_context_includes_injected_bodies_and_listing() {
+        let context = SkillContext {
+            injected: vec![("always-on".to_string(), "Always-on body".to_string())],
+            listing: vec![("pdf".to_string(), "Extract PDFs".to_string())],
+        };
+        let rendered = render_skill_context(&context);
+        assert!(rendered.contains("Always-on body"));
+        assert!(rendered.contains("`pdf`: Extract PDFs"));
+        assert!(rendered.contains("skill` tool"));
     }
 }
