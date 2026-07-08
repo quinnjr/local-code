@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 /// How to reach an MCP server: the three client transports `daimon`'s vendored
@@ -105,6 +107,40 @@ pub fn save_mcp_servers(dir: &Path, servers: &[McpServerConfig]) -> Result<(), M
     })
 }
 
+static ENV_VAR_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap());
+
+/// Replaces every `${VAR_NAME}` occurrence in `value` with that environment
+/// variable's value, or an empty string if it's unset — a misconfigured
+/// secret then fails at the point of use (e.g. an empty Bearer token gets a
+/// 401 from the server) rather than at config-load time.
+fn interpolate_env(value: &str) -> String {
+    ENV_VAR_PATTERN
+        .replace_all(value, |caps: &regex::Captures| std::env::var(&caps[1]).unwrap_or_default())
+        .into_owned()
+}
+
+/// Applies `interpolate_env` to every string field of a transport config:
+/// `command`, each `args` entry, `url`, and every header key/value.
+fn interpolate_transport(transport: McpTransportConfig) -> McpTransportConfig {
+    match transport {
+        McpTransportConfig::Stdio { command, args } => McpTransportConfig::Stdio {
+            command: interpolate_env(&command),
+            args: args.iter().map(|a| interpolate_env(a)).collect(),
+        },
+        McpTransportConfig::Http { url, headers } => McpTransportConfig::Http {
+            url: interpolate_env(&url),
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (interpolate_env(&k), interpolate_env(&v)))
+                .collect(),
+        },
+        McpTransportConfig::Websocket { url } => {
+            McpTransportConfig::Websocket { url: interpolate_env(&url) }
+        }
+    }
+}
+
 fn load_one(path: &Path) -> Result<McpServersFile, McpServersError> {
     if !path.exists() {
         return Ok(McpServersFile::default());
@@ -113,10 +149,17 @@ fn load_one(path: &Path) -> Result<McpServersFile, McpServersError> {
         path: path.to_path_buf(),
         source,
     })?;
-    toml::from_str(&text).map_err(|source| McpServersError::Parse {
+    let mut file: McpServersFile = toml::from_str(&text).map_err(|source| McpServersError::Parse {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    for server in &mut file.servers {
+        server.transport = interpolate_transport(std::mem::replace(
+            &mut server.transport,
+            McpTransportConfig::Websocket { url: String::new() },
+        ));
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -312,5 +355,85 @@ url = "http://b"
         save_mcp_servers(dir.path(), &[second.clone()]).unwrap();
         let loaded = load_mcp_servers(Path::new("/nonexistent"), dir.path()).unwrap();
         assert_eq!(loaded, vec![second]);
+    }
+
+    #[test]
+    fn interpolates_env_var_in_header_value() {
+        // SAFETY: test-only, single-threaded within this process's test harness
+        // for this specific var name; no other test reads or writes it.
+        unsafe { std::env::set_var("MCP_TEST_TOKEN", "secret-abc") };
+        let toml_text = r#"
+[[server]]
+name = "remote-tools"
+transport = "http"
+url = "http://localhost:9000/mcp"
+
+[server.headers]
+Authorization = "Bearer ${MCP_TEST_TOKEN}"
+"#;
+        let dir = tempdir().unwrap();
+        write(dir.path(), toml_text);
+        let servers = load_mcp_servers(Path::new("/nonexistent"), dir.path()).unwrap();
+        assert_eq!(
+            servers[0].transport,
+            McpTransportConfig::Http {
+                url: "http://localhost:9000/mcp".into(),
+                headers: HashMap::from([("Authorization".to_string(), "Bearer secret-abc".to_string())]),
+            }
+        );
+        unsafe { std::env::remove_var("MCP_TEST_TOKEN") };
+    }
+
+    #[test]
+    fn missing_env_var_interpolates_to_empty_string() {
+        unsafe { std::env::remove_var("MCP_TEST_DEFINITELY_UNSET") };
+        let toml_text = r#"
+[[server]]
+name = "remote-tools"
+transport = "http"
+url = "http://localhost:9000/mcp"
+
+[server.headers]
+Authorization = "Bearer ${MCP_TEST_DEFINITELY_UNSET}"
+"#;
+        let dir = tempdir().unwrap();
+        write(dir.path(), toml_text);
+        let servers = load_mcp_servers(Path::new("/nonexistent"), dir.path()).unwrap();
+        assert_eq!(
+            servers[0].transport,
+            McpTransportConfig::Http {
+                url: "http://localhost:9000/mcp".into(),
+                headers: HashMap::from([("Authorization".to_string(), "Bearer ".to_string())]),
+            }
+        );
+    }
+
+    #[test]
+    fn interpolates_multiple_vars_in_one_string_and_in_command_and_args() {
+        unsafe {
+            std::env::set_var("MCP_TEST_BIN", "my-server");
+            std::env::set_var("MCP_TEST_ROOT", "/srv/data");
+        }
+        let toml_text = r#"
+[[server]]
+name = "fs"
+transport = "stdio"
+command = "${MCP_TEST_BIN}"
+args = ["--root=${MCP_TEST_ROOT}/sub"]
+"#;
+        let dir = tempdir().unwrap();
+        write(dir.path(), toml_text);
+        let servers = load_mcp_servers(Path::new("/nonexistent"), dir.path()).unwrap();
+        assert_eq!(
+            servers[0].transport,
+            McpTransportConfig::Stdio {
+                command: "my-server".into(),
+                args: vec!["--root=/srv/data/sub".into()],
+            }
+        );
+        unsafe {
+            std::env::remove_var("MCP_TEST_BIN");
+            std::env::remove_var("MCP_TEST_ROOT");
+        }
     }
 }
