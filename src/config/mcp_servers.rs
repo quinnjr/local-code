@@ -84,6 +84,27 @@ pub fn load_mcp_servers(
     Ok(merged)
 }
 
+/// Overwrites the project-level `mcp.toml` with exactly `servers`. Mirrors
+/// `config::connection::save_connections` exactly: callers (the `/mcp add`
+/// wizard, `local-code mcp remove`) load the merged (user+project) list,
+/// replace-or-push by name, and pass the whole merged result back in here —
+/// so the project file ends up holding a full copy, same convention
+/// `connections add`/`remove` already use.
+pub fn save_mcp_servers(dir: &Path, servers: &[McpServerConfig]) -> Result<(), McpServersError> {
+    fs::create_dir_all(dir).map_err(|source| McpServersError::Read {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    let file = McpServersFile {
+        servers: servers.to_vec(),
+    };
+    let text = toml::to_string_pretty(&file).expect("McpServerConfig serializes without error");
+    fs::write(dir.join("mcp.toml"), text).map_err(|source| McpServersError::Read {
+        path: dir.to_path_buf(),
+        source,
+    })
+}
+
 fn load_one(path: &Path) -> Result<McpServersFile, McpServersError> {
     if !path.exists() {
         return Ok(McpServersFile::default());
@@ -259,5 +280,37 @@ url = "http://b"
         let project_dir = tempdir().unwrap();
         let servers = load_mcp_servers(user_dir.path(), project_dir.path()).unwrap();
         assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = tempdir().unwrap();
+        let server = McpServerConfig {
+            name: "roundtrip".into(),
+            transport: McpTransportConfig::Stdio {
+                command: "npx".into(),
+                args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+            },
+        };
+        save_mcp_servers(dir.path(), &[server.clone()]).unwrap();
+        let loaded = load_mcp_servers(Path::new("/nonexistent"), dir.path()).unwrap();
+        assert_eq!(loaded, vec![server]);
+    }
+
+    #[test]
+    fn save_overwrites_existing_file_with_exactly_the_given_list() {
+        let dir = tempdir().unwrap();
+        let first = McpServerConfig {
+            name: "a".into(),
+            transport: McpTransportConfig::Http { url: "http://a".into(), headers: HashMap::new() },
+        };
+        let second = McpServerConfig {
+            name: "b".into(),
+            transport: McpTransportConfig::Http { url: "http://b".into(), headers: HashMap::new() },
+        };
+        save_mcp_servers(dir.path(), &[first]).unwrap();
+        save_mcp_servers(dir.path(), &[second.clone()]).unwrap();
+        let loaded = load_mcp_servers(Path::new("/nonexistent"), dir.path()).unwrap();
+        assert_eq!(loaded, vec![second]);
     }
 }
