@@ -211,7 +211,16 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
 
     let always_allow_snapshot = props.always_allow.clone();
     let always_deny_snapshot = props.always_deny.clone();
-    let mcp_tools_snapshot = props.mcp_tools.clone();
+    // A `State` (not a plain snapshot, unlike `always_allow_snapshot`/
+    // `always_deny_snapshot` above) because a later task's `/mcp add`
+    // live-reconnect needs to *append* newly discovered tools at runtime
+    // and have every subsequent `/model`/`/resume` rebuild see them — a
+    // plain `Vec` clone captured once at mount would silently drop
+    // anything added this way.
+    let mcp_tools_state = hooks.use_state({
+        let initial = props.mcp_tools.clone();
+        move || initial
+    });
     // Tracks the currently-active model, kept in sync with `agent_and_responder`
     // on every `/model` switch (see the digit-press handler below) so
     // `SlashContext.model` (used by `/compact`'s summarization call) never
@@ -327,7 +336,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let agent_and_responder = agent_and_responder.clone();
         let always_allow_snapshot = always_allow_snapshot.clone();
         let always_deny_snapshot = always_deny_snapshot.clone();
-        let mcp_tools_snapshot = mcp_tools_snapshot.clone();
+        let mcp_tools_state = mcp_tools_state.clone();
         let system_context = props.system_context.clone();
         let current_model = current_model.clone();
         let connection_display = connection_display.clone();
@@ -377,7 +386,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 let always_allow = always_allow_snapshot.clone();
                                 let always_deny = always_deny_snapshot.clone();
                                 let system_context = system_context.clone();
-                                let mcp_tools = mcp_tools_snapshot.clone();
+                                let mcp_tools = mcp_tools_state.get();
                                 let connection_display = connection_display.clone();
                                 let model_display = model_display.clone();
                                 let connection_name_for_display = connection.name.clone();
@@ -482,7 +491,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                     always_deny_snapshot.clone(),
                                                     session.messages.clone(),
                                                     &system_context,
-                                                    mcp_tools_snapshot.clone(),
+                                                    mcp_tools_state.get(),
                                                     pending_permission.clone(),
                                                 );
                                                 agent_and_responder.set(rebuilt);
