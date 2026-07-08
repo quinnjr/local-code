@@ -1,6 +1,6 @@
 // src/mcp/connect.rs
 
-use daimon::mcp::{HttpTransport, McpClient, StdioTransport, WebSocketTransport};
+use daimon::mcp::{HttpTransport, McpClient, SseTransport, StdioTransport, WebSocketTransport};
 
 use crate::config::mcp_servers::{McpServerConfig, McpTransportConfig};
 use crate::mcp::tool::NamespacedMcpTool;
@@ -13,12 +13,6 @@ pub enum McpConnectError {
         #[source]
         source: daimon::DaimonError,
     },
-    /// The `sse` transport is configured but not yet wired up — `daimon`'s
-    /// `SseTransport` (0.19.0) isn't available at the currently pinned
-    /// `daimon = "0.16.0"`. Bumping the dependency and implementing this arm
-    /// is tracked as a later task.
-    #[error("mcp server '{server}' uses the 'sse' transport, which is not yet supported")]
-    UnsupportedTransport { server: String },
 }
 
 /// Connects to a single configured MCP server, performs the MCP handshake, and
@@ -72,10 +66,19 @@ pub async fn connect_one(
                     source,
                 })?
         }
-        McpTransportConfig::Sse { .. } => {
-            return Err(McpConnectError::UnsupportedTransport {
-                server: config.name.clone(),
-            });
+        McpTransportConfig::Sse { url, headers } => {
+            let transport = SseTransport::connect(url.clone(), headers.clone())
+                .await
+                .map_err(|source| McpConnectError::Connect {
+                    server: config.name.clone(),
+                    source,
+                })?;
+            McpClient::connect(transport)
+                .await
+                .map_err(|source| McpConnectError::Connect {
+                    server: config.name.clone(),
+                    source,
+                })?
         }
     };
 
@@ -146,18 +149,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sse_transport_reports_unsupported_transport_error() {
+    async fn sse_transport_reports_a_connect_error_when_nothing_is_listening() {
         let config = McpServerConfig {
-            name: "sse-tools".into(),
+            name: "unreachable-sse".into(),
             transport: McpTransportConfig::Sse {
-                url: "http://localhost:9002/sse".into(),
+                url: "http://127.0.0.1:1".into(), // port 1: nothing listens here
                 headers: Default::default(),
             },
         };
         let result = connect_one(&config).await;
-        assert!(
-            matches!(result, Err(McpConnectError::UnsupportedTransport { server }) if server == "sse-tools")
-        );
+        assert!(matches!(result, Err(McpConnectError::Connect { server, .. }) if server == "unreachable-sse"));
     }
 
     #[tokio::test]
@@ -187,7 +188,6 @@ mod tests {
             .iter()
             .map(|e| match e {
                 McpConnectError::Connect { server, .. } => server.as_str(),
-                McpConnectError::UnsupportedTransport { server } => server.as_str(),
             })
             .collect();
         assert!(failed_names.contains(&"broken-a"));
