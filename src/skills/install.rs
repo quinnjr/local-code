@@ -20,6 +20,8 @@ pub enum InstallError {
     NotInstalled(String),
     #[error("fetched directory '{0}' contained no files")]
     EmptyDirectory(String),
+    #[error("refusing to write file with unsafe path '{}' (contains '..' or is absolute)", .0.display())]
+    UnsafePath(PathBuf),
 }
 
 fn skills_dir(paths: &Paths, scope: Scope) -> PathBuf {
@@ -93,6 +95,18 @@ pub async fn install_skill(
 }
 
 fn write_files(dir: &Path, files: &[FetchedFile], manifest: &InstalledSkillManifest) -> Result<(), InstallError> {
+    // Defense-in-depth: reject any fetched file whose relative path is absolute
+    // or escapes the target directory via a `..` component, *before* writing
+    // anything. GitHub's real API shouldn't produce such paths, but nothing
+    // upstream guarantees it, so refuse to trust `relative_path` blindly.
+    for file in files {
+        if file.relative_path.is_absolute()
+            || file.relative_path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(InstallError::UnsafePath(file.relative_path.clone()));
+        }
+    }
+
     std::fs::create_dir_all(dir).map_err(|e| io_err(dir, e))?;
     for file in files {
         let dest = dir.join(&file.relative_path);
@@ -468,6 +482,50 @@ mod tests {
         let paths = test_paths(root.path());
         let summaries = list_skills(&paths).unwrap();
         assert!(summaries.is_empty());
+    }
+
+    #[test]
+    fn write_files_rejects_a_path_traversal_relative_path() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let target_dir = paths.project_config_dir.join("skills/pdf");
+        let manifest = InstalledSkillManifest {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: "main".into(),
+            commit_sha: "abc123".into(),
+        };
+        let files = vec![
+            FetchedFile { relative_path: PathBuf::from("SKILL.md"), bytes: b"safe".to_vec() },
+            FetchedFile { relative_path: PathBuf::from("../../etc/passwn"), bytes: b"evil".to_vec() },
+        ];
+
+        let result = write_files(&target_dir, &files, &manifest);
+        assert!(matches!(result, Err(InstallError::UnsafePath(p)) if p == PathBuf::from("../../etc/passwn")));
+
+        // Nothing should have been written outside (or even inside) the target
+        // directory as a result of the rejected batch.
+        assert!(!root.path().join("etc/passwn").exists());
+        assert!(!target_dir.join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn write_files_rejects_an_absolute_relative_path() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let target_dir = paths.project_config_dir.join("skills/pdf");
+        let manifest = InstalledSkillManifest {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: "main".into(),
+            commit_sha: "abc123".into(),
+        };
+        let files = vec![FetchedFile { relative_path: PathBuf::from("/etc/passwn"), bytes: b"evil".to_vec() }];
+
+        let result = write_files(&target_dir, &files, &manifest);
+        assert!(matches!(result, Err(InstallError::UnsafePath(p)) if p == PathBuf::from("/etc/passwn")));
     }
 
     #[test]
