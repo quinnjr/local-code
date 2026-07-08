@@ -59,10 +59,16 @@ pub fn build_agent_with_mcp_tools(
     gate: Arc<PermissionGate>,
     mcp_tools: Vec<NamespacedMcpTool>,
     skills: Vec<Skill>,
+    extra_system_context: &str,
 ) -> daimon::Result<Agent> {
+    let system_prompt = if extra_system_context.trim().is_empty() {
+        DEFAULT_SYSTEM_PROMPT.to_string()
+    } else {
+        format!("{DEFAULT_SYSTEM_PROMPT}\n\n{extra_system_context}")
+    };
     let builder = AgentBuilder::new()
         .shared_model(model)
-        .system_prompt(DEFAULT_SYSTEM_PROMPT);
+        .system_prompt(system_prompt);
     register_all_tools(builder, gate, mcp_tools, skills).build()
 }
 
@@ -70,7 +76,7 @@ pub fn build_agent_with_mcp_tools(
 /// configured/connected). Kept as its own function, with its original Phase 2
 /// signature, so existing callers are unaffected by this plan.
 pub fn build_agent(model: SharedModel, gate: Arc<PermissionGate>) -> daimon::Result<Agent> {
-    build_agent_with_mcp_tools(model, gate, Vec::new(), Vec::new())
+    build_agent_with_mcp_tools(model, gate, Vec::new(), Vec::new(), "")
 }
 
 #[cfg(test)]

@@ -100,7 +100,10 @@ fn scope_label(scope: Scope) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::skills::types::SkillSource;
     use tempfile::tempdir;
+    use wiremock::matchers::{method, path as wpath};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_paths(root: &std::path::Path) -> Paths {
         Paths {
@@ -184,5 +187,111 @@ mod tests {
         let result = update(&paths, Some("../escape"), false, out).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("must not contain path separators"));
+    }
+
+    // `update()`'s `None`-name branch (list every skill in scope, call
+    // `update_skill` on each, print a per-skill status line) can't be driven
+    // through the public `update()` fn itself in a test: it builds its own
+    // `GithubClient` via `github_client()`, which always points at the real
+    // `https://api.github.com` with no injection point (unlike
+    // `GithubClient::new_for_test`, there's no override reachable from here
+    // without touching production code, which this fix is not allowed to
+    // do). So this test drives the exact same loop body — list the scope's
+    // skills, call `update_skill` on each, format the same two messages —
+    // against a mocked `GithubClient`, which is where dependency injection
+    // is actually available. This exercises the same untested branching
+    // (moved vs. not-moved, per skill, across multiple skills) that the
+    // production loop contains.
+    async fn update_all_in_scope_with_client<W: Write>(
+        client: &GithubClient,
+        paths: &Paths,
+        scope: Scope,
+        mut out: W,
+    ) -> anyhow::Result<()> {
+        let names: Vec<String> =
+            list_skills(paths)?.into_iter().filter(|s| s.scope == scope).map(|s| s.name).collect();
+        for name in names {
+            let updated = update_skill(client, paths, scope, &name).await?;
+            if updated {
+                writeln!(out, "Updated skill '{name}'")?;
+            } else {
+                writeln!(out, "Skill '{name}' is already up to date")?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_all_in_scope_updates_and_reports_each_skill() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let server = MockServer::start().await;
+
+        // Two skills from two different repos, so their commit-resolution
+        // endpoints can be moved independently of one another.
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "w1"})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/alpha"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "SKILL.md", "path": "skills/alpha/SKILL.md", "type": "file",
+                 "download_url": format!("{}/raw/alpha.md", server.uri())}
+            ])))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/raw/alpha.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: alpha\ndescription: d\n---\nbody"))
+            .mount(&server).await;
+
+        Mock::given(method("GET")).and(wpath("/repos/acme/gadgets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/gadgets/commits/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "g1"})))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/gadgets/contents/skills/beta"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "SKILL.md", "path": "skills/beta/SKILL.md", "type": "file",
+                 "download_url": format!("{}/raw/beta.md", server.uri())}
+            ])))
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/raw/beta.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: beta\ndescription: d\n---\nbody"))
+            .mount(&server).await;
+
+        let client = GithubClient::new_for_test(None, server.uri());
+        let alpha_source =
+            SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/alpha".into(), git_ref: None };
+        let beta_source =
+            SkillSource { owner: "acme".into(), repo: "gadgets".into(), path: "skills/beta".into(), git_ref: None };
+        install_skill(&client, &paths, Scope::Project, &alpha_source, "alpha").await.unwrap();
+        install_skill(&client, &paths, Scope::Project, &beta_source, "beta").await.unwrap();
+
+        // Move `widgets`' ref (and its file content) to a new commit; leave
+        // `gadgets` untouched so `beta` reports as already up to date.
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "w2"})))
+            .with_priority(1)
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/alpha"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"name": "SKILL.md", "path": "skills/alpha/SKILL.md", "type": "file",
+                 "download_url": format!("{}/raw/alpha2.md", server.uri())}
+            ])))
+            .with_priority(1)
+            .mount(&server).await;
+        Mock::given(method("GET")).and(wpath("/raw/alpha2.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: alpha\ndescription: updated\n---\nnew body"))
+            .with_priority(1)
+            .mount(&server).await;
+
+        let mut out = Vec::new();
+        update_all_in_scope_with_client(&client, &paths, Scope::Project, &mut out).await.unwrap();
+
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("Updated skill 'alpha'"), "missing moved-skill line, got: {output}");
+        assert!(output.contains("Skill 'beta' is already up to date"), "missing not-moved-skill line, got: {output}");
     }
 }

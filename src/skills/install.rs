@@ -24,11 +24,33 @@ pub enum InstallError {
     UnsafePath(PathBuf),
 }
 
+/// Filename of the JSON manifest recorded alongside each installed skill's
+/// fetched files, tracking its GitHub source and pinned commit.
+const MANIFEST_FILENAME: &str = ".skill-manifest.json";
+
 fn skills_dir(paths: &Paths, scope: Scope) -> PathBuf {
     match scope {
         Scope::Project => paths.project_config_dir.join("skills"),
         Scope::Global => paths.user_config_dir.join("skills"),
     }
+}
+
+/// Both scope directories paired with their `Scope`, in the fixed order
+/// (project, then global) that callers rely on for shadowing semantics.
+pub(crate) fn scope_dirs(paths: &Paths) -> [(PathBuf, Scope); 2] {
+    [(skills_dir(paths, Scope::Project), Scope::Project), (skills_dir(paths, Scope::Global), Scope::Global)]
+}
+
+/// The temp directory a fresh fetch is written into before being renamed
+/// into place, for both `install_skill` and `update_skill`.
+fn installing_temp_dir(parent: &Path, name: &str) -> PathBuf {
+    parent.join(format!(".{name}.installing"))
+}
+
+/// The backup path `update_skill` renames the pre-update directory to while
+/// swapping in the newly-fetched content.
+fn replaced_backup_dir(parent: &Path, name: &str) -> PathBuf {
+    parent.join(format!(".{name}.replaced"))
 }
 
 /// Derives the default install name from a source spec: the last path
@@ -84,7 +106,7 @@ pub async fn install_skill(
 
     let parent = target_dir.parent().expect("skills dir always has a parent");
     std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
-    let temp_dir = parent.join(format!(".{name}.installing"));
+    let temp_dir = installing_temp_dir(parent, name);
     if temp_dir.exists() {
         std::fs::remove_dir_all(&temp_dir).map_err(|e| io_err(&temp_dir, e))?;
     }
@@ -116,7 +138,7 @@ fn write_files(dir: &Path, files: &[FetchedFile], manifest: &InstalledSkillManif
         std::fs::write(&dest, &file.bytes).map_err(|e| io_err(&dest, e))?;
     }
     let manifest_json = serde_json::to_string_pretty(manifest)?;
-    std::fs::write(dir.join(".skill-manifest.json"), manifest_json).map_err(|e| io_err(dir, e))?;
+    std::fs::write(dir.join(MANIFEST_FILENAME), manifest_json).map_err(|e| io_err(dir, e))?;
     Ok(())
 }
 
@@ -129,16 +151,34 @@ fn write_files(dir: &Path, files: &[FetchedFile], manifest: &InstalledSkillManif
 /// place, then the backup is removed. A crash after the second rename leaves
 /// the new skill fully installed, with only an orphaned backup directory
 /// left to clean up; a crash before it leaves the old skill untouched (either
-/// still in place, or recoverable from the backup). At no point does the
-/// skill's directory not exist at all.
+/// still in place, or recoverable from the backup).
+///
+/// There IS a window, between the two renames, where the skill's directory
+/// doesn't exist at all. This function is self-healing across that window,
+/// though: if a prior call crashed there, `dir` is missing but the backup
+/// (`.{name}.replaced`) still holds the pre-update content, and the next
+/// call to `update_skill` restores it from the backup before doing anything
+/// else, rather than reporting `NotInstalled`.
 /// No-op (returns `Ok(false)`) if the ref hasn't moved. Returns `Ok(true)` if
 /// an update was applied.
 pub async fn update_skill(client: &GithubClient, paths: &Paths, scope: Scope, name: &str) -> Result<bool, InstallError> {
     let dir = skills_dir(paths, scope).join(name);
+    let parent = dir.parent().expect("skills dir always has a parent").to_path_buf();
+    let backup_dir = replaced_backup_dir(&parent, name);
+
+    // Self-heal: a prior `update_skill` call may have crashed between renaming
+    // `dir` aside to `backup_dir` and renaming the newly-fetched content into
+    // `dir`. If so, `dir` is missing but `backup_dir` (the pre-update content)
+    // still exists — restore it so this call sees the skill as still
+    // installed, rather than erroring `NotInstalled`.
+    if !dir.exists() && backup_dir.exists() {
+        std::fs::rename(&backup_dir, &dir).map_err(|e| io_err(&dir, e))?;
+    }
+
     if !dir.exists() {
         return Err(InstallError::NotInstalled(name.to_string()));
     }
-    let manifest_text = std::fs::read_to_string(dir.join(".skill-manifest.json")).map_err(|e| io_err(&dir, e))?;
+    let manifest_text = std::fs::read_to_string(dir.join(MANIFEST_FILENAME)).map_err(|e| io_err(&dir, e))?;
     let manifest: InstalledSkillManifest = serde_json::from_str(&manifest_text)?;
 
     let latest_sha = client.resolve_commit_sha(&manifest.owner, &manifest.repo, &manifest.git_ref).await?;
@@ -152,14 +192,12 @@ pub async fn update_skill(client: &GithubClient, paths: &Paths, scope: Scope, na
     }
     let new_manifest = InstalledSkillManifest { commit_sha: latest_sha, ..manifest };
 
-    let parent = dir.parent().expect("skills dir always has a parent");
-    let temp_dir = parent.join(format!(".{name}.installing"));
+    let temp_dir = installing_temp_dir(&parent, name);
     if temp_dir.exists() {
         std::fs::remove_dir_all(&temp_dir).map_err(|e| io_err(&temp_dir, e))?;
     }
     write_files(&temp_dir, &files, &new_manifest)?;
 
-    let backup_dir = parent.join(format!(".{name}.replaced"));
     if backup_dir.exists() {
         std::fs::remove_dir_all(&backup_dir).map_err(|e| io_err(&backup_dir, e))?;
     }
@@ -192,20 +230,20 @@ pub struct InstalledSkillSummary {
 /// see what `remove --global` would affect).
 pub fn list_skills(paths: &Paths) -> Result<Vec<InstalledSkillSummary>, InstallError> {
     let mut summaries = Vec::new();
-    for (dir, scope) in [
-        (paths.project_config_dir.join("skills"), Scope::Project),
-        (paths.user_config_dir.join("skills"), Scope::Global),
-    ] {
+    for (dir, scope) in scope_dirs(paths) {
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let skill_dir = entry.path();
             if !skill_dir.is_dir() {
                 continue;
             }
-            let manifest_path = skill_dir.join(".skill-manifest.json");
+            let manifest_path = skill_dir.join(MANIFEST_FILENAME);
             let manifest_text = match std::fs::read_to_string(&manifest_path) {
                 Ok(text) => text,
-                Err(_) => continue, // no manifest at all — not a valid skill install, skip silently
+                Err(e) => {
+                    eprintln!("warning: skipping skill at {}: no manifest: {e}", skill_dir.display());
+                    continue;
+                }
             };
             let manifest = match serde_json::from_str::<InstalledSkillManifest>(&manifest_text) {
                 Ok(m) => m,
@@ -431,6 +469,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_self_heals_from_a_crash_between_the_two_renames() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let server = mock_server_with_one_file().await;
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
+
+        let parent = paths.project_config_dir.join("skills");
+        let dir = parent.join("pdf");
+        let backup_dir = parent.join(".pdf.replaced");
+
+        // Simulate the on-disk state a crash between the two renames in
+        // `update_skill` would leave behind: `dir` is missing, but the
+        // pre-update content (including a valid manifest matching the "ref
+        // hasn't moved" mock) still sits at the backup path.
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        std::fs::write(backup_dir.join("SKILL.md"), "pre-update content").unwrap();
+        let manifest = InstalledSkillManifest {
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: "main".into(),
+            commit_sha: "abc123".into(),
+        };
+        std::fs::write(backup_dir.join(MANIFEST_FILENAME), serde_json::to_string(&manifest).unwrap()).unwrap();
+        assert!(!dir.exists());
+
+        // The mocked ref hasn't moved (still resolves to "abc123"), so this
+        // call should self-heal (restore `dir` from `backup_dir`) and then
+        // return `Ok(false)` (no-op) rather than `Err(NotInstalled)`.
+        let updated = update_skill(&client, &paths, Scope::Project, "pdf").await.unwrap();
+        assert!(!updated);
+
+        assert!(dir.exists());
+        assert!(!backup_dir.exists());
+        let content = std::fs::read_to_string(dir.join("SKILL.md")).unwrap();
+        assert_eq!(content, "pre-update content");
+    }
+
+    #[tokio::test]
     async fn update_errors_when_skill_not_installed() {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
@@ -474,6 +551,22 @@ mod tests {
         assert_eq!(summaries[0].name, "pdf");
         assert_eq!(summaries[0].scope, Scope::Project);
         assert_eq!(summaries[0].source, "acme/widgets/skills/pdf@main");
+    }
+
+    #[tokio::test]
+    async fn list_reports_both_scopes_without_shadowing_same_named_skill() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let server = mock_server_with_one_file().await;
+        let client = crate::skills::github::GithubClient::new_for_test(None, server.uri());
+        let source = SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        install_skill(&client, &paths, Scope::Global, &source, "pdf").await.unwrap();
+
+        let summaries = list_skills(&paths).unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().any(|s| s.name == "pdf" && s.scope == Scope::Project));
+        assert!(summaries.iter().any(|s| s.name == "pdf" && s.scope == Scope::Global));
     }
 
     #[test]

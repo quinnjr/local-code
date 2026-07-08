@@ -147,7 +147,11 @@ struct ContentsEntry {
 impl GithubClient {
     pub fn new(token: Option<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("reqwest client with basic timeout config should always build"),
             api_base: "https://api.github.com".to_string(),
             token,
         }
@@ -157,13 +161,26 @@ impl GithubClient {
     /// `wiremock::MockServer`'s URI) instead of the real GitHub API.
     #[cfg(test)]
     pub(crate) fn new_for_test(token: Option<String>, api_base: String) -> Self {
-        Self { http: reqwest::Client::new(), api_base, token }
+        Self {
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+                .expect("reqwest client with basic timeout config should always build"),
+            api_base,
+            token,
+        }
     }
 
     fn request(&self, url: &str) -> reqwest::RequestBuilder {
         let mut req = self.http.get(url).header("User-Agent", "local-code");
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {token}"));
+            let is_github_host = url.starts_with("https://api.github.com")
+                || url.starts_with("https://raw.githubusercontent.com")
+                || url.starts_with(&self.api_base); // covers the test-mock api_base override
+            if is_github_host {
+                req = req.header("Authorization", format!("Bearer {token}"));
+            }
         }
         req
     }
@@ -247,6 +264,11 @@ impl GithubClient {
                             body: "file entry missing download_url".to_string(),
                         })?;
                         let response = self.request(&download_url).send().await.map_err(GithubError::Request)?;
+                        let status = response.status();
+                        if !status.is_success() {
+                            let body = response.text().await.unwrap_or_default();
+                            return Err(GithubError::Api { status: status.as_u16(), url: download_url, body });
+                        }
                         let bytes = response.bytes().await.map_err(GithubError::Request)?.to_vec();
                         let relative = entry.path.strip_prefix(base_path).unwrap_or(&entry.path).trim_start_matches('/');
                         out.push(FetchedFile { relative_path: PathBuf::from(relative), bytes });
@@ -426,5 +448,39 @@ mod github_client_tests {
         let client = GithubClient::new_for_test(None, server.uri());
         let result = client.resolve_default_branch("acme", "widgets").await;
         assert!(matches!(result, Err(GithubError::Api { status: 404, .. })));
+    }
+
+    #[tokio::test]
+    async fn fetch_directory_files_errors_when_raw_download_returns_non_2xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/acme/widgets/contents/skills/pdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "name": "SKILL.md",
+                    "path": "skills/pdf/SKILL.md",
+                    "type": "file",
+                    "download_url": format!("{}/raw/SKILL.md", server.uri())
+                }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/raw/SKILL.md"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&server)
+            .await;
+
+        let client = GithubClient::new_for_test(None, server.uri());
+        let result = client.fetch_directory_files("acme", "widgets", "skills/pdf", "abc123").await;
+        assert!(matches!(result, Err(GithubError::Api { status: 500, .. })));
+    }
+
+    #[tokio::test]
+    async fn does_not_send_bearer_token_to_non_github_host() {
+        let client = GithubClient::new_for_test(Some("test-token".to_string()), "http://127.0.0.1:1".to_string());
+        let request = client.request("https://example.invalid/SKILL.md");
+        let built = request.build().unwrap();
+        assert!(built.headers().get("Authorization").is_none());
     }
 }

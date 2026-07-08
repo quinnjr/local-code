@@ -30,6 +30,7 @@ Ollama. No cloud calls, no API keys required.
 - MCP (Model Context Protocol) client support alongside built-in file/shell
   tools
 - Flat-file cross-session memory (`memory search` / `memory core` / `memory add`)
+- GitHub-backed skills (`skills install` / `skills list` / `skills remove` / `skills update`)
 - Headless mode (`local-code -p "..."`) for scripted, non-interactive use
 
 ## Getting started

@@ -29,7 +29,9 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    wart (run single-threaded if flakiness appears) — not a product-behavior limitation.
 
 7. **Headless mode doesn't load AGENTS.md/CLAUDE.md context.** This gap was already open at the
-   end of Phase 2 and remains open — it was out of scope for this TUI-focused plan.
+   end of Phase 2 and remains open — it was out of scope for this TUI-focused plan. (Headless
+   mode *does* now auto-inject `alwaysApply`/glob-matched skill context into the system prompt,
+   matching the TUI — only the AGENTS.md/CLAUDE.md piece is still missing.)
 
 8. **HTTP/WebSocket MCP transports are only proven via negative/graceful-degradation tests.**
    Only the stdio transport has a live, fixture-server integration test proving positive
@@ -41,8 +43,3 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    They'd miss a regression where the model returns garbage-but-nonempty text. Intentionally thin
    smoke-test bar, consistent with the pre-existing Phase 2 live tests.
 
-10. **Headless mode registers the `skill` tool but doesn't auto-inject skill context.** Like
-    limitation #7 (no AGENTS.md/CLAUDE.md context in headless), `-p` prompts get the `skill` tool
-    for model-invoked skills but never see the auto-injected bodies of `alwaysApply`/glob-matched
-    `.mdc` skills, since headless mode doesn't thread `extra_system_context` through at all.
-    Deliberate scoping decision, not a bug — fixing it is the same follow-up as #7's.

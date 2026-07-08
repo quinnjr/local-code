@@ -162,7 +162,7 @@ pub async fn run_tui(
 
     let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;
     let system_context = load_project_context(paths, project_root);
-    let discovered_skills = discover_skills(paths, project_root);
+    let discovered_skills = discover_skills(paths);
     let skill_context = resolve_skill_context(&discovered_skills, project_root);
     let rendered_skill_context = render_skill_context(&skill_context);
     let system_context = if rendered_skill_context.is_empty() {

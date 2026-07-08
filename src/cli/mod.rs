@@ -406,3 +406,59 @@ mod headless_cli_tests {
         assert!(!requires_interactive_stdin(None));
     }
 }
+
+#[cfg(test)]
+mod skills_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_install_with_global_and_name() {
+        let cli = Cli::parse_from([
+            "local-code",
+            "skills",
+            "install",
+            "owner/repo",
+            "--global",
+            "--name",
+            "foo",
+        ]);
+        if let Some(Command::Skills { action }) = cli.command {
+            if let SkillsAction::Install { spec, global, name } = action {
+                assert_eq!(spec, "owner/repo");
+                assert!(global);
+                assert_eq!(name.as_deref(), Some("foo"));
+            } else {
+                panic!("expected SkillsAction::Install, got a different variant");
+            }
+        } else {
+            panic!("expected Some(Command::Skills)");
+        }
+    }
+
+    #[test]
+    fn parses_list() {
+        let cli = Cli::parse_from(["local-code", "skills", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Skills {
+                action: SkillsAction::List
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_remove_with_global() {
+        let cli = Cli::parse_from(["local-code", "skills", "remove", "foo", "--global"]);
+        if let Some(Command::Skills { action }) = cli.command {
+            if let SkillsAction::Remove { name, global } = action {
+                assert_eq!(name, "foo");
+                assert!(global);
+            } else {
+                panic!("expected SkillsAction::Remove, got a different variant");
+            }
+        } else {
+            panic!("expected Some(Command::Skills)");
+        }
+    }
+}

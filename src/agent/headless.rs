@@ -14,7 +14,7 @@ use crate::permissions::gate::PermissionGate;
 use crate::permissions::settings::load_settings;
 use crate::permissions::stdio::StdioPrompter;
 use crate::permissions::types::PermissionTier;
-use crate::skills::discovery::discover_skills;
+use crate::skills::discovery::{discover_skills, render_skill_context, resolve_skill_context};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HeadlessError {
@@ -95,9 +95,17 @@ pub async fn run_headless(
         eprintln!("warning: {error}");
     }
 
-    let skills = discover_skills(paths, project_root);
+    let discovered_skills = discover_skills(paths);
+    let skill_context = resolve_skill_context(&discovered_skills, project_root);
+    let system_context = render_skill_context(&skill_context);
 
-    let agent = build_agent_with_mcp_tools(model, gate, mcp_report.tools, skills)?;
+    let agent = build_agent_with_mcp_tools(
+        model,
+        gate,
+        mcp_report.tools,
+        discovered_skills,
+        &system_context,
+    )?;
     let response = agent.prompt(prompt).await?;
     Ok(response.text().to_string())
 }
@@ -181,7 +189,7 @@ mod tests {
 
         // The whole point: a fully-failed MCP discovery report still produces
         // a working agent with just the built-in tools.
-        let agent = build_agent_with_mcp_tools(model, gate, report.tools, Vec::new());
+        let agent = build_agent_with_mcp_tools(model, gate, report.tools, Vec::new(), "");
         assert!(agent.is_ok());
     }
 }
