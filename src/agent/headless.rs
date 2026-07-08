@@ -14,6 +14,7 @@ use crate::permissions::gate::PermissionGate;
 use crate::permissions::settings::load_settings;
 use crate::permissions::stdio::StdioPrompter;
 use crate::permissions::types::PermissionTier;
+use crate::skills::discovery::discover_skills;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HeadlessError {
@@ -68,7 +69,7 @@ fn select_connection(
 /// regardless of tier).
 pub async fn run_headless(
     paths: &Paths,
-    _project_root: &Path,
+    project_root: &Path,
     connection_name: Option<&str>,
     permission_mode_override: Option<PermissionTier>,
     prompt: &str,
@@ -94,7 +95,9 @@ pub async fn run_headless(
         eprintln!("warning: {error}");
     }
 
-    let agent = build_agent_with_mcp_tools(model, gate, mcp_report.tools, Vec::new())?;
+    let skills = discover_skills(paths, project_root);
+
+    let agent = build_agent_with_mcp_tools(model, gate, mcp_report.tools, skills)?;
     let response = agent.prompt(prompt).await?;
     Ok(response.text().to_string())
 }
