@@ -820,6 +820,14 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 });
             });
         }
+        SlashCommand::McpList | SlashCommand::McpRemove { .. } | SlashCommand::McpAdd => {
+            // TODO: dispatch for /mcp list|remove|add is implemented in a later task.
+            ctx.transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice {
+                    text: "/mcp is not yet implemented".to_string(),
+                });
+            });
+        }
         SlashCommand::Compact => {
             const RETAIN_RECENT: usize = 10;
             const COMPACT_THRESHOLD: usize = 20;
