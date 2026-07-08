@@ -36,10 +36,11 @@ pub fn search(memory_dir: &Path, query: &str) -> Result<Vec<MemoryHit>, MemoryEr
             source,
         })?;
         let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("today-") && name.ends_with(".md") {
-                daily.push(path);
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with("today-")
+            && name.ends_with(".md")
+        {
+            daily.push(path);
         }
     }
     daily.sort();

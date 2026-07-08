@@ -8,10 +8,11 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    non-matching keystroke is silently swallowed until a valid digit is pressed — there's no way
    to back out once one of these menus is open.
 
-2. **MCP tool discovery only happens once, at TUI startup.** `/model` and `/resume` rebuild the
-   agent but reuse the already-discovered `NamespacedMcpTool`s rather than reconnecting to MCP
-   servers. A server added to `mcp.toml` mid-session isn't picked up until a full TUI
-   restart. Deliberate trade-off, not an oversight.
+2. **MCP tool discovery only happens once, at TUI startup — except via `/mcp add`.** `/model` and
+   `/resume` rebuild the agent but reuse the already-discovered `NamespacedMcpTool`s rather than
+   reconnecting to MCP servers. A server added by hand-editing `mcp.toml` mid-session isn't picked
+   up until a full TUI restart; `/mcp add` is the one path that *does* connect and merge its tools
+   into the live agent immediately. Deliberate trade-off for the hand-edit case, not an oversight.
 
 3. **`/clear` doesn't rebuild the live agent object.** It resets the visible transcript and
    session file immediately, but the agent's in-memory `SeededMemory` technically retains

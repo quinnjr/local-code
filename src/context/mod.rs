@@ -20,10 +20,10 @@ pub fn load_project_context(paths: &Paths, project_root: &Path) -> String {
 
     let mut sections = Vec::new();
     for (path, label) in candidates {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if !content.trim().is_empty() {
-                sections.push(format!("## {label}\n\n{content}"));
-            }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && !content.trim().is_empty()
+        {
+            sections.push(format!("## {label}\n\n{content}"));
         }
     }
     sections.join("\n\n")

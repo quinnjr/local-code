@@ -98,10 +98,9 @@ fn list_daily_files(memory_dir: &Path) -> Result<Vec<(NaiveDate, PathBuf)>, Memo
         if let Some(date_str) = file_name
             .strip_prefix("today-")
             .and_then(|s| s.strip_suffix(".md"))
+            && let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
         {
-            if let Ok(date) = NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-                result.push((date, path));
-            }
+            result.push((date, path));
         }
     }
     Ok(result)

@@ -27,6 +27,7 @@ pub type ResponderHandle = Arc<Mutex<Option<oneshot::Sender<PermissionDecision>>
 /// that logic lives — `App`'s mount, `/model`, and `/resume` all call it
 /// instead of duplicating the construction sequence Phase 3 originally left
 /// inlined in `App`'s `hooks.use_state` initializer.
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild_agent(
     model: SharedModel,
     initial_tier: PermissionTier,

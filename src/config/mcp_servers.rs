@@ -352,7 +352,7 @@ url = "http://b"
                 args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
             },
         };
-        save_mcp_servers(dir.path(), &[server.clone()]).unwrap();
+        save_mcp_servers(dir.path(), std::slice::from_ref(&server)).unwrap();
         let loaded = load_mcp_servers(Path::new("/nonexistent"), dir.path()).unwrap();
         assert_eq!(loaded, vec![server]);
     }
@@ -369,7 +369,7 @@ url = "http://b"
             transport: McpTransportConfig::Http { url: "http://b".into(), headers: HashMap::new() },
         };
         save_mcp_servers(dir.path(), &[first]).unwrap();
-        save_mcp_servers(dir.path(), &[second.clone()]).unwrap();
+        save_mcp_servers(dir.path(), std::slice::from_ref(&second)).unwrap();
         let loaded = load_mcp_servers(Path::new("/nonexistent"), dir.path()).unwrap();
         assert_eq!(loaded, vec![second]);
     }

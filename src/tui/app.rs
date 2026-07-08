@@ -122,12 +122,12 @@ impl PartialEq for AppProps {
 /// digit-matching boilerplate across what was then three (now four)
 /// near-identical blocks.
 fn digit_key_to_index(code: KeyCode, max: usize) -> Option<usize> {
-    if let KeyCode::Char(c) = code {
-        if let Some(digit) = c.to_digit(10) {
-            if digit >= 1 && (digit as usize) <= max {
-                return Some(digit as usize - 1);
-            }
-        }
+    if let KeyCode::Char(c) = code
+        && let Some(digit) = c.to_digit(10)
+        && digit >= 1
+        && (digit as usize) <= max
+    {
+        return Some(digit as usize - 1);
     }
     None
 }
@@ -1243,6 +1243,7 @@ fn format_turn_error(e: impl std::fmt::Display) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     agent: Arc<Agent>,
     input: String,

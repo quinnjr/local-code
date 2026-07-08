@@ -27,8 +27,9 @@ Ollama. No cloud calls, no API keys required.
   `/compact`, `/resume`, `/clear`, `/help`
 - Session persistence — every turn is saved, and sessions can be resumed
   in-TUI or via `local-code --resume`
-- MCP (Model Context Protocol) client support alongside built-in file/shell
-  tools
+- MCP (Model Context Protocol) client support (stdio/HTTP/SSE/WebSocket)
+  alongside built-in file/shell tools, configurable via `/mcp add`'s in-TUI
+  wizard or by hand-editing `mcp.toml`
 - Flat-file cross-session memory (`memory search` / `memory core` / `memory add`)
 - Headless mode (`local-code -p "..."`) for scripted, non-interactive use
 

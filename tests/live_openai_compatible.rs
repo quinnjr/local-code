@@ -3,6 +3,7 @@
 //!   - a server listening at `LOCAL_CODE_TEST_OPENAI_BASE_URL` (default
 //!     `http://localhost:8000/v1`) that supports native OpenAI-style `tool_calls`.
 //!   - `LOCAL_CODE_TEST_OPENAI_MODEL` set to a model ID the server has loaded.
+//!
 //! Run with: `cargo test --test live_openai_compatible -- --ignored --nocapture`
 
 use std::sync::Arc;

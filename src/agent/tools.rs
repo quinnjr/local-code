@@ -29,14 +29,13 @@ async fn write_file(
     content: String,
 ) -> daimon::Result<ToolOutput> {
     let path_ref = std::path::Path::new(&path);
-    if let Some(parent) = path_ref.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return Ok(ToolOutput::error(format!(
-                    "failed to create parent directories for {path}: {e}"
-                )));
-            }
-        }
+    if let Some(parent) = path_ref.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return Ok(ToolOutput::error(format!(
+            "failed to create parent directories for {path}: {e}"
+        )));
     }
     match tokio::fs::write(&path, content).await {
         Ok(()) => Ok(ToolOutput::text(format!("wrote {path}"))),
@@ -181,12 +180,10 @@ async fn glob(
     };
 
     let mut matches = Vec::new();
-    for entry in paths {
-        if let Ok(p) = entry {
-            matches.push(p.display().to_string());
-            if matches.len() >= 200 {
-                break;
-            }
+    for p in paths.flatten() {
+        matches.push(p.display().to_string());
+        if matches.len() >= 200 {
+            break;
         }
     }
 
