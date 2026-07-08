@@ -13,6 +13,12 @@ pub enum McpConnectError {
         #[source]
         source: daimon::DaimonError,
     },
+    /// The `sse` transport is configured but not yet wired up — `daimon`'s
+    /// `SseTransport` (0.19.0) isn't available at the currently pinned
+    /// `daimon = "0.16.0"`. Bumping the dependency and implementing this arm
+    /// is tracked as a later task.
+    #[error("mcp server '{server}' uses the 'sse' transport, which is not yet supported")]
+    UnsupportedTransport { server: String },
 }
 
 /// Connects to a single configured MCP server, performs the MCP handshake, and
@@ -65,6 +71,11 @@ pub async fn connect_one(
                     server: config.name.clone(),
                     source,
                 })?
+        }
+        McpTransportConfig::Sse { .. } => {
+            return Err(McpConnectError::UnsupportedTransport {
+                server: config.name.clone(),
+            });
         }
     };
 
@@ -135,6 +146,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sse_transport_reports_unsupported_transport_error() {
+        let config = McpServerConfig {
+            name: "sse-tools".into(),
+            transport: McpTransportConfig::Sse {
+                url: "http://localhost:9002/sse".into(),
+                headers: Default::default(),
+            },
+        };
+        let result = connect_one(&config).await;
+        assert!(
+            matches!(result, Err(McpConnectError::UnsupportedTransport { server }) if server == "sse-tools")
+        );
+    }
+
+    #[tokio::test]
     async fn one_broken_server_does_not_prevent_others_from_being_reported() {
         let configs = vec![
             McpServerConfig {
@@ -161,6 +187,7 @@ mod tests {
             .iter()
             .map(|e| match e {
                 McpConnectError::Connect { server, .. } => server.as_str(),
+                McpConnectError::UnsupportedTransport { server } => server.as_str(),
             })
             .collect();
         assert!(failed_names.contains(&"broken-a"));

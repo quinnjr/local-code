@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-/// How to reach an MCP server: the three client transports `daimon`'s vendored
+/// How to reach an MCP server: the four client transports `daimon`'s vendored
 /// `mcp` feature supports (`daimon::mcp::{StdioTransport, HttpTransport, WebSocketTransport}`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "kebab-case")]
@@ -23,6 +23,16 @@ pub enum McpTransportConfig {
     /// Sends each JSON-RPC message as an HTTP POST to `url`. `headers` are attached
     /// to every request (e.g. `Authorization = "Bearer <token>"`).
     Http {
+        url: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+    /// The MCP "HTTP+SSE" transport: a persistent `GET` receives server
+    /// responses/notifications as SSE frames, while requests are sent via
+    /// separate `POST`s. `headers` are attached to both. Requires
+    /// `daimon::mcp::SseTransport` (added in daimon 0.19.0) — see
+    /// `src/mcp/connect.rs`.
+    Sse {
         url: String,
         #[serde(default)]
         headers: HashMap<String, String>,
@@ -129,6 +139,13 @@ fn interpolate_transport(transport: McpTransportConfig) -> McpTransportConfig {
             args: args.iter().map(|a| interpolate_env(a)).collect(),
         },
         McpTransportConfig::Http { url, headers } => McpTransportConfig::Http {
+            url: interpolate_env(&url),
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (interpolate_env(&k), interpolate_env(&v)))
+                .collect(),
+        },
+        McpTransportConfig::Sse { url, headers } => McpTransportConfig::Sse {
             url: interpolate_env(&url),
             headers: headers
                 .into_iter()
@@ -435,5 +452,41 @@ args = ["--root=${MCP_TEST_ROOT}/sub"]
             std::env::remove_var("MCP_TEST_BIN");
             std::env::remove_var("MCP_TEST_ROOT");
         }
+    }
+
+    #[test]
+    fn parses_sse_transport_with_headers() {
+        let toml_text = r#"
+[[server]]
+name = "sse-tools"
+transport = "sse"
+url = "http://localhost:9002/sse"
+
+[server.headers]
+Authorization = "Bearer abc123"
+"#;
+        let file: McpServersFile = toml::from_str(toml_text).expect("valid toml");
+        assert_eq!(
+            file.servers[0].transport,
+            McpTransportConfig::Sse {
+                url: "http://localhost:9002/sse".into(),
+                headers: HashMap::from([("Authorization".to_string(), "Bearer abc123".to_string())]),
+            }
+        );
+    }
+
+    #[test]
+    fn sse_headers_default_to_empty_when_omitted() {
+        let toml_text = r#"
+[[server]]
+name = "sse-tools"
+transport = "sse"
+url = "http://localhost:9002/sse"
+"#;
+        let file: McpServersFile = toml::from_str(toml_text).expect("valid toml");
+        assert_eq!(
+            file.servers[0].transport,
+            McpTransportConfig::Sse { url: "http://localhost:9002/sse".into(), headers: HashMap::new() }
+        );
     }
 }
