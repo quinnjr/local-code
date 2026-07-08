@@ -1,5 +1,6 @@
 pub mod connections;
 pub mod memory;
+pub mod skills;
 
 use crate::agent::headless::run_headless;
 use crate::config::paths::Paths;
@@ -45,6 +46,11 @@ pub enum Command {
         #[command(subcommand)]
         action: MemoryAction,
     },
+    /// Manage skills (install/list/remove/update from GitHub)
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -62,6 +68,34 @@ pub enum MemoryAction {
     Core,
     /// Append a manual entry to the short-term buffer
     Add { text: String },
+}
+
+#[derive(Subcommand)]
+pub enum SkillsAction {
+    /// Install a skill from GitHub: owner/repo[/path][@ref]
+    Install {
+        spec: String,
+        /// Install into the global (user-level) scope instead of this project
+        #[arg(long)]
+        global: bool,
+        /// Override the derived skill name
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List installed skills across both scopes
+    List,
+    /// Remove an installed skill
+    Remove {
+        name: String,
+        #[arg(long)]
+        global: bool,
+    },
+    /// Re-fetch a skill (or all skills in scope) if its pinned ref has moved
+    Update {
+        name: Option<String>,
+        #[arg(long)]
+        global: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -136,6 +170,20 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             }
             MemoryAction::Add { text } => {
                 memory::add_command(&paths, &text, stdout())?;
+            }
+        },
+        Some(Command::Skills { action }) => match action {
+            SkillsAction::Install { spec, global, name } => {
+                skills::install(&paths, &spec, global, name.as_deref(), stdout()).await?;
+            }
+            SkillsAction::List => {
+                skills::list(&paths, stdout())?;
+            }
+            SkillsAction::Remove { name, global } => {
+                skills::remove(&paths, &name, global, stdout())?;
+            }
+            SkillsAction::Update { name, global } => {
+                skills::update(&paths, name.as_deref(), global, stdout()).await?;
             }
         },
         None => {
