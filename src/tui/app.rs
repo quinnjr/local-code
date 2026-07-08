@@ -167,6 +167,15 @@ enum PendingMenu {
     ModelChoice(Vec<(crate::config::connection::Connection, String)>),
     PermissionsMenu,
     ResumeChoice(Vec<crate::session::types::SessionSummary>),
+    /// A `/mcp add` wizard is mid-flow, waiting for the next line of free-text
+    /// input. Unlike the three variants above, this one supports `Esc` to
+    /// cancel (see a later task) — the only pending menu that does.
+    McpAddWizard(crate::tui::mcp_wizard::McpAddWizard),
+    /// The wizard finished (`Advance::Finalize`) and its `connect_one` +
+    /// save + agent-rebuild is running in a spawned task. All input is
+    /// blocked (like `streaming`) until it resolves and resets this to
+    /// `None`.
+    McpAddConnecting,
 }
 
 /// The TUI's single stateful root component. Owns the transcript, the input
@@ -526,6 +535,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     }
                     return;
                 }
+                PendingMenu::McpAddWizard(_) => {
+                    // Real free-text handling added in a later task.
+                    return;
+                }
+                PendingMenu::McpAddConnecting => {
+                    return;
+                }
                 PendingMenu::None => {}
             }
 
@@ -668,6 +684,9 @@ const HELP_TEXT: &str = "\
 /connections list          list configured connections
 /connections remove <name> remove a configured connection
 /connections add           not supported in-TUI; run `local-code connections add` in a separate terminal
+/mcp list                  list configured MCP servers
+/mcp remove <name>         remove a configured MCP server
+/mcp add                   add an MCP server via a step-by-step wizard (Esc to cancel)
 /init                      generate/update AGENTS.md from a survey of this project
 /permissions               view or change the permission tier and allow/deny list
 /compact                   summarize older turns to free up context
@@ -820,13 +839,42 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 });
             });
         }
-        SlashCommand::McpList | SlashCommand::McpRemove { .. } | SlashCommand::McpAdd => {
-            // TODO: dispatch for /mcp list|remove|add is implemented in a later task.
+        SlashCommand::McpList => {
+            let paths = crate::config::paths::Paths {
+                user_config_dir: ctx.user_config_dir.clone(),
+                project_config_dir: ctx.project_config_dir.clone(),
+                user_state_dir: ctx.user_state_dir.clone(),
+            };
+            let mut out = Vec::new();
+            let text = match crate::cli::mcp::list(&paths, &mut out) {
+                Ok(()) => String::from_utf8_lossy(&out).to_string(),
+                Err(e) => format!("failed to list MCP servers: {e}"),
+            };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
-                    text: "/mcp is not yet implemented".to_string(),
-                });
+                entries.push(TranscriptEntry::SystemNotice { text });
             });
+        }
+        SlashCommand::McpRemove { name } => {
+            let paths = crate::config::paths::Paths {
+                user_config_dir: ctx.user_config_dir.clone(),
+                project_config_dir: ctx.project_config_dir.clone(),
+                user_state_dir: ctx.user_state_dir.clone(),
+            };
+            let mut out = Vec::new();
+            let text = match crate::cli::mcp::remove(&paths, &name, &mut out) {
+                Ok(()) => String::from_utf8_lossy(&out).to_string(),
+                Err(e) => format!("failed to remove MCP server: {e}"),
+            };
+            ctx.transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice { text });
+            });
+        }
+        SlashCommand::McpAdd => {
+            let (wizard, prompt) = crate::tui::mcp_wizard::start();
+            ctx.transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice { text: prompt });
+            });
+            ctx.pending_menu.set(PendingMenu::McpAddWizard(wizard));
         }
         SlashCommand::Compact => {
             const RETAIN_RECENT: usize = 10;
@@ -1805,6 +1853,22 @@ mod tests {
         type_and_submit(&mut t, "/connections list").await;
         t.tick().await.unwrap();
         assert!(t.frame_text().contains("No connections configured"), "{}", t.frame_text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_list_reports_no_servers_configured() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/mcp list").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("No MCP servers configured"), "{}", t.frame_text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_starts_the_wizard_and_prompts_for_a_name() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Server name:"), "{}", t.frame_text());
     }
 
     #[tokio::test(start_paused = true)]
