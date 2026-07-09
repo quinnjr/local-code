@@ -16,10 +16,17 @@ fn skill_client(host: Host) -> anyhow::Result<SkillClient> {
         Host::GitHub => Ok(SkillClient::GitHub(GithubClient::new(SecretStore::get_api_key("github")?))),
         Host::GitLab => Ok(SkillClient::GitLab(GitlabClient::new(SecretStore::get_api_key("gitlab")?))),
         Host::Bitbucket => {
-            let credentials = SecretStore::get_api_key("bitbucket")?.map(|combined| match combined.split_once(':') {
-                Some((user, pass)) => (user.to_string(), pass.to_string()),
-                None => (combined, String::new()),
-            });
+            let credentials = match SecretStore::get_api_key("bitbucket")? {
+                Some(combined) => {
+                    let (user, pass) = combined.split_once(':').ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "bitbucket credential is malformed: expected 'username:app_password', found no ':' separator"
+                        )
+                    })?;
+                    Some((user.to_string(), pass.to_string()))
+                }
+                None => None,
+            };
             Ok(SkillClient::Bitbucket(BitbucketClient::new(credentials)))
         }
     }
