@@ -57,7 +57,6 @@ impl SkillClient {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::skills::types::{Host, SkillSource};
 
     #[test]

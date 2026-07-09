@@ -4,13 +4,25 @@ use std::io::Write;
 
 use crate::config::paths::Paths;
 use crate::config::secrets::SecretStore;
+use crate::skills::bitbucket::BitbucketClient;
+use crate::skills::client::SkillClient;
 use crate::skills::github::GithubClient;
+use crate::skills::gitlab::GitlabClient;
 use crate::skills::install::{default_name, install_skill, list_skills, remove_skill, update_skill};
-use crate::skills::types::Scope;
+use crate::skills::types::{Host, Scope};
 
-fn github_client() -> anyhow::Result<GithubClient> {
-    let token = SecretStore::get_api_key("github")?;
-    Ok(GithubClient::new(token))
+fn skill_client(host: Host) -> anyhow::Result<SkillClient> {
+    match host {
+        Host::GitHub => Ok(SkillClient::GitHub(GithubClient::new(SecretStore::get_api_key("github")?))),
+        Host::GitLab => Ok(SkillClient::GitLab(GitlabClient::new(SecretStore::get_api_key("gitlab")?))),
+        Host::Bitbucket => {
+            let credentials = SecretStore::get_api_key("bitbucket")?.map(|combined| match combined.split_once(':') {
+                Some((user, pass)) => (user.to_string(), pass.to_string()),
+                None => (combined, String::new()),
+            });
+            Ok(SkillClient::Bitbucket(BitbucketClient::new(credentials)))
+        }
+    }
 }
 
 /// Rejects a skill name that looks like it's trying to escape the skills
@@ -31,11 +43,25 @@ pub async fn install<W: Write>(
     name_override: Option<&str>,
     mut out: W,
 ) -> anyhow::Result<()> {
-    let source = crate::skills::github::parse_spec(spec)?;
+    let parsed = crate::skills::spec::parse_spec(spec)?;
+    if let Some(n) = name_override {
+        validate_skill_name(n)?;
+    }
+    let client = skill_client(parsed.source.host)?;
+
+    let source = if parsed.needs_project_path_resolution {
+        let SkillClient::GitLab(gitlab_client) = &client else {
+            unreachable!("needs_project_path_resolution is only ever true for Host::GitLab specs")
+        };
+        let (project_path, in_repo_path) = gitlab_client.resolve_project_path(&parsed.source.repo).await?;
+        crate::skills::types::SkillSource { repo: project_path, path: in_repo_path, ..parsed.source }
+    } else {
+        parsed.source
+    };
+
     let name = name_override.map(str::to_string).unwrap_or_else(|| default_name(&source));
     validate_skill_name(&name)?;
     let scope = if global { Scope::Global } else { Scope::Project };
-    let client = github_client()?;
 
     install_skill(&client, paths, scope, &source, &name).await?;
     writeln!(out, "Installed skill '{name}' from {spec} ({})", scope_label(scope))?;
@@ -67,7 +93,6 @@ pub async fn update<W: Write>(paths: &Paths, name: Option<&str>, global: bool, m
         validate_skill_name(n)?;
     }
     let scope = if global { Scope::Global } else { Scope::Project };
-    let client = github_client()?;
 
     let names: Vec<String> = match name {
         Some(n) => vec![n.to_string()],
@@ -80,6 +105,8 @@ pub async fn update<W: Write>(paths: &Paths, name: Option<&str>, global: bool, m
     }
 
     for name in names {
+        let host = crate::skills::install::skill_manifest_host(paths, scope, &name)?;
+        let client = skill_client(host)?;
         let updated = update_skill(&client, paths, scope, &name).await?;
         if updated {
             writeln!(out, "Updated skill '{name}'")?;
@@ -172,8 +199,10 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let out: Vec<u8> = Vec::new();
-        // Validation happens before any GitHub client/network call is made, so
-        // this fails fast on the bad `--name` regardless of `spec` validity.
+        // An explicit `--name` override is validated eagerly, right after spec
+        // parsing and before any host client is constructed or any network call
+        // is made, so this fails fast on the bad `--name` regardless of `spec`
+        // validity.
         let result = install(&paths, "acme/widgets", false, Some("../escape"), out).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("must not contain path separators"));
@@ -192,18 +221,17 @@ mod tests {
     // `update()`'s `None`-name branch (list every skill in scope, call
     // `update_skill` on each, print a per-skill status line) can't be driven
     // through the public `update()` fn itself in a test: it builds its own
-    // `GithubClient` via `github_client()`, which always points at the real
-    // `https://api.github.com` with no injection point (unlike
-    // `GithubClient::new_for_test`, there's no override reachable from here
-    // without touching production code, which this fix is not allowed to
-    // do). So this test drives the exact same loop body — list the scope's
-    // skills, call `update_skill` on each, format the same two messages —
-    // against a mocked `GithubClient`, which is where dependency injection
-    // is actually available. This exercises the same untested branching
-    // (moved vs. not-moved, per skill, across multiple skills) that the
-    // production loop contains.
+    // `SkillClient` via `skill_client()`, which always points at the real
+    // hosted APIs with no injection point (unlike `GithubClient::new_for_test`,
+    // there's no override reachable from here without touching production
+    // code, which this fix is not allowed to do). So this test drives the
+    // exact same loop body — list the scope's skills, call `update_skill` on
+    // each, format the same two messages — against a mocked `SkillClient`,
+    // which is where dependency injection is actually available. This
+    // exercises the same untested branching (moved vs. not-moved, per skill,
+    // across multiple skills) that the production loop contains.
     async fn update_all_in_scope_with_client<W: Write>(
-        client: &GithubClient,
+        client: &SkillClient,
         paths: &Paths,
         scope: Scope,
         mut out: W,
@@ -261,11 +289,21 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: beta\ndescription: d\n---\nbody"))
             .mount(&server).await;
 
-        let client = GithubClient::new_for_test(None, server.uri());
-        let alpha_source =
-            SkillSource { owner: "acme".into(), repo: "widgets".into(), path: "skills/alpha".into(), git_ref: None };
-        let beta_source =
-            SkillSource { owner: "acme".into(), repo: "gadgets".into(), path: "skills/beta".into(), git_ref: None };
+        let client = SkillClient::GitHub(GithubClient::new_for_test(None, server.uri()));
+        let alpha_source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/alpha".into(),
+            git_ref: None,
+        };
+        let beta_source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "gadgets".into(),
+            path: "skills/beta".into(),
+            git_ref: None,
+        };
         install_skill(&client, &paths, Scope::Project, &alpha_source, "alpha").await.unwrap();
         install_skill(&client, &paths, Scope::Project, &beta_source, "beta").await.unwrap();
 
@@ -293,5 +331,12 @@ mod tests {
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("Updated skill 'alpha'"), "missing moved-skill line, got: {output}");
         assert!(output.contains("Skill 'beta' is already up to date"), "missing not-moved-skill line, got: {output}");
+    }
+
+    #[test]
+    fn skill_client_maps_each_host_to_its_concrete_client_variant() {
+        assert!(matches!(skill_client(Host::GitHub).unwrap(), SkillClient::GitHub(_)));
+        assert!(matches!(skill_client(Host::GitLab).unwrap(), SkillClient::GitLab(_)));
+        assert!(matches!(skill_client(Host::Bitbucket).unwrap(), SkillClient::Bitbucket(_)));
     }
 }

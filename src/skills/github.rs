@@ -119,11 +119,18 @@ struct CommitInfo {
 #[serde(untagged)]
 enum ContentsResponse {
     Directory(Vec<ContentsEntry>),
+    // The `File` case is only ever matched against with `_` (see
+    // `fetch_directory_files` below) — its payload just needs to deserialize
+    // successfully so `serde(untagged)` can distinguish it from `Directory`.
+    #[allow(dead_code)]
     File(ContentsEntry),
 }
 
 #[derive(serde::Deserialize, Clone)]
 struct ContentsEntry {
+    // Present in GitHub's API response but never read here — `path` is what
+    // callers key off of.
+    #[allow(dead_code)]
     name: String,
     path: String,
     #[serde(rename = "type")]

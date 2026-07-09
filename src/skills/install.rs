@@ -611,7 +611,7 @@ mod tests {
         ];
 
         let result = write_files(&target_dir, &files, &manifest);
-        assert!(matches!(result, Err(InstallError::UnsafePath(p)) if p == PathBuf::from("../../etc/passwn")));
+        assert!(matches!(result, Err(InstallError::UnsafePath(p)) if p == std::path::Path::new("../../etc/passwn")));
 
         // Nothing should have been written outside (or even inside) the target
         // directory as a result of the rejected batch.
@@ -635,7 +635,7 @@ mod tests {
         let files = vec![FetchedFile { relative_path: PathBuf::from("/etc/passwn"), bytes: b"evil".to_vec() }];
 
         let result = write_files(&target_dir, &files, &manifest);
-        assert!(matches!(result, Err(InstallError::UnsafePath(p)) if p == PathBuf::from("/etc/passwn")));
+        assert!(matches!(result, Err(InstallError::UnsafePath(p)) if p == std::path::Path::new("/etc/passwn")));
     }
 
     #[test]
