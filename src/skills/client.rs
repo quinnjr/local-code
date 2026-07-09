@@ -3,7 +3,7 @@
 use crate::skills::bitbucket::BitbucketClient;
 use crate::skills::github::GithubClient;
 use crate::skills::gitlab::GitlabClient;
-use crate::skills::types::{FetchedFile, SkillHostError, SkillSource};
+use crate::skills::types::{FetchedFile, SkillHostError};
 
 /// Wraps the three concrete host clients behind one set of methods, matching
 /// this codebase's existing enum-dispatch convention (see
@@ -58,7 +58,7 @@ impl SkillClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::skills::types::Host;
+    use crate::skills::types::{Host, SkillSource};
 
     #[test]
     fn source_construction_smoke_test() {
