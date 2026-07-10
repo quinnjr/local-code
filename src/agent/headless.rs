@@ -62,6 +62,22 @@ fn select_connection(
     }
 }
 
+/// Joins project/user `AGENTS.md`/`CLAUDE.md` context with rendered skill
+/// context the same way `tui::run_tui` does: project context first, skill
+/// context appended after a blank line, either half omitted entirely if
+/// empty. Extracted as a pure function so the composition logic is
+/// unit-testable without building a full `Agent` (which doesn't expose its
+/// constructed system prompt for inspection).
+fn combined_system_context(project_context: &str, rendered_skill_context: &str) -> String {
+    if rendered_skill_context.is_empty() {
+        project_context.to_string()
+    } else if project_context.is_empty() {
+        rendered_skill_context.to_string()
+    } else {
+        format!("{project_context}\n\n{rendered_skill_context}")
+    }
+}
+
 /// Runs one full ReAct-loop turn headlessly and returns the final text response.
 /// Headless invocations default to `PermissionTier::FullAuto` (there is no TTY to
 /// answer an inline prompt); pass `permission_mode_override` to force a different
@@ -97,7 +113,9 @@ pub async fn run_headless(
 
     let discovered_skills = discover_skills(paths);
     let skill_context = resolve_skill_context(&discovered_skills, project_root);
-    let system_context = render_skill_context(&skill_context);
+    let rendered_skill_context = render_skill_context(&skill_context);
+    let project_context = crate::context::load_project_context(paths, project_root);
+    let system_context = combined_system_context(&project_context, &rendered_skill_context);
 
     let agent = build_agent_with_mcp_tools(
         model,
@@ -157,6 +175,29 @@ mod tests {
         let connections = vec![conn("a")];
         let result = select_connection(&connections, Some("does-not-exist"));
         assert!(matches!(result, Err(HeadlessError::ConnectionNotFound(name)) if name == "does-not-exist"));
+    }
+
+    #[test]
+    fn combined_system_context_returns_empty_when_both_are_empty() {
+        assert_eq!(combined_system_context("", ""), "");
+    }
+
+    #[test]
+    fn combined_system_context_returns_project_context_alone_when_skills_are_empty() {
+        assert_eq!(combined_system_context("project rules", ""), "project rules");
+    }
+
+    #[test]
+    fn combined_system_context_returns_skill_context_alone_when_project_context_is_empty() {
+        assert_eq!(combined_system_context("", "skill context"), "skill context");
+    }
+
+    #[test]
+    fn combined_system_context_joins_both_with_a_blank_line() {
+        assert_eq!(
+            combined_system_context("project rules", "skill context"),
+            "project rules\n\nskill context"
+        );
     }
 
     #[tokio::test]

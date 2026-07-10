@@ -119,8 +119,8 @@ cargo test --test live_ollama -- --ignored --nocapture
 - `session/` — session persistence (`store.rs` load/save, `types.rs::SessionFile`); every TUI turn
   is saved so `local-code --resume` (or in-TUI `/resume`) can reopen it later.
 - `context/mod.rs::load_project_context` — loads and concatenates project `AGENTS.md`/`CLAUDE.md`
-  and user-level `AGENTS.md`/`CLAUDE.md` (in that order) into the system prompt. **Headless mode
-  does not currently load this context** (see `TODO.md` item 7) — only the TUI path does.
+  and user-level `AGENTS.md`/`CLAUDE.md` (in that order) into the system prompt. Both the TUI
+  (`tui::run_tui`) and headless mode (`agent::headless::run_headless`) load this context.
 - `init/` — the `/init` slash command's survey + generation logic for producing a project
   `CLAUDE.md`.
 

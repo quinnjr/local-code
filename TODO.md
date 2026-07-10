@@ -29,16 +29,11 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
 6. **`/init`'s test mutates the process-wide current directory.** Flagged as a minor test-hygiene
    wart (run single-threaded if flakiness appears) — not a product-behavior limitation.
 
-7. **Headless mode doesn't load AGENTS.md/CLAUDE.md context.** This gap was already open at the
-   end of Phase 2 and remains open — it was out of scope for this TUI-focused plan. (Headless
-   mode *does* now auto-inject `alwaysApply`/glob-matched skill context into the system prompt,
-   matching the TUI — only the AGENTS.md/CLAUDE.md piece is still missing.)
-
-8. **HTTP/WebSocket MCP transports are only proven via negative/graceful-degradation tests.**
+7. **HTTP/WebSocket MCP transports are only proven via negative/graceful-degradation tests.**
    Only the stdio transport has a live, fixture-server integration test proving positive
    end-to-end behavior. Inherited from Phase 5, not introduced here.
 
-9. **The two live smoke tests (`live_compact`, `live_init`) only assert non-empty output.**
+8. **The two live smoke tests (`live_compact`, `live_init`) only assert non-empty output.**
    Neither checks structural correctness of the generated content (e.g., that `/init`'s output
    looks like real markdown, or that `/compact`'s summary is actually shorter than the input).
    They'd miss a regression where the model returns garbage-but-nonempty text. Intentionally thin
