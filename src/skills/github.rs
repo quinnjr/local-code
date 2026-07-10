@@ -246,29 +246,39 @@ impl GithubClient {
                 }
             };
 
+            let mut file_entries = Vec::new();
             for entry in entries {
                 match entry.entry_type.as_str() {
                     "dir" => {
                         self.fetch_directory_files_into(owner, repo, base_path, &entry.path, commit_sha, out).await?;
                     }
-                    "file" => {
-                        let download_url = entry.download_url.ok_or_else(|| SkillHostError::Api {
-                            status: 0,
-                            url: entry.path.clone(),
-                            body: "file entry missing download_url".to_string(),
-                        })?;
-                        let response = self.request(&download_url).send().await.map_err(SkillHostError::Request)?;
-                        let status = response.status();
-                        if !status.is_success() {
-                            let body = response.text().await.unwrap_or_default();
-                            return Err(SkillHostError::Api { status: status.as_u16(), url: download_url, body });
-                        }
-                        let bytes = response.bytes().await.map_err(SkillHostError::Request)?.to_vec();
-                        let relative = entry.path.strip_prefix(base_path).unwrap_or(&entry.path).trim_start_matches('/');
-                        out.push(FetchedFile { relative_path: PathBuf::from(relative), bytes });
-                    }
+                    "file" => file_entries.push(entry),
                     _ => {} // symlinks/submodules: skip, not relevant to skill content
                 }
+            }
+
+            // Every file in this directory listing is an independent
+            // download — fetch them concurrently instead of one round trip
+            // at a time, since this is the dominant cost for skills with
+            // more than a couple of files.
+            let downloads = file_entries.into_iter().map(|entry| async move {
+                let download_url = entry.download_url.ok_or_else(|| SkillHostError::Api {
+                    status: 0,
+                    url: entry.path.clone(),
+                    body: "file entry missing download_url".to_string(),
+                })?;
+                let response = self.request(&download_url).send().await.map_err(SkillHostError::Request)?;
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(SkillHostError::Api { status: status.as_u16(), url: download_url, body });
+                }
+                let bytes = response.bytes().await.map_err(SkillHostError::Request)?.to_vec();
+                let relative = entry.path.strip_prefix(base_path).unwrap_or(&entry.path).trim_start_matches('/');
+                Ok(FetchedFile { relative_path: PathBuf::from(relative), bytes })
+            });
+            for result in futures::future::join_all(downloads).await {
+                out.push(result?);
             }
             Ok(())
         })

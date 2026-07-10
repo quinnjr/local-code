@@ -141,24 +141,29 @@ impl GitlabClient {
         // callers (`install_skill`/`update_skill`) already treat "no files
         // fetched" as `InstallError::EmptyDirectory`, which is the correct
         // user-facing outcome either way.
-        let mut files = Vec::new();
-        for entry in entries.iter().filter(|e| e.entry_type == "blob") {
-            let raw_url = format!(
-                "{}/projects/{id}/repository/files/{}/raw?ref={commit_sha}",
-                self.api_base,
-                urlencoding_path(&entry.path)
-            );
-            let response = self.request(&raw_url).send().await?;
-            let status = response.status();
-            if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
-                return Err(SkillHostError::Api { status: status.as_u16(), url: raw_url, body });
+        // Every blob's raw-content fetch is independent — download them
+        // concurrently instead of one round trip at a time, since this is
+        // the dominant cost for skills with more than a couple of files.
+        let downloads = entries.iter().filter(|e| e.entry_type == "blob").map(|entry| {
+            let id = id.clone();
+            async move {
+                let raw_url = format!(
+                    "{}/projects/{id}/repository/files/{}/raw?ref={commit_sha}",
+                    self.api_base,
+                    urlencoding_path(&entry.path)
+                );
+                let response = self.request(&raw_url).send().await?;
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(SkillHostError::Api { status: status.as_u16(), url: raw_url, body });
+                }
+                let bytes = response.bytes().await.map_err(SkillHostError::Request)?.to_vec();
+                let relative = entry.path.strip_prefix(path).unwrap_or(&entry.path).trim_start_matches('/');
+                Ok(FetchedFile { relative_path: PathBuf::from(relative), bytes })
             }
-            let bytes = response.bytes().await.map_err(SkillHostError::Request)?.to_vec();
-            let relative = entry.path.strip_prefix(path).unwrap_or(&entry.path).trim_start_matches('/');
-            files.push(FetchedFile { relative_path: PathBuf::from(relative), bytes });
-        }
-        Ok(files)
+        });
+        futures::future::join_all(downloads).await.into_iter().collect()
     }
 
     /// Walks prefixes of `raw_path` (split on `/`), longest first, calling

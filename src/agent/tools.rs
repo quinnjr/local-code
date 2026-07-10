@@ -5,13 +5,33 @@
 use daimon::tool::ToolOutput;
 use daimon::tool_fn;
 
+/// `read_file` refuses to read files larger than this — an unbounded read
+/// would balloon the transcript (every read result is retained and
+/// re-persisted to the session file on every subsequent turn) and risks a
+/// large-file OOM. 2 MiB comfortably covers real source files while bounding
+/// the worst case.
+const MAX_READ_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Reads the full contents of a file at `path` (absolute or relative to the
-/// process's current working directory).
+/// process's current working directory). Refuses files larger than
+/// [`MAX_READ_FILE_BYTES`] — use `grep`/`bash` to inspect a large file instead
+/// of reading it whole.
 #[tool_fn]
 async fn read_file(
     /// Path to the file to read.
     path: String,
 ) -> daimon::Result<ToolOutput> {
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.len() > MAX_READ_FILE_BYTES => {
+            return Ok(ToolOutput::error(format!(
+                "{path} is {} bytes, which exceeds the {MAX_READ_FILE_BYTES}-byte read_file limit; \
+                 use grep to search it or bash (e.g. head/tail) to inspect it in parts instead",
+                meta.len()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) => return Ok(ToolOutput::error(format!("failed to read {path}: {e}"))),
+    }
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => Ok(ToolOutput::text(content)),
         Err(e) => Ok(ToolOutput::error(format!("failed to read {path}: {e}"))),
@@ -213,6 +233,21 @@ mod builtin_tool_tests {
             .unwrap();
         assert!(!output.is_error);
         assert_eq!(output.content, "hello world");
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_a_file_larger_than_the_cap() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("big.txt");
+        std::fs::write(&file_path, vec![b'x'; (MAX_READ_FILE_BYTES + 1) as usize]).unwrap();
+
+        let tool = ReadFile;
+        let output = tool
+            .execute(&serde_json::json!({"path": file_path.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("exceeds"));
     }
 
     #[tokio::test]

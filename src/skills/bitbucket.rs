@@ -154,29 +154,39 @@ impl BitbucketClient {
             ));
             while let Some(page_url) = url {
                 let listing: SrcListing = self.get_json(&page_url).await?;
+                let mut file_entries = Vec::new();
                 for entry in listing.values {
                     match entry.entry_type.as_str() {
                         "commit_directory" => {
                             self.fetch_into(workspace, repo_slug, base_path, &entry.path, revision, out).await?;
                         }
-                        "commit_file" => {
-                            let response = self.request(&entry.links.self_link.href).send().await?;
-                            let status = response.status();
-                            if !status.is_success() {
-                                let body = response.text().await.unwrap_or_default();
-                                return Err(SkillHostError::Api {
-                                    status: status.as_u16(),
-                                    url: entry.links.self_link.href.clone(),
-                                    body,
-                                });
-                            }
-                            let bytes = response.bytes().await.map_err(SkillHostError::Request)?.to_vec();
-                            let relative =
-                                entry.path.strip_prefix(base_path).unwrap_or(&entry.path).trim_start_matches('/');
-                            out.push(FetchedFile { relative_path: PathBuf::from(relative), bytes });
-                        }
+                        "commit_file" => file_entries.push(entry),
                         _ => {} // symlinks/submodules: skip
                     }
+                }
+
+                // Every file in this page's listing is an independent
+                // download — fetch them concurrently instead of one round
+                // trip at a time, since this is the dominant cost for skills
+                // with more than a couple of files.
+                let downloads = file_entries.into_iter().map(|entry| async move {
+                    let response = self.request(&entry.links.self_link.href).send().await?;
+                    let status = response.status();
+                    if !status.is_success() {
+                        let body = response.text().await.unwrap_or_default();
+                        return Err(SkillHostError::Api {
+                            status: status.as_u16(),
+                            url: entry.links.self_link.href.clone(),
+                            body,
+                        });
+                    }
+                    let bytes = response.bytes().await.map_err(SkillHostError::Request)?.to_vec();
+                    let relative =
+                        entry.path.strip_prefix(base_path).unwrap_or(&entry.path).trim_start_matches('/');
+                    Ok(FetchedFile { relative_path: PathBuf::from(relative), bytes })
+                });
+                for result in futures::future::join_all(downloads).await {
+                    out.push(result?);
                 }
                 url = listing.next;
             }

@@ -1,7 +1,7 @@
 // src/skills/discovery.rs
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::config::paths::Paths;
 use crate::skills::frontmatter::{classify, parse_frontmatter};
@@ -95,18 +95,30 @@ pub struct SkillContext {
 
 /// Classifies each discovered skill into `injected` or `listing`, matching
 /// `Globs` skills against `project_root`'s file tree (respecting the same
-/// ignore rules as the built-in `grep`/`glob` tools, via the `ignore` crate)
-/// exactly once. A `Globs` skill whose pattern matches nothing in the tree
-/// is dropped entirely — it is not auto-injected and not listed, since it
-/// isn't relevant to this project.
+/// ignore rules as the built-in `grep`/`glob` tools, via the `ignore` crate).
+/// The tree is walked **at most once** regardless of how many `Globs` skills
+/// are installed — `project_root`'s files are collected up front (only if at
+/// least one `Globs` skill exists at all) and each skill's patterns are then
+/// matched against that single cached list, instead of re-walking the whole
+/// project per skill. A `Globs` skill whose pattern matches nothing in the
+/// tree is dropped entirely — it is not auto-injected and not listed, since
+/// it isn't relevant to this project.
 pub fn resolve_skill_context(skills: &[Skill], project_root: &Path) -> SkillContext {
     let mut context = SkillContext::default();
+    let has_glob_skills = skills.iter().any(|s| matches!(s.load_mode, LoadMode::Globs(_)));
+    let project_files = if has_glob_skills {
+        Some(walk_project_files(project_root))
+    } else {
+        None
+    };
+
     for skill in skills {
         match &skill.load_mode {
             LoadMode::AlwaysApply => context.injected.push((skill.name.clone(), skill.body.clone())),
             LoadMode::ModelInvoked => context.listing.push((skill.name.clone(), skill.description.clone())),
             LoadMode::Globs(globs) => {
-                if project_tree_matches_any_glob(project_root, globs) {
+                let files = project_files.as_ref().expect("has_glob_skills guarantees this is Some");
+                if any_glob_matches(files, globs) {
                     context.injected.push((skill.name.clone(), skill.body.clone()));
                 }
             }
@@ -115,7 +127,19 @@ pub fn resolve_skill_context(skills: &[Skill], project_root: &Path) -> SkillCont
     context
 }
 
-fn project_tree_matches_any_glob(project_root: &Path, globs: &[String]) -> bool {
+/// Collects every file's path (relative to `project_root`) in the project
+/// tree, respecting `.gitignore`/`.ignore` rules — the single filesystem walk
+/// shared by every `Globs` skill in one `resolve_skill_context` call.
+fn walk_project_files(project_root: &Path) -> Vec<PathBuf> {
+    ignore::WalkBuilder::new(project_root)
+        .build()
+        .flatten()
+        .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|entry| entry.path().strip_prefix(project_root).ok().map(Path::to_path_buf))
+        .collect()
+}
+
+fn any_glob_matches(files: &[PathBuf], globs: &[String]) -> bool {
     let patterns: Vec<glob::Pattern> = globs
         .iter()
         .filter_map(|g| match glob::Pattern::new(g) {
@@ -129,20 +153,12 @@ fn project_tree_matches_any_glob(project_root: &Path, globs: &[String]) -> bool 
     if patterns.is_empty() {
         return false;
     }
-    for entry in ignore::WalkBuilder::new(project_root).build().flatten() {
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let Some(file_name) = entry.file_name().to_str() else { continue };
-        let Ok(relative_path) = entry.path().strip_prefix(project_root) else { continue };
-        if patterns
+    files.iter().any(|relative_path| {
+        let file_name = relative_path.file_name().and_then(|n| n.to_str());
+        patterns
             .iter()
-            .any(|p| p.matches_path(relative_path) || p.matches(file_name))
-        {
-            return true;
-        }
-    }
-    false
+            .any(|p| p.matches_path(relative_path) || file_name.is_some_and(|f| p.matches(f)))
+    })
 }
 
 /// Renders a `SkillContext` into the text appended to the system prompt:

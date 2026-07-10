@@ -1,8 +1,14 @@
 // src/tui/state.rs
 
+use std::sync::Arc;
+
 /// One entry in the transcript, in display order. Cloned into `ntui::State` on
-/// every update, so kept cheap and flat (no `Rc`/`Arc` needed — clones are just
-/// string/vec copies of already-small turn data).
+/// every update. Most fields are small (turn text, tool names/args), so plain
+/// `String` clones are fine there — but `ToolCallResult::content` can hold a
+/// full file read or large `bash`/`grep` output, so it's `Arc<str>` instead of
+/// `String`: cloning a `TranscriptEntry` (which happens on every render, since
+/// `ntui::State::get()` clones its value) then only bumps a refcount for that
+/// field instead of copying potentially many KB of text.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TranscriptEntry {
     /// A user-submitted prompt, rendered in a bordered box.
@@ -41,7 +47,7 @@ pub struct ToolCallEntry {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallResult {
-    pub content: String,
+    pub content: Arc<str>,
     pub is_error: bool,
 }
 

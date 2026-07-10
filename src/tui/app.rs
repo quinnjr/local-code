@@ -1383,7 +1383,7 @@ async fn run_turn(
             Ok(StreamEvent::ToolResult { id, content, is_error }) => {
                 transcript.update(|entries| {
                     if let Some(call) = find_tool_call_mut(entries, &id) {
-                        call.result = Some(ToolCallResult { content, is_error });
+                        call.result = Some(ToolCallResult { content: content.into(), is_error });
                     }
                 });
             }
