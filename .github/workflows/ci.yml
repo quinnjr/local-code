@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main, develop]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -42,3 +45,19 @@ jobs:
       # and require a real running LLM server, so the default `cargo test`
       # filter already excludes them here.
       - run: cargo test
+
+  # A single required status check for branch protection to depend on,
+  # rather than requiring fmt/clippy/test individually (easy to forget one
+  # when configuring protected-branch settings, which would let that job's
+  # failures silently stop blocking merges).
+  ci-passed:
+    name: CI passed
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test]
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "one or more required jobs failed"
+            exit 1
+          fi

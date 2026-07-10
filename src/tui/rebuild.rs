@@ -72,6 +72,10 @@ pub fn rebuild_agent(
 /// the active model, `/mcp add` merges in newly-discovered tools). `/resume`
 /// does NOT use this — it rebuilds from a *loaded session's* messages, not
 /// the live agent's current history, so reloading would be wrong there.
+///
+/// Mirrors [`rebuild_agent`]'s parameter list (plus `old_agent`) — see its
+/// doc comment for why the arg count is intentional, hence the same lint
+/// suppression below.
 #[allow(clippy::too_many_arguments)]
 pub async fn rebuild_agent_from_history(
     old_agent: &Agent,
