@@ -13,6 +13,14 @@ Both are external dependencies pulled from crates.io, not part of this repo.
 
 ## Workflow
 
+This repo follows git-flow branching. `main` tracks production releases only; `develop` is the
+integration branch. Do all work on a `feature/<name>` branch cut from `develop` — never commit
+directly to `develop` or `main`. Land work via a PR from the feature branch into `develop`, not a
+direct push. `release/<version>` branches cut from `develop` stage a release before it merges to
+both `main` and back into `develop`; `hotfix/<name>` branches cut from `main` do the same for
+urgent production fixes. If asked to start new work while sitting on `develop` or `main`, create
+and switch to the appropriate branch first rather than committing in place.
+
 Before merging a branch/PR (whether via subagent-driven-development, finishing-a-development-branch,
 or any other workflow), stop and give the user the chance to run `/simplify`, `/code-review`,
 `/optimize`, or similar audit commands themselves first — even if the branch already went through
