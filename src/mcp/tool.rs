@@ -52,10 +52,10 @@ impl Tool for NamespacedMcpTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daimon::mcp::McpTransport;
     use daimon::mcp::protocol::{
         JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpToolInfo,
     };
-    use daimon::mcp::McpTransport;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;

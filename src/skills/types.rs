@@ -27,7 +27,11 @@ pub enum SkillHostError {
     #[error("request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("API returned {status} for {url}: {body}")]
-    Api { status: u16, url: String, body: String },
+    Api {
+        status: u16,
+        url: String,
+        body: String,
+    },
     #[error("'{0}' is a file, not a directory — skills must be installed from a directory")]
     NotADirectory(String),
 }

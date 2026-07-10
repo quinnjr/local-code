@@ -30,7 +30,14 @@ pub fn project_slug(project_root: &Path) -> String {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
     let readable = readable.trim_matches('_');
-    let tail: String = readable.chars().rev().take(40).collect::<String>().chars().rev().collect();
+    let tail: String = readable
+        .chars()
+        .rev()
+        .take(40)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
 
     format!("{tail}-{hash:016x}")
 }
@@ -38,7 +45,9 @@ pub fn project_slug(project_root: &Path) -> String {
 /// The directory holding every session file for `project_root`, under the
 /// resolved user state dir.
 pub fn session_dir_for_project(user_state_dir: &Path, project_root: &Path) -> PathBuf {
-    user_state_dir.join("sessions").join(project_slug(project_root))
+    user_state_dir
+        .join("sessions")
+        .join(project_slug(project_root))
 }
 
 /// Builds a fresh, not-yet-existing session file path for `project_root`,
@@ -46,7 +55,11 @@ pub fn session_dir_for_project(user_state_dir: &Path, project_root: &Path) -> Pa
 /// if two `local-code` processes start in the same second) still sort
 /// distinctly enough for `list_sessions` — ties are broken by an incrementing
 /// suffix.
-pub fn new_session_path(user_state_dir: &Path, project_root: &Path, now: chrono::DateTime<chrono::Utc>) -> PathBuf {
+pub fn new_session_path(
+    user_state_dir: &Path,
+    project_root: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> PathBuf {
     let dir = session_dir_for_project(user_state_dir, project_root);
     let base = now.format("%Y%m%dT%H%M%SZ").to_string();
     let mut candidate = dir.join(format!("{base}.json"));
@@ -80,7 +93,10 @@ mod tests {
     #[test]
     fn slug_contains_only_filesystem_safe_characters() {
         let slug = project_slug(Path::new("/home/user/my project (v2)"));
-        assert!(slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+        assert!(
+            slug.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
     }
 
     #[test]

@@ -18,7 +18,13 @@ pub fn search_command<W: Write>(paths: &Paths, query: &str, mut out: W) -> anyho
         return Ok(());
     }
     for hit in hits {
-        writeln!(out, "{}:{}: {}", hit.file.display(), hit.line_number, hit.line)?;
+        writeln!(
+            out,
+            "{}:{}: {}",
+            hit.file.display(),
+            hit.line_number,
+            hit.line
+        )?;
     }
     Ok(())
 }
@@ -59,11 +65,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = test_paths(dir.path());
 
-        add_command(&paths, "Remember this fact about the build.", &mut Vec::new()).unwrap();
+        add_command(
+            &paths,
+            "Remember this fact about the build.",
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let mut out = Vec::new();
         search_command(&paths, "build", &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("Remember this fact about the build."));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("Remember this fact about the build.")
+        );
     }
 
     #[test]
@@ -73,7 +88,11 @@ mod tests {
 
         let mut out = Vec::new();
         search_command(&paths, "nonexistent-term", &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("No memory entries matched"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("No memory entries matched")
+        );
     }
 
     #[test]
@@ -83,7 +102,11 @@ mod tests {
 
         let mut out = Vec::new();
         core_command(&paths, &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("No core memories recorded yet."));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("No core memories recorded yet.")
+        );
     }
 
     #[test]

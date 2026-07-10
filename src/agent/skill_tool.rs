@@ -61,7 +61,11 @@ impl Tool for SkillTool {
             ))),
             None => Ok(ToolOutput::error(format!(
                 "no skill named '{name}' is available. Available skills: {}",
-                self.skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+                self.skills
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))),
         }
     }
@@ -87,7 +91,10 @@ mod tests {
     #[tokio::test]
     async fn returns_the_body_of_a_known_model_invoked_skill() {
         let tool = SkillTool::new(vec![skill("pdf", LoadMode::ModelInvoked)]);
-        let output = tool.execute(&serde_json::json!({"name": "pdf"})).await.unwrap();
+        let output = tool
+            .execute(&serde_json::json!({"name": "pdf"}))
+            .await
+            .unwrap();
         assert!(!output.is_error);
         assert!(output.content.contains("pdf body"));
     }
@@ -95,7 +102,10 @@ mod tests {
     #[tokio::test]
     async fn errors_with_available_names_for_an_unknown_skill() {
         let tool = SkillTool::new(vec![skill("pdf", LoadMode::ModelInvoked)]);
-        let output = tool.execute(&serde_json::json!({"name": "nope"})).await.unwrap();
+        let output = tool
+            .execute(&serde_json::json!({"name": "nope"}))
+            .await
+            .unwrap();
         assert!(output.is_error);
         assert!(output.content.contains("pdf"));
     }
@@ -113,7 +123,10 @@ mod tests {
             skill("always-on", LoadMode::AlwaysApply),
             skill("conditional", LoadMode::Globs(vec!["*.pdf".to_string()])),
         ]);
-        let output = tool.execute(&serde_json::json!({"name": "always-on"})).await.unwrap();
+        let output = tool
+            .execute(&serde_json::json!({"name": "always-on"}))
+            .await
+            .unwrap();
         assert!(output.is_error);
     }
 }

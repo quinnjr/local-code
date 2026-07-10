@@ -6,13 +6,13 @@ use daimon::agent::{Agent, AgentBuilder};
 use daimon::model::SharedModel;
 
 use crate::agent::build::register_all_tools;
+#[cfg(test)]
+use crate::agent::gated_tool::GatedTool;
 use crate::mcp::tool::NamespacedMcpTool;
 use crate::permissions::gate::PermissionGate;
 use crate::skills::types::Skill;
 use crate::tui::memory_seed::SeededMemory;
 use daimon::model::types::Message;
-#[cfg(test)]
-use crate::agent::gated_tool::GatedTool;
 
 const SYSTEM_PROMPT: &str = "You are local-code, a coding assistant that talks only to \
 local/local-network LLM backends. You can read, write, and edit files, run shell commands, and \
@@ -27,7 +27,10 @@ the filesystem or runs a command.";
 /// locally-redefined tool list. `GatedTool` (Phase 2) works correctly under
 /// both `Agent::prompt` and `Agent::prompt_stream` because it checks the
 /// permission gate inside `execute()` itself, which both call unconditionally.
-pub fn build_streaming_agent(model: SharedModel, gate: Arc<PermissionGate>) -> daimon::Result<Agent> {
+pub fn build_streaming_agent(
+    model: SharedModel,
+    gate: Arc<PermissionGate>,
+) -> daimon::Result<Agent> {
     let builder = AgentBuilder::new()
         .shared_model(model)
         .system_prompt(SYSTEM_PROMPT);
@@ -211,7 +214,9 @@ mod tests {
 mod with_history_tests {
     use super::*;
     use crate::permissions::settings::PermissionSettings;
-    use crate::permissions::types::{PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier};
+    use crate::permissions::types::{
+        PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier,
+    };
     use std::future::Future;
     use std::pin::Pin;
 
@@ -235,14 +240,20 @@ mod with_history_tests {
 
     struct EchoModel;
     impl daimon::model::Model for EchoModel {
-        async fn generate(&self, request: &daimon::model::types::ChatRequest) -> daimon::Result<daimon::model::types::ChatResponse> {
+        async fn generate(
+            &self,
+            request: &daimon::model::types::ChatRequest,
+        ) -> daimon::Result<daimon::model::types::ChatResponse> {
             Ok(daimon::model::types::ChatResponse {
                 message: Message::assistant(format!("saw {} messages", request.messages.len())),
                 stop_reason: daimon::model::types::StopReason::EndTurn,
                 usage: Some(daimon::model::types::Usage::default()),
             })
         }
-        async fn generate_stream(&self, _request: &daimon::model::types::ChatRequest) -> daimon::Result<daimon::stream::ResponseStream> {
+        async fn generate_stream(
+            &self,
+            _request: &daimon::model::types::ChatRequest,
+        ) -> daimon::Result<daimon::stream::ResponseStream> {
             Ok(Box::pin(futures::stream::empty()))
         }
     }
@@ -250,19 +261,31 @@ mod with_history_tests {
     #[tokio::test]
     async fn seeded_history_is_visible_to_the_next_turn() {
         let model: SharedModel = Arc::new(EchoModel);
-        let initial = vec![Message::user("earlier turn"), Message::assistant("earlier reply")];
-        let agent = build_streaming_agent_with_history(model, gate(), initial, "", Vec::new(), Vec::new()).unwrap();
+        let initial = vec![
+            Message::user("earlier turn"),
+            Message::assistant("earlier reply"),
+        ];
+        let agent =
+            build_streaming_agent_with_history(model, gate(), initial, "", Vec::new(), Vec::new())
+                .unwrap();
 
         let response = agent.prompt("new turn").await.unwrap();
         // system prompt + 2 seeded + new user turn = 4 messages sent to the model
-        assert!(response.text().contains("saw 4 messages"), "{}", response.text());
+        assert!(
+            response.text().contains("saw 4 messages"),
+            "{}",
+            response.text()
+        );
     }
 
     #[tokio::test]
     async fn extra_system_context_is_appended_to_the_prompt() {
         struct CapturingModel;
         impl daimon::model::Model for CapturingModel {
-            async fn generate(&self, request: &daimon::model::types::ChatRequest) -> daimon::Result<daimon::model::types::ChatResponse> {
+            async fn generate(
+                &self,
+                request: &daimon::model::types::ChatRequest,
+            ) -> daimon::Result<daimon::model::types::ChatResponse> {
                 let system_text = request
                     .messages
                     .first()
@@ -274,7 +297,10 @@ mod with_history_tests {
                     usage: Some(daimon::model::types::Usage::default()),
                 })
             }
-            async fn generate_stream(&self, _request: &daimon::model::types::ChatRequest) -> daimon::Result<daimon::stream::ResponseStream> {
+            async fn generate_stream(
+                &self,
+                _request: &daimon::model::types::ChatRequest,
+            ) -> daimon::Result<daimon::stream::ResponseStream> {
                 Ok(Box::pin(futures::stream::empty()))
             }
         }
@@ -290,7 +316,13 @@ mod with_history_tests {
         )
         .unwrap();
         let response = agent.prompt("hi").await.unwrap();
-        assert!(response.text().contains("Project rule: never use unwrap()."), "{}", response.text());
+        assert!(
+            response
+                .text()
+                .contains("Project rule: never use unwrap()."),
+            "{}",
+            response.text()
+        );
     }
 
     #[tokio::test]
@@ -308,7 +340,10 @@ mod with_history_tests {
         }
 
         impl daimon::model::Model for ToolCallingModel {
-            async fn generate(&self, request: &daimon::model::types::ChatRequest) -> daimon::Result<daimon::model::types::ChatResponse> {
+            async fn generate(
+                &self,
+                request: &daimon::model::types::ChatRequest,
+            ) -> daimon::Result<daimon::model::types::ChatResponse> {
                 let count = self.call_count.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     Ok(daimon::model::types::ChatResponse {
@@ -333,7 +368,10 @@ mod with_history_tests {
                     })
                 }
             }
-            async fn generate_stream(&self, _request: &daimon::model::types::ChatRequest) -> daimon::Result<daimon::stream::ResponseStream> {
+            async fn generate_stream(
+                &self,
+                _request: &daimon::model::types::ChatRequest,
+            ) -> daimon::Result<daimon::stream::ResponseStream> {
                 Ok(Box::pin(futures::stream::empty()))
             }
         }
@@ -350,7 +388,9 @@ mod with_history_tests {
         let model: SharedModel = Arc::new(ToolCallingModel {
             call_count: AtomicUsize::new(0),
         });
-        let agent = build_streaming_agent_with_history(model, gate(), vec![], "", Vec::new(), vec![skill]).unwrap();
+        let agent =
+            build_streaming_agent_with_history(model, gate(), vec![], "", Vec::new(), vec![skill])
+                .unwrap();
 
         let response = agent.prompt("please use the test skill").await.unwrap();
         assert!(

@@ -52,13 +52,12 @@ pub async fn connect_one(
                 })?
         }
         McpTransportConfig::Websocket { url } => {
-            let transport =
-                WebSocketTransport::connect(url)
-                    .await
-                    .map_err(|source| McpConnectError::Connect {
-                        server: config.name.clone(),
-                        source,
-                    })?;
+            let transport = WebSocketTransport::connect(url).await.map_err(|source| {
+                McpConnectError::Connect {
+                    server: config.name.clone(),
+                    source,
+                }
+            })?;
             McpClient::connect(transport)
                 .await
                 .map_err(|source| McpConnectError::Connect {
@@ -132,7 +131,9 @@ mod tests {
             },
         };
         let result = connect_one(&config).await;
-        assert!(matches!(result, Err(McpConnectError::Connect { server, .. }) if server == "broken"));
+        assert!(
+            matches!(result, Err(McpConnectError::Connect { server, .. }) if server == "broken")
+        );
     }
 
     #[tokio::test]
@@ -158,17 +159,23 @@ mod tests {
             },
         };
         let result = connect_one(&config).await;
-        assert!(matches!(result, Err(McpConnectError::Connect { server, .. }) if server == "unreachable-sse"));
+        assert!(
+            matches!(result, Err(McpConnectError::Connect { server, .. }) if server == "unreachable-sse")
+        );
     }
 
     #[tokio::test]
     async fn websocket_transport_reports_a_connect_error_when_nothing_is_listening() {
         let config = McpServerConfig {
             name: "unreachable-ws".into(),
-            transport: McpTransportConfig::Websocket { url: "ws://127.0.0.1:1".into() },
+            transport: McpTransportConfig::Websocket {
+                url: "ws://127.0.0.1:1".into(),
+            },
         };
         let result = connect_one(&config).await;
-        assert!(matches!(result, Err(McpConnectError::Connect { server, .. }) if server == "unreachable-ws"));
+        assert!(
+            matches!(result, Err(McpConnectError::Connect { server, .. }) if server == "unreachable-ws")
+        );
     }
 
     #[tokio::test]

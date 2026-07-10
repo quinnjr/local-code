@@ -157,7 +157,9 @@ static ENV_VAR_PATTERN: LazyLock<Regex> =
 /// 401 from the server) rather than at config-load time.
 fn interpolate_env(value: &str) -> String {
     ENV_VAR_PATTERN
-        .replace_all(value, |caps: &regex::Captures| std::env::var(&caps[1]).unwrap_or_default())
+        .replace_all(value, |caps: &regex::Captures| {
+            std::env::var(&caps[1]).unwrap_or_default()
+        })
         .into_owned()
 }
 
@@ -195,9 +197,9 @@ fn interpolate_transport(transport: McpTransportConfig) -> McpTransportConfig {
                 .map(|(k, v)| (interpolate_env(&k), interpolate_env(&v)))
                 .collect(),
         },
-        McpTransportConfig::Websocket { url } => {
-            McpTransportConfig::Websocket { url: interpolate_env(&url) }
-        }
+        McpTransportConfig::Websocket { url } => McpTransportConfig::Websocket {
+            url: interpolate_env(&url),
+        },
     }
 }
 
@@ -280,7 +282,10 @@ Authorization = "Bearer abc123"
             file.servers[0].transport,
             McpTransportConfig::Http {
                 url: "http://localhost:9000/mcp".into(),
-                headers: HashMap::from([("Authorization".to_string(), "Bearer abc123".to_string())]),
+                headers: HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer abc123".to_string()
+                )]),
             }
         );
     }
@@ -455,7 +460,10 @@ command = "new-binary"
             name: "roundtrip".into(),
             transport: McpTransportConfig::Stdio {
                 command: "npx".into(),
-                args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+                args: vec![
+                    "-y".into(),
+                    "@modelcontextprotocol/server-filesystem".into(),
+                ],
             },
         };
         save_mcp_servers(dir.path(), std::slice::from_ref(&server)).unwrap();
@@ -468,11 +476,17 @@ command = "new-binary"
         let dir = tempdir().unwrap();
         let first = McpServerConfig {
             name: "a".into(),
-            transport: McpTransportConfig::Http { url: "http://a".into(), headers: HashMap::new() },
+            transport: McpTransportConfig::Http {
+                url: "http://a".into(),
+                headers: HashMap::new(),
+            },
         };
         let second = McpServerConfig {
             name: "b".into(),
-            transport: McpTransportConfig::Http { url: "http://b".into(), headers: HashMap::new() },
+            transport: McpTransportConfig::Http {
+                url: "http://b".into(),
+                headers: HashMap::new(),
+            },
         };
         save_mcp_servers(dir.path(), &[first]).unwrap();
         save_mcp_servers(dir.path(), std::slice::from_ref(&second)).unwrap();
@@ -488,12 +502,17 @@ command = "new-binary"
                 name: "sse-rt".into(),
                 transport: McpTransportConfig::Sse {
                     url: "http://localhost:9002/sse".into(),
-                    headers: HashMap::from([("Authorization".to_string(), "Bearer abc123".to_string())]),
+                    headers: HashMap::from([(
+                        "Authorization".to_string(),
+                        "Bearer abc123".to_string(),
+                    )]),
                 },
             },
             McpServerConfig {
                 name: "ws-rt".into(),
-                transport: McpTransportConfig::Websocket { url: "ws://localhost:9001/mcp".into() },
+                transport: McpTransportConfig::Websocket {
+                    url: "ws://localhost:9001/mcp".into(),
+                },
             },
         ];
         save_mcp_servers(dir.path(), &servers).unwrap();
@@ -573,7 +592,10 @@ Authorization = "Bearer ${MCP_TEST_E2E_TOKEN}"
         let mut servers = load_mcp_servers_raw(Path::new("/nonexistent"), dir.path()).unwrap();
         servers.push(McpServerConfig {
             name: "added".into(),
-            transport: McpTransportConfig::Http { url: "http://other".into(), headers: HashMap::new() },
+            transport: McpTransportConfig::Http {
+                url: "http://other".into(),
+                headers: HashMap::new(),
+            },
         });
         save_mcp_servers(dir.path(), &servers).unwrap();
 
@@ -608,7 +630,10 @@ Authorization = "Bearer ${MCP_TEST_TOKEN}"
             servers[0].transport,
             McpTransportConfig::Http {
                 url: "http://localhost:9000/mcp".into(),
-                headers: HashMap::from([("Authorization".to_string(), "Bearer secret-abc".to_string())]),
+                headers: HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer secret-abc".to_string()
+                )]),
             }
         );
         unsafe { std::env::remove_var("MCP_TEST_TOKEN") };
@@ -683,7 +708,10 @@ Authorization = "Bearer abc123"
             file.servers[0].transport,
             McpTransportConfig::Sse {
                 url: "http://localhost:9002/sse".into(),
-                headers: HashMap::from([("Authorization".to_string(), "Bearer abc123".to_string())]),
+                headers: HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer abc123".to_string()
+                )]),
             }
         );
     }
@@ -699,7 +727,10 @@ url = "http://localhost:9002/sse"
         let file: McpServersFile = toml::from_str(toml_text).expect("valid toml");
         assert_eq!(
             file.servers[0].transport,
-            McpTransportConfig::Sse { url: "http://localhost:9002/sse".into(), headers: HashMap::new() }
+            McpTransportConfig::Sse {
+                url: "http://localhost:9002/sse".into(),
+                headers: HashMap::new()
+            }
         );
     }
 }

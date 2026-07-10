@@ -83,9 +83,7 @@ async fn edit_file(
 
     let occurrences = content.matches(find.as_str()).count();
     if occurrences == 0 {
-        return Ok(ToolOutput::error(format!(
-            "find text not found in {path}"
-        )));
+        return Ok(ToolOutput::error(format!("find text not found in {path}")));
     }
     if occurrences > 1 {
         return Ok(ToolOutput::error(format!(
@@ -196,7 +194,11 @@ async fn glob(
 
     let paths = match glob::glob(&full_pattern) {
         Ok(p) => p,
-        Err(e) => return Ok(ToolOutput::error(format!("invalid glob '{full_pattern}': {e}"))),
+        Err(e) => {
+            return Ok(ToolOutput::error(format!(
+                "invalid glob '{full_pattern}': {e}"
+            )));
+        }
     };
 
     let mut matches = Vec::new();
@@ -353,7 +355,10 @@ mod builtin_tool_tests {
     #[tokio::test]
     async fn bash_reports_nonzero_exit_as_error_output() {
         let tool = Bash;
-        let output = tool.execute(&serde_json::json!({"command": "exit 3"})).await.unwrap();
+        let output = tool
+            .execute(&serde_json::json!({"command": "exit 3"}))
+            .await
+            .unwrap();
         assert!(output.is_error);
         assert!(output.content.contains("exit code: 3"));
     }

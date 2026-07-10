@@ -40,15 +40,23 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "model" => SlashCommand::Model,
         "connections" => match rest.as_slice() {
             ["list"] | [] => SlashCommand::ConnectionsList,
-            ["remove", name] => SlashCommand::ConnectionsRemove { name: name.to_string() },
+            ["remove", name] => SlashCommand::ConnectionsRemove {
+                name: name.to_string(),
+            },
             ["add"] => SlashCommand::ConnectionsAddUnsupported,
-            _ => SlashCommand::Unknown { raw: trimmed.to_string() },
+            _ => SlashCommand::Unknown {
+                raw: trimmed.to_string(),
+            },
         },
         "mcp" => match rest.as_slice() {
             ["list"] | [] => SlashCommand::McpList,
-            ["remove", name] => SlashCommand::McpRemove { name: name.to_string() },
+            ["remove", name] => SlashCommand::McpRemove {
+                name: name.to_string(),
+            },
             ["add"] => SlashCommand::McpAdd,
-            _ => SlashCommand::Unknown { raw: trimmed.to_string() },
+            _ => SlashCommand::Unknown {
+                raw: trimmed.to_string(),
+            },
         },
         "init" => SlashCommand::Init,
         "permissions" => SlashCommand::Permissions,
@@ -56,7 +64,9 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "resume" => SlashCommand::Resume,
         "clear" => SlashCommand::Clear,
         "help" => SlashCommand::Help,
-        _ => SlashCommand::Unknown { raw: trimmed.to_string() },
+        _ => SlashCommand::Unknown {
+            raw: trimmed.to_string(),
+        },
     })
 }
 
@@ -72,15 +82,29 @@ mod tests {
     #[test]
     fn recognizes_every_v1_command() {
         assert_eq!(parse_slash_command("/model"), Some(SlashCommand::Model));
-        assert_eq!(parse_slash_command("/connections"), Some(SlashCommand::ConnectionsList));
-        assert_eq!(parse_slash_command("/connections list"), Some(SlashCommand::ConnectionsList));
+        assert_eq!(
+            parse_slash_command("/connections"),
+            Some(SlashCommand::ConnectionsList)
+        );
+        assert_eq!(
+            parse_slash_command("/connections list"),
+            Some(SlashCommand::ConnectionsList)
+        );
         assert_eq!(
             parse_slash_command("/connections remove local-vllm"),
-            Some(SlashCommand::ConnectionsRemove { name: "local-vllm".into() })
+            Some(SlashCommand::ConnectionsRemove {
+                name: "local-vllm".into()
+            })
         );
-        assert_eq!(parse_slash_command("/connections add"), Some(SlashCommand::ConnectionsAddUnsupported));
+        assert_eq!(
+            parse_slash_command("/connections add"),
+            Some(SlashCommand::ConnectionsAddUnsupported)
+        );
         assert_eq!(parse_slash_command("/init"), Some(SlashCommand::Init));
-        assert_eq!(parse_slash_command("/permissions"), Some(SlashCommand::Permissions));
+        assert_eq!(
+            parse_slash_command("/permissions"),
+            Some(SlashCommand::Permissions)
+        );
         assert_eq!(parse_slash_command("/compact"), Some(SlashCommand::Compact));
         assert_eq!(parse_slash_command("/resume"), Some(SlashCommand::Resume));
         assert_eq!(parse_slash_command("/clear"), Some(SlashCommand::Clear));
@@ -91,7 +115,9 @@ mod tests {
     fn unrecognized_slash_word_is_unknown_not_none() {
         assert_eq!(
             parse_slash_command("/typo"),
-            Some(SlashCommand::Unknown { raw: "/typo".into() })
+            Some(SlashCommand::Unknown {
+                raw: "/typo".into()
+            })
         );
     }
 
@@ -99,7 +125,9 @@ mod tests {
     fn malformed_connections_subcommand_is_unknown() {
         assert_eq!(
             parse_slash_command("/connections bogus"),
-            Some(SlashCommand::Unknown { raw: "/connections bogus".into() })
+            Some(SlashCommand::Unknown {
+                raw: "/connections bogus".into()
+            })
         );
     }
 
@@ -111,10 +139,15 @@ mod tests {
     #[test]
     fn recognizes_mcp_commands() {
         assert_eq!(parse_slash_command("/mcp"), Some(SlashCommand::McpList));
-        assert_eq!(parse_slash_command("/mcp list"), Some(SlashCommand::McpList));
+        assert_eq!(
+            parse_slash_command("/mcp list"),
+            Some(SlashCommand::McpList)
+        );
         assert_eq!(
             parse_slash_command("/mcp remove filesystem"),
-            Some(SlashCommand::McpRemove { name: "filesystem".into() })
+            Some(SlashCommand::McpRemove {
+                name: "filesystem".into()
+            })
         );
         assert_eq!(parse_slash_command("/mcp add"), Some(SlashCommand::McpAdd));
     }
@@ -123,7 +156,9 @@ mod tests {
     fn malformed_mcp_subcommand_is_unknown() {
         assert_eq!(
             parse_slash_command("/mcp bogus"),
-            Some(SlashCommand::Unknown { raw: "/mcp bogus".into() })
+            Some(SlashCommand::Unknown {
+                raw: "/mcp bogus".into()
+            })
         );
     }
 }

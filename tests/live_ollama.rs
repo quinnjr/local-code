@@ -20,8 +20,8 @@ use local_code::permissions::types::PermissionTier;
 async fn prompts_a_real_ollama_server_and_gets_a_text_response() {
     let base_url = std::env::var("LOCAL_CODE_TEST_OLLAMA_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let model_id = std::env::var("LOCAL_CODE_TEST_OLLAMA_MODEL")
-        .unwrap_or_else(|_| "llama3.1".to_string());
+    let model_id =
+        std::env::var("LOCAL_CODE_TEST_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1".to_string());
 
     let connection = Connection {
         name: "live-ollama-test".into(),

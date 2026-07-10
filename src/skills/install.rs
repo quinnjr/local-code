@@ -4,17 +4,24 @@ use std::path::{Path, PathBuf};
 
 use crate::config::paths::Paths;
 use crate::skills::client::SkillClient;
-use crate::skills::types::{FetchedFile, Host, InstalledSkillManifest, Scope, SkillHostError, SkillSource};
+use crate::skills::types::{
+    FetchedFile, Host, InstalledSkillManifest, Scope, SkillHostError, SkillSource,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
     #[error(transparent)]
     Host(#[from] SkillHostError),
     #[error("io error at {path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("failed to (de)serialize skill manifest: {0}")]
     Manifest(#[from] serde_json::Error),
-    #[error("a skill named '{0}' is already installed in this scope; pass --name to choose a different name")]
+    #[error(
+        "a skill named '{0}' is already installed in this scope; pass --name to choose a different name"
+    )]
     AlreadyInstalled(String),
     #[error("no skill named '{0}' is installed in this scope")]
     NotInstalled(String),
@@ -38,7 +45,10 @@ fn skills_dir(paths: &Paths, scope: Scope) -> PathBuf {
 /// Both scope directories paired with their `Scope`, in the fixed order
 /// (project, then global) that callers rely on for shadowing semantics.
 pub(crate) fn scope_dirs(paths: &Paths) -> [(PathBuf, Scope); 2] {
-    [(skills_dir(paths, Scope::Project), Scope::Project), (skills_dir(paths, Scope::Global), Scope::Global)]
+    [
+        (skills_dir(paths, Scope::Project), Scope::Project),
+        (skills_dir(paths, Scope::Global), Scope::Global),
+    ]
 }
 
 /// The temp directory a fresh fetch is written into before being renamed
@@ -66,7 +76,10 @@ pub fn default_name(source: &SkillSource) -> String {
 }
 
 fn io_err(path: &Path, source: std::io::Error) -> InstallError {
-    InstallError::Io { path: path.to_path_buf(), source }
+    InstallError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
 }
 
 /// Fetches `source` from GitHub and installs it as `name` into `scope`.
@@ -88,10 +101,18 @@ pub async fn install_skill(
 
     let git_ref = match &source.git_ref {
         Some(r) => r.clone(),
-        None => client.resolve_default_branch(&source.owner, &source.repo).await?,
+        None => {
+            client
+                .resolve_default_branch(&source.owner, &source.repo)
+                .await?
+        }
     };
-    let commit_sha = client.resolve_commit_sha(&source.owner, &source.repo, &git_ref).await?;
-    let files = client.fetch_directory_files(&source.owner, &source.repo, &source.path, &commit_sha).await?;
+    let commit_sha = client
+        .resolve_commit_sha(&source.owner, &source.repo, &git_ref)
+        .await?;
+    let files = client
+        .fetch_directory_files(&source.owner, &source.repo, &source.path, &commit_sha)
+        .await?;
     if files.is_empty() {
         return Err(InstallError::EmptyDirectory(source.path.clone()));
     }
@@ -117,14 +138,21 @@ pub async fn install_skill(
     Ok(())
 }
 
-fn write_files(dir: &Path, files: &[FetchedFile], manifest: &InstalledSkillManifest) -> Result<(), InstallError> {
+fn write_files(
+    dir: &Path,
+    files: &[FetchedFile],
+    manifest: &InstalledSkillManifest,
+) -> Result<(), InstallError> {
     // Defense-in-depth: reject any fetched file whose relative path is absolute
     // or escapes the target directory via a `..` component, *before* writing
     // anything. GitHub's real API shouldn't produce such paths, but nothing
     // upstream guarantees it, so refuse to trust `relative_path` blindly.
     for file in files {
         if file.relative_path.is_absolute()
-            || file.relative_path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+            || file
+                .relative_path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             return Err(InstallError::UnsafePath(file.relative_path.clone()));
         }
@@ -162,9 +190,17 @@ fn write_files(dir: &Path, files: &[FetchedFile], manifest: &InstalledSkillManif
 /// else, rather than reporting `NotInstalled`.
 /// No-op (returns `Ok(false)`) if the ref hasn't moved. Returns `Ok(true)` if
 /// an update was applied.
-pub async fn update_skill(client: &SkillClient, paths: &Paths, scope: Scope, name: &str) -> Result<bool, InstallError> {
+pub async fn update_skill(
+    client: &SkillClient,
+    paths: &Paths,
+    scope: Scope,
+    name: &str,
+) -> Result<bool, InstallError> {
     let dir = skills_dir(paths, scope).join(name);
-    let parent = dir.parent().expect("skills dir always has a parent").to_path_buf();
+    let parent = dir
+        .parent()
+        .expect("skills dir always has a parent")
+        .to_path_buf();
     let backup_dir = replaced_backup_dir(&parent, name);
 
     // Self-heal: a prior `update_skill` call may have crashed between renaming
@@ -179,19 +215,27 @@ pub async fn update_skill(client: &SkillClient, paths: &Paths, scope: Scope, nam
     if !dir.exists() {
         return Err(InstallError::NotInstalled(name.to_string()));
     }
-    let manifest_text = std::fs::read_to_string(dir.join(MANIFEST_FILENAME)).map_err(|e| io_err(&dir, e))?;
+    let manifest_text =
+        std::fs::read_to_string(dir.join(MANIFEST_FILENAME)).map_err(|e| io_err(&dir, e))?;
     let manifest: InstalledSkillManifest = serde_json::from_str(&manifest_text)?;
 
-    let latest_sha = client.resolve_commit_sha(&manifest.owner, &manifest.repo, &manifest.git_ref).await?;
+    let latest_sha = client
+        .resolve_commit_sha(&manifest.owner, &manifest.repo, &manifest.git_ref)
+        .await?;
     if latest_sha == manifest.commit_sha {
         return Ok(false);
     }
 
-    let files = client.fetch_directory_files(&manifest.owner, &manifest.repo, &manifest.path, &latest_sha).await?;
+    let files = client
+        .fetch_directory_files(&manifest.owner, &manifest.repo, &manifest.path, &latest_sha)
+        .await?;
     if files.is_empty() {
         return Err(InstallError::EmptyDirectory(manifest.path.clone()));
     }
-    let new_manifest = InstalledSkillManifest { commit_sha: latest_sha, ..manifest };
+    let new_manifest = InstalledSkillManifest {
+        commit_sha: latest_sha,
+        ..manifest
+    };
 
     let temp_dir = installing_temp_dir(&parent, name);
     if temp_dir.exists() {
@@ -232,7 +276,9 @@ pub struct InstalledSkillSummary {
 pub fn list_skills(paths: &Paths) -> Result<Vec<InstalledSkillSummary>, InstallError> {
     let mut summaries = Vec::new();
     for (dir, scope) in scope_dirs(paths) {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let skill_dir = entry.path();
             if !skill_dir.is_dir() {
@@ -242,26 +288,43 @@ pub fn list_skills(paths: &Paths) -> Result<Vec<InstalledSkillSummary>, InstallE
             let manifest_text = match std::fs::read_to_string(&manifest_path) {
                 Ok(text) => text,
                 Err(e) => {
-                    eprintln!("warning: skipping skill at {}: no manifest: {e}", skill_dir.display());
+                    eprintln!(
+                        "warning: skipping skill at {}: no manifest: {e}",
+                        skill_dir.display()
+                    );
                     continue;
                 }
             };
             let manifest = match serde_json::from_str::<InstalledSkillManifest>(&manifest_text) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("warning: skipping skill at {}: invalid manifest: {e}", skill_dir.display());
+                    eprintln!(
+                        "warning: skipping skill at {}: invalid manifest: {e}",
+                        skill_dir.display()
+                    );
                     continue;
                 }
             };
             let name = entry.file_name().to_string_lossy().to_string();
-            let path_suffix = if manifest.path.is_empty() { String::new() } else { format!("/{}", manifest.path) };
-            let bare = format!("{}/{}{}@{}", manifest.owner, manifest.repo, path_suffix, manifest.git_ref);
+            let path_suffix = if manifest.path.is_empty() {
+                String::new()
+            } else {
+                format!("/{}", manifest.path)
+            };
+            let bare = format!(
+                "{}/{}{}@{}",
+                manifest.owner, manifest.repo, path_suffix, manifest.git_ref
+            );
             let source = match manifest.host {
                 Host::GitHub => bare,
                 Host::GitLab => format!("gl:{bare}"),
                 Host::Bitbucket => format!("bb:{bare}"),
             };
-            summaries.push(InstalledSkillSummary { name, scope, source });
+            summaries.push(InstalledSkillSummary {
+                name,
+                scope,
+                source,
+            });
         }
     }
     Ok(summaries)
@@ -273,7 +336,8 @@ pub fn list_skills(paths: &Paths) -> Result<Vec<InstalledSkillSummary>, InstallE
 /// calling `update_skill`.
 pub fn skill_manifest_host(paths: &Paths, scope: Scope, name: &str) -> Result<Host, InstallError> {
     let manifest_path = skills_dir(paths, scope).join(name).join(MANIFEST_FILENAME);
-    let manifest_text = std::fs::read_to_string(&manifest_path).map_err(|e| io_err(&manifest_path, e))?;
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).map_err(|e| io_err(&manifest_path, e))?;
     let manifest: InstalledSkillManifest = serde_json::from_str(&manifest_text)?;
     Ok(manifest.host)
 }
@@ -295,21 +359,37 @@ mod tests {
 
     async fn mock_server_with_one_file() -> MockServer {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "abc123"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/pdf"))
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "abc123"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/contents/skills/pdf"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"name": "SKILL.md", "path": "skills/pdf/SKILL.md", "type": "file",
                  "download_url": format!("{}/raw/SKILL.md", server.uri())}
             ])))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/raw/SKILL.md"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: pdf\ndescription: d\n---\nbody"))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/raw/SKILL.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("---\nname: pdf\ndescription: d\n---\nbody"),
+            )
+            .mount(&server)
+            .await;
         server
     }
 
@@ -318,15 +398,29 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = mock_server_with_one_file().await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        };
 
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
 
         let skill_md = paths.project_config_dir.join("skills/pdf/SKILL.md");
         assert!(skill_md.exists());
-        let manifest_path = paths.project_config_dir.join("skills/pdf/.skill-manifest.json");
-        let manifest: InstalledSkillManifest = serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        let manifest_path = paths
+            .project_config_dir
+            .join("skills/pdf/.skill-manifest.json");
+        let manifest: InstalledSkillManifest =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
         assert_eq!(manifest.commit_sha, "abc123");
         assert_eq!(manifest.git_ref, "main");
     }
@@ -337,8 +431,17 @@ mod tests {
         let paths = test_paths(root.path());
         std::fs::create_dir_all(paths.project_config_dir.join("skills/pdf")).unwrap();
         let server = mock_server_with_one_file().await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        };
 
         let result = install_skill(&client, &paths, Scope::Project, &source, "pdf").await;
         assert!(matches!(result, Err(InstallError::AlreadyInstalled(name)) if name == "pdf"));
@@ -349,17 +452,37 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "abc123"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/pdf"))
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "abc123"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/contents/skills/pdf"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .mount(&server).await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+            .mount(&server)
+            .await;
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        };
 
         let result = install_skill(&client, &paths, Scope::Project, &source, "pdf").await;
         assert!(matches!(result, Err(InstallError::EmptyDirectory(p)) if p == "skills/pdf"));
@@ -373,15 +496,29 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = mock_server_with_one_file().await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        };
 
-        install_skill(&client, &paths, Scope::Global, &source, "pdf").await.unwrap();
+        install_skill(&client, &paths, Scope::Global, &source, "pdf")
+            .await
+            .unwrap();
 
         let skill_md = paths.user_config_dir.join("skills/pdf/SKILL.md");
         assert!(skill_md.exists());
-        let manifest_path = paths.user_config_dir.join("skills/pdf/.skill-manifest.json");
-        let manifest: InstalledSkillManifest = serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        let manifest_path = paths
+            .user_config_dir
+            .join("skills/pdf/.skill-manifest.json");
+        let manifest: InstalledSkillManifest =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
         assert_eq!(manifest.commit_sha, "abc123");
         assert_eq!(manifest.git_ref, "main");
     }
@@ -400,20 +537,40 @@ mod tests {
         let dead_download_url = "http://127.0.0.1:1/raw/SKILL.md".to_string();
 
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "abc123"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/pdf"))
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "abc123"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/contents/skills/pdf"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"name": "SKILL.md", "path": "skills/pdf/SKILL.md", "type": "file",
                  "download_url": dead_download_url}
             ])))
-            .mount(&server).await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+            .mount(&server)
+            .await;
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        };
 
         let result = install_skill(&client, &paths, Scope::Project, &source, "pdf").await;
         assert!(result.is_err());
@@ -424,13 +581,25 @@ mod tests {
 
     #[test]
     fn default_name_uses_last_path_segment() {
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        };
         assert_eq!(default_name(&source), "pdf");
     }
 
     #[test]
     fn default_name_falls_back_to_repo_when_no_path() {
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "".into(), git_ref: None };
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "".into(),
+            git_ref: None,
+        };
         assert_eq!(default_name(&source), "widgets");
     }
 
@@ -439,11 +608,24 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = mock_server_with_one_file().await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        };
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
 
-        let updated = update_skill(&client, &paths, Scope::Project, "pdf").await.unwrap();
+        let updated = update_skill(&client, &paths, Scope::Project, "pdf")
+            .await
+            .unwrap();
         assert!(!updated);
     }
 
@@ -452,33 +634,58 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = mock_server_with_one_file().await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        };
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
 
         // Point the commit-resolution mock at a new sha and change the file content.
         // `with_priority(1)` is needed so these newly-mounted mocks take precedence
         // over the still-mounted mocks from `mock_server_with_one_file` above, since
         // wiremock falls back to insertion order when priority is tied (default: 5).
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "def456"})))
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "def456"})),
+            )
             .with_priority(1)
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/pdf"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/contents/skills/pdf"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"name": "SKILL.md", "path": "skills/pdf/SKILL.md", "type": "file",
                  "download_url": format!("{}/raw/SKILL2.md", server.uri())}
             ])))
             .with_priority(1)
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/raw/SKILL2.md"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: pdf\ndescription: updated\n---\nnew body"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/raw/SKILL2.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("---\nname: pdf\ndescription: updated\n---\nnew body"),
+            )
             .with_priority(1)
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
-        let updated = update_skill(&client, &paths, Scope::Project, "pdf").await.unwrap();
+        let updated = update_skill(&client, &paths, Scope::Project, "pdf")
+            .await
+            .unwrap();
         assert!(updated);
-        let content = std::fs::read_to_string(paths.project_config_dir.join("skills/pdf/SKILL.md")).unwrap();
+        let content =
+            std::fs::read_to_string(paths.project_config_dir.join("skills/pdf/SKILL.md")).unwrap();
         assert!(content.contains("updated"));
     }
 
@@ -487,7 +694,10 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = mock_server_with_one_file().await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
 
         let parent = paths.project_config_dir.join("skills");
         let dir = parent.join("pdf");
@@ -507,13 +717,19 @@ mod tests {
             git_ref: "main".into(),
             commit_sha: "abc123".into(),
         };
-        std::fs::write(backup_dir.join(MANIFEST_FILENAME), serde_json::to_string(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            backup_dir.join(MANIFEST_FILENAME),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
         assert!(!dir.exists());
 
         // The mocked ref hasn't moved (still resolves to "abc123"), so this
         // call should self-heal (restore `dir` from `backup_dir`) and then
         // return `Ok(false)` (no-op) rather than `Err(NotInstalled)`.
-        let updated = update_skill(&client, &paths, Scope::Project, "pdf").await.unwrap();
+        let updated = update_skill(&client, &paths, Scope::Project, "pdf")
+            .await
+            .unwrap();
         assert!(!updated);
 
         assert!(dir.exists());
@@ -527,7 +743,10 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = MockServer::start().await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
         let result = update_skill(&client, &paths, Scope::Project, "nope").await;
         assert!(matches!(result, Err(InstallError::NotInstalled(name)) if name == "nope"));
     }
@@ -557,9 +776,20 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = mock_server_with_one_file().await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        };
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
 
         let summaries = list_skills(&paths).unwrap();
         assert_eq!(summaries.len(), 1);
@@ -573,15 +803,36 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = mock_server_with_one_file().await;
-        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(None, server.uri()));
-        let source = SkillSource { host: Host::GitHub, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None };
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
-        install_skill(&client, &paths, Scope::Global, &source, "pdf").await.unwrap();
+        let client = SkillClient::GitHub(crate::skills::github::GithubClient::new_for_test(
+            None,
+            server.uri(),
+        ));
+        let source = SkillSource {
+            host: Host::GitHub,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        };
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
+        install_skill(&client, &paths, Scope::Global, &source, "pdf")
+            .await
+            .unwrap();
 
         let summaries = list_skills(&paths).unwrap();
         assert_eq!(summaries.len(), 2);
-        assert!(summaries.iter().any(|s| s.name == "pdf" && s.scope == Scope::Project));
-        assert!(summaries.iter().any(|s| s.name == "pdf" && s.scope == Scope::Global));
+        assert!(
+            summaries
+                .iter()
+                .any(|s| s.name == "pdf" && s.scope == Scope::Project)
+        );
+        assert!(
+            summaries
+                .iter()
+                .any(|s| s.name == "pdf" && s.scope == Scope::Global)
+        );
     }
 
     #[test]
@@ -606,12 +857,20 @@ mod tests {
             commit_sha: "abc123".into(),
         };
         let files = vec![
-            FetchedFile { relative_path: PathBuf::from("SKILL.md"), bytes: b"safe".to_vec() },
-            FetchedFile { relative_path: PathBuf::from("../../etc/passwn"), bytes: b"evil".to_vec() },
+            FetchedFile {
+                relative_path: PathBuf::from("SKILL.md"),
+                bytes: b"safe".to_vec(),
+            },
+            FetchedFile {
+                relative_path: PathBuf::from("../../etc/passwn"),
+                bytes: b"evil".to_vec(),
+            },
         ];
 
         let result = write_files(&target_dir, &files, &manifest);
-        assert!(matches!(result, Err(InstallError::UnsafePath(p)) if p == std::path::Path::new("../../etc/passwn")));
+        assert!(
+            matches!(result, Err(InstallError::UnsafePath(p)) if p == std::path::Path::new("../../etc/passwn"))
+        );
 
         // Nothing should have been written outside (or even inside) the target
         // directory as a result of the rejected batch.
@@ -632,10 +891,15 @@ mod tests {
             git_ref: "main".into(),
             commit_sha: "abc123".into(),
         };
-        let files = vec![FetchedFile { relative_path: PathBuf::from("/etc/passwn"), bytes: b"evil".to_vec() }];
+        let files = vec![FetchedFile {
+            relative_path: PathBuf::from("/etc/passwn"),
+            bytes: b"evil".to_vec(),
+        }];
 
         let result = write_files(&target_dir, &files, &manifest);
-        assert!(matches!(result, Err(InstallError::UnsafePath(p)) if p == std::path::Path::new("/etc/passwn")));
+        assert!(
+            matches!(result, Err(InstallError::UnsafePath(p)) if p == std::path::Path::new("/etc/passwn"))
+        );
     }
 
     #[test]
@@ -654,25 +918,49 @@ mod tests {
 
     async fn gitlab_mock_server_with_one_file() -> MockServer {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(wpath("/projects/acme%2Fwidgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/projects/acme%2Fwidgets/repository/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "abc123"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/projects/acme%2Fwidgets/repository/tree"))
+        Mock::given(method("GET"))
+            .and(wpath("/projects/acme%2Fwidgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/projects/acme%2Fwidgets/repository/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "abc123"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/projects/acme%2Fwidgets/repository/tree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"path": "skills/pdf/SKILL.md", "type": "blob"}
             ])))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2FSKILL.md/raw"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: pdf\ndescription: d\n---\nbody"))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath(
+                "/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2FSKILL.md/raw",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("---\nname: pdf\ndescription: d\n---\nbody"),
+            )
+            .mount(&server)
+            .await;
         server
     }
 
     fn gitlab_source() -> SkillSource {
-        SkillSource { host: Host::GitLab, owner: "".into(), repo: "acme/widgets".into(), path: "skills/pdf".into(), git_ref: None }
+        SkillSource {
+            host: Host::GitLab,
+            owner: "".into(),
+            repo: "acme/widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        }
     }
 
     #[tokio::test]
@@ -680,15 +968,23 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = gitlab_mock_server_with_one_file().await;
-        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(None, server.uri()));
+        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(
+            None,
+            server.uri(),
+        ));
         let source = gitlab_source();
 
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
 
         let skill_md = paths.project_config_dir.join("skills/pdf/SKILL.md");
         assert!(skill_md.exists());
-        let manifest_path = paths.project_config_dir.join("skills/pdf/.skill-manifest.json");
-        let manifest: InstalledSkillManifest = serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        let manifest_path = paths
+            .project_config_dir
+            .join("skills/pdf/.skill-manifest.json");
+        let manifest: InstalledSkillManifest =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
         assert_eq!(manifest.host, Host::GitLab);
         assert_eq!(manifest.commit_sha, "abc123");
         assert_eq!(manifest.git_ref, "main");
@@ -700,7 +996,10 @@ mod tests {
         let paths = test_paths(root.path());
         std::fs::create_dir_all(paths.project_config_dir.join("skills/pdf")).unwrap();
         let server = gitlab_mock_server_with_one_file().await;
-        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(None, server.uri()));
+        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(
+            None,
+            server.uri(),
+        ));
         let source = gitlab_source();
 
         let result = install_skill(&client, &paths, Scope::Project, &source, "pdf").await;
@@ -712,16 +1011,30 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(wpath("/projects/acme%2Fwidgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/projects/acme%2Fwidgets/repository/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "abc123"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/projects/acme%2Fwidgets/repository/tree"))
+        Mock::given(method("GET"))
+            .and(wpath("/projects/acme%2Fwidgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/projects/acme%2Fwidgets/repository/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "abc123"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/projects/acme%2Fwidgets/repository/tree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
-            .mount(&server).await;
-        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(None, server.uri()));
+            .mount(&server)
+            .await;
+        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(
+            None,
+            server.uri(),
+        ));
         let source = gitlab_source();
 
         let result = install_skill(&client, &paths, Scope::Project, &source, "pdf").await;
@@ -736,11 +1049,18 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = gitlab_mock_server_with_one_file().await;
-        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(None, server.uri()));
+        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(
+            None,
+            server.uri(),
+        ));
         let source = gitlab_source();
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
 
-        let updated = update_skill(&client, &paths, Scope::Project, "pdf").await.unwrap();
+        let updated = update_skill(&client, &paths, Scope::Project, "pdf")
+            .await
+            .unwrap();
         assert!(!updated);
     }
 
@@ -749,28 +1069,49 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = gitlab_mock_server_with_one_file().await;
-        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(None, server.uri()));
+        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(
+            None,
+            server.uri(),
+        ));
         let source = gitlab_source();
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
 
-        Mock::given(method("GET")).and(wpath("/projects/acme%2Fwidgets/repository/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "def456"})))
+        Mock::given(method("GET"))
+            .and(wpath("/projects/acme%2Fwidgets/repository/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "def456"})),
+            )
             .with_priority(1)
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/projects/acme%2Fwidgets/repository/tree"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/projects/acme%2Fwidgets/repository/tree"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"path": "skills/pdf/SKILL.md", "type": "blob"}
             ])))
             .with_priority(1)
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2FSKILL.md/raw"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: pdf\ndescription: updated\n---\nnew body"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath(
+                "/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2FSKILL.md/raw",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("---\nname: pdf\ndescription: updated\n---\nnew body"),
+            )
             .with_priority(1)
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
-        let updated = update_skill(&client, &paths, Scope::Project, "pdf").await.unwrap();
+        let updated = update_skill(&client, &paths, Scope::Project, "pdf")
+            .await
+            .unwrap();
         assert!(updated);
-        let content = std::fs::read_to_string(paths.project_config_dir.join("skills/pdf/SKILL.md")).unwrap();
+        let content =
+            std::fs::read_to_string(paths.project_config_dir.join("skills/pdf/SKILL.md")).unwrap();
         assert!(content.contains("updated"));
     }
 
@@ -778,13 +1119,23 @@ mod tests {
 
     async fn bitbucket_mock_server_with_one_file() -> MockServer {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(wpath("/repositories/acme/widgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"mainbranch": {"name": "main"}})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repositories/acme/widgets/commit/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"hash": "abc123"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repositories/acme/widgets/src/abc123/skills/pdf"))
+        Mock::given(method("GET"))
+            .and(wpath("/repositories/acme/widgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"mainbranch": {"name": "main"}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repositories/acme/widgets/commit/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"hash": "abc123"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repositories/acme/widgets/src/abc123/skills/pdf"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "values": [{
                     "path": "skills/pdf/SKILL.md",
@@ -793,15 +1144,27 @@ mod tests {
                 }],
                 "next": null
             })))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/raw/SKILL.md"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: pdf\ndescription: d\n---\nbody"))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/raw/SKILL.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("---\nname: pdf\ndescription: d\n---\nbody"),
+            )
+            .mount(&server)
+            .await;
         server
     }
 
     fn bitbucket_source() -> SkillSource {
-        SkillSource { host: Host::Bitbucket, owner: "acme".into(), repo: "widgets".into(), path: "skills/pdf".into(), git_ref: None }
+        SkillSource {
+            host: Host::Bitbucket,
+            owner: "acme".into(),
+            repo: "widgets".into(),
+            path: "skills/pdf".into(),
+            git_ref: None,
+        }
     }
 
     #[tokio::test]
@@ -809,15 +1172,22 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = bitbucket_mock_server_with_one_file().await;
-        let client = SkillClient::Bitbucket(crate::skills::bitbucket::BitbucketClient::new_for_test(None, server.uri()));
+        let client = SkillClient::Bitbucket(
+            crate::skills::bitbucket::BitbucketClient::new_for_test(None, server.uri()),
+        );
         let source = bitbucket_source();
 
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
 
         let skill_md = paths.project_config_dir.join("skills/pdf/SKILL.md");
         assert!(skill_md.exists());
-        let manifest_path = paths.project_config_dir.join("skills/pdf/.skill-manifest.json");
-        let manifest: InstalledSkillManifest = serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        let manifest_path = paths
+            .project_config_dir
+            .join("skills/pdf/.skill-manifest.json");
+        let manifest: InstalledSkillManifest =
+            serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
         assert_eq!(manifest.host, Host::Bitbucket);
         assert_eq!(manifest.commit_sha, "abc123");
         assert_eq!(manifest.git_ref, "main");
@@ -829,7 +1199,9 @@ mod tests {
         let paths = test_paths(root.path());
         std::fs::create_dir_all(paths.project_config_dir.join("skills/pdf")).unwrap();
         let server = bitbucket_mock_server_with_one_file().await;
-        let client = SkillClient::Bitbucket(crate::skills::bitbucket::BitbucketClient::new_for_test(None, server.uri()));
+        let client = SkillClient::Bitbucket(
+            crate::skills::bitbucket::BitbucketClient::new_for_test(None, server.uri()),
+        );
         let source = bitbucket_source();
 
         let result = install_skill(&client, &paths, Scope::Project, &source, "pdf").await;
@@ -841,16 +1213,32 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(wpath("/repositories/acme/widgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"mainbranch": {"name": "main"}})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repositories/acme/widgets/commit/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"hash": "abc123"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repositories/acme/widgets/src/abc123/skills/pdf"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"values": [], "next": null})))
-            .mount(&server).await;
-        let client = SkillClient::Bitbucket(crate::skills::bitbucket::BitbucketClient::new_for_test(None, server.uri()));
+        Mock::given(method("GET"))
+            .and(wpath("/repositories/acme/widgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"mainbranch": {"name": "main"}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repositories/acme/widgets/commit/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"hash": "abc123"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repositories/acme/widgets/src/abc123/skills/pdf"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"values": [], "next": null})),
+            )
+            .mount(&server)
+            .await;
+        let client = SkillClient::Bitbucket(
+            crate::skills::bitbucket::BitbucketClient::new_for_test(None, server.uri()),
+        );
         let source = bitbucket_source();
 
         let result = install_skill(&client, &paths, Scope::Project, &source, "pdf").await;
@@ -865,11 +1253,17 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = bitbucket_mock_server_with_one_file().await;
-        let client = SkillClient::Bitbucket(crate::skills::bitbucket::BitbucketClient::new_for_test(None, server.uri()));
+        let client = SkillClient::Bitbucket(
+            crate::skills::bitbucket::BitbucketClient::new_for_test(None, server.uri()),
+        );
         let source = bitbucket_source();
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
 
-        let updated = update_skill(&client, &paths, Scope::Project, "pdf").await.unwrap();
+        let updated = update_skill(&client, &paths, Scope::Project, "pdf")
+            .await
+            .unwrap();
         assert!(!updated);
     }
 
@@ -878,15 +1272,24 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         let server = bitbucket_mock_server_with_one_file().await;
-        let client = SkillClient::Bitbucket(crate::skills::bitbucket::BitbucketClient::new_for_test(None, server.uri()));
+        let client = SkillClient::Bitbucket(
+            crate::skills::bitbucket::BitbucketClient::new_for_test(None, server.uri()),
+        );
         let source = bitbucket_source();
-        install_skill(&client, &paths, Scope::Project, &source, "pdf").await.unwrap();
+        install_skill(&client, &paths, Scope::Project, &source, "pdf")
+            .await
+            .unwrap();
 
-        Mock::given(method("GET")).and(wpath("/repositories/acme/widgets/commit/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"hash": "def456"})))
+        Mock::given(method("GET"))
+            .and(wpath("/repositories/acme/widgets/commit/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"hash": "def456"})),
+            )
             .with_priority(1)
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repositories/acme/widgets/src/def456/skills/pdf"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repositories/acme/widgets/src/def456/skills/pdf"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "values": [{
                     "path": "skills/pdf/SKILL.md",
@@ -896,15 +1299,24 @@ mod tests {
                 "next": null
             })))
             .with_priority(1)
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/raw/SKILL2.md"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: pdf\ndescription: updated\n---\nnew body"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/raw/SKILL2.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("---\nname: pdf\ndescription: updated\n---\nnew body"),
+            )
             .with_priority(1)
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
-        let updated = update_skill(&client, &paths, Scope::Project, "pdf").await.unwrap();
+        let updated = update_skill(&client, &paths, Scope::Project, "pdf")
+            .await
+            .unwrap();
         assert!(updated);
-        let content = std::fs::read_to_string(paths.project_config_dir.join("skills/pdf/SKILL.md")).unwrap();
+        let content =
+            std::fs::read_to_string(paths.project_config_dir.join("skills/pdf/SKILL.md")).unwrap();
         assert!(content.contains("updated"));
     }
 }

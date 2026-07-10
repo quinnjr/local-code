@@ -1,8 +1,8 @@
 // src/tui/components/permission_card.rs
 
+use ntui::Element;
 use ntui::props::FlexDirection;
 use ntui::style::{BorderStyle, Color};
-use ntui::Element;
 
 use crate::permissions::types::PermissionRequest;
 

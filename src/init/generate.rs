@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use daimon::model::types::{ChatRequest, Message};
 use daimon::model::SharedModel;
+use daimon::model::types::{ChatRequest, Message};
 
 use crate::init::prompt::build_init_prompt;
 use crate::init::survey::ProjectSurvey;
@@ -24,7 +24,10 @@ Be concrete and specific to the project you're shown, not generic boilerplate.";
 /// Makes the one real LLM call `/init` needs: survey → prompt → generated
 /// Markdown. Uses `model.generate_erased` directly (not `Agent::prompt`) since
 /// this is a single, tool-free completion, not a ReAct turn.
-pub async fn generate_agents_md(model: &SharedModel, survey: &ProjectSurvey) -> Result<String, InitError> {
+pub async fn generate_agents_md(
+    model: &SharedModel,
+    survey: &ProjectSurvey,
+) -> Result<String, InitError> {
     let request = ChatRequest {
         messages: vec![
             Message::system(INIT_SYSTEM_PROMPT),
@@ -77,7 +80,9 @@ mod tests {
 
     #[tokio::test]
     async fn generate_agents_md_returns_the_models_text() {
-        let model: SharedModel = Arc::new(FixedResponseModel("# AGENTS.md\n\nThis is a Rust crate.".into()));
+        let model: SharedModel = Arc::new(FixedResponseModel(
+            "# AGENTS.md\n\nThis is a Rust crate.".into(),
+        ));
         let survey = ProjectSurvey {
             file_paths: vec!["Cargo.toml".into()],
             manifests: vec![],
@@ -99,7 +104,10 @@ mod tests {
     #[tokio::test]
     async fn generate_agents_md_rejects_a_blank_response() {
         let model: SharedModel = Arc::new(FixedResponseModel("   \n\t  ".into()));
-        let survey = ProjectSurvey { file_paths: vec!["Cargo.toml".into()], ..Default::default() };
+        let survey = ProjectSurvey {
+            file_paths: vec!["Cargo.toml".into()],
+            ..Default::default()
+        };
         let err = generate_agents_md(&model, &survey).await.unwrap_err();
         assert!(matches!(err, InitError::EmptyResponse));
     }

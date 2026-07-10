@@ -4,20 +4,36 @@ use std::fs;
 use std::path::Path;
 
 use crate::session::paths::session_dir_for_project;
-use crate::session::types::{SessionFile, SessionSummary, SESSION_FILE_VERSION};
+use crate::session::types::{SESSION_FILE_VERSION, SessionFile, SessionSummary};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("failed to read {path}: {source}")]
-    Read { path: std::path::PathBuf, #[source] source: std::io::Error },
+    Read {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to write {path}: {source}")]
-    Write { path: std::path::PathBuf, #[source] source: std::io::Error },
+    Write {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to parse session file {path}: {source}")]
-    Parse { path: std::path::PathBuf, #[source] source: serde_json::Error },
+    Parse {
+        path: std::path::PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("failed to serialize session: {0}")]
     Serialize(#[source] serde_json::Error),
     #[error("session file {path} has unsupported version {found} (expected {expected})")]
-    UnsupportedVersion { path: std::path::PathBuf, found: u32, expected: u32 },
+    UnsupportedVersion {
+        path: std::path::PathBuf,
+        found: u32,
+        expected: u32,
+    },
 }
 
 /// Overwrites `path` with `session`'s current contents, creating parent
@@ -43,10 +59,11 @@ pub fn load_session(path: &Path) -> Result<SessionFile, SessionError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let session: SessionFile = serde_json::from_str(&text).map_err(|source| SessionError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let session: SessionFile =
+        serde_json::from_str(&text).map_err(|source| SessionError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
     if session.version != SESSION_FILE_VERSION {
         return Err(SessionError::UnsupportedVersion {
             path: path.to_path_buf(),
@@ -61,7 +78,10 @@ pub fn load_session(path: &Path) -> Result<SessionFile, SessionError> {
 /// first. Unreadable/corrupt files are skipped rather than failing the whole
 /// listing (a hand-edited or partially-written file shouldn't block
 /// `/resume` from finding everything else).
-pub fn list_sessions(user_state_dir: &Path, project_root: &Path) -> Result<Vec<SessionSummary>, SessionError> {
+pub fn list_sessions(
+    user_state_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<SessionSummary>, SessionError> {
     let dir = session_dir_for_project(user_state_dir, project_root);
     if !dir.exists() {
         return Ok(Vec::new());
@@ -77,16 +97,15 @@ pub fn list_sessions(user_state_dir: &Path, project_root: &Path) -> Result<Vec<S
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(session) = load_session(&path) else { continue };
-        let preview = session
-            .entries
-            .iter()
-            .find_map(|e| match e {
-                crate::tui::state::TranscriptEntry::UserTurn { text } => {
-                    Some(text.chars().take(60).collect::<String>())
-                }
-                _ => None,
-            });
+        let Ok(session) = load_session(&path) else {
+            continue;
+        };
+        let preview = session.entries.iter().find_map(|e| match e {
+            crate::tui::state::TranscriptEntry::UserTurn { text } => {
+                Some(text.chars().take(60).collect::<String>())
+            }
+            _ => None,
+        });
         summaries.push(SessionSummary {
             path,
             connection_name: session.connection_name,
@@ -135,7 +154,10 @@ mod tests {
         session.version = 999;
         save_session(&path, &session).unwrap();
         let result = load_session(&path);
-        assert!(matches!(result, Err(SessionError::UnsupportedVersion { found: 999, .. })));
+        assert!(matches!(
+            result,
+            Err(SessionError::UnsupportedVersion { found: 999, .. })
+        ));
     }
 
     #[test]
@@ -152,8 +174,16 @@ mod tests {
         let dir = session_dir_for_project(user_state_dir.path(), project_root);
         fs::create_dir_all(&dir).unwrap();
 
-        save_session(&dir.join("a.json"), &sample("older", "2026-07-01T00:00:00Z")).unwrap();
-        save_session(&dir.join("b.json"), &sample("newer", "2026-07-06T00:00:00Z")).unwrap();
+        save_session(
+            &dir.join("a.json"),
+            &sample("older", "2026-07-01T00:00:00Z"),
+        )
+        .unwrap();
+        save_session(
+            &dir.join("b.json"),
+            &sample("newer", "2026-07-06T00:00:00Z"),
+        )
+        .unwrap();
         fs::write(dir.join("corrupt.json"), "not json").unwrap();
 
         let sessions = list_sessions(user_state_dir.path(), project_root).unwrap();
@@ -170,12 +200,17 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let mut session = sample("conn", "2026-07-06T00:00:00Z");
-        session.entries.push(crate::tui::state::TranscriptEntry::UserTurn {
-            text: "fix the flaky test".into(),
-        });
+        session
+            .entries
+            .push(crate::tui::state::TranscriptEntry::UserTurn {
+                text: "fix the flaky test".into(),
+            });
         save_session(&dir.join("s.json"), &session).unwrap();
 
         let sessions = list_sessions(user_state_dir.path(), project_root).unwrap();
-        assert_eq!(sessions[0].first_user_turn_preview.as_deref(), Some("fix the flaky test"));
+        assert_eq!(
+            sessions[0].first_user_turn_preview.as_deref(),
+            Some("fix the flaky test")
+        );
     }
 }

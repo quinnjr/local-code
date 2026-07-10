@@ -37,14 +37,25 @@ pub fn parse_spec(spec: &str) -> Result<ParsedSpec, SkillHostError> {
     // owner/repo[/path][@ref] parser — the one backward-compatibility
     // guarantee this feature needs to uphold.
     let source = crate::skills::github::parse_spec(spec)?;
-    Ok(ParsedSpec { source, needs_project_path_resolution: false })
+    Ok(ParsedSpec {
+        source,
+        needs_project_path_resolution: false,
+    })
 }
 
 /// GitHub (`owner/repo[/path][@ref]`) and Bitbucket (`workspace/repo_slug[/path][@ref]`)
 /// share an identical flat shape, differing only in the resulting `Host`.
-fn parse_github_or_bitbucket_shaped(rest: &str, host: Host, original_spec: &str) -> Result<ParsedSpec, SkillHostError> {
-    let parsed = crate::skills::github::parse_spec(rest).map_err(|_| SkillHostError::InvalidSpec(original_spec.to_string()))?;
-    Ok(ParsedSpec { source: SkillSource { host, ..parsed }, needs_project_path_resolution: false })
+fn parse_github_or_bitbucket_shaped(
+    rest: &str,
+    host: Host,
+    original_spec: &str,
+) -> Result<ParsedSpec, SkillHostError> {
+    let parsed = crate::skills::github::parse_spec(rest)
+        .map_err(|_| SkillHostError::InvalidSpec(original_spec.to_string()))?;
+    Ok(ParsedSpec {
+        source: SkillSource { host, ..parsed },
+        needs_project_path_resolution: false,
+    })
 }
 
 /// `gl:group/subgroup/project/skills/pdf@main` — split off `@ref` only;
@@ -77,12 +88,24 @@ fn parse_url(rest: &str, original_spec: &str) -> Result<ParsedSpec, SkillHostErr
         "github.com" => {
             let parsed = crate::skills::github::parse_spec(after_domain)
                 .map_err(|_| SkillHostError::InvalidSpec(original_spec.to_string()))?;
-            Ok(ParsedSpec { source: SkillSource { host: Host::GitHub, ..parsed }, needs_project_path_resolution: false })
+            Ok(ParsedSpec {
+                source: SkillSource {
+                    host: Host::GitHub,
+                    ..parsed
+                },
+                needs_project_path_resolution: false,
+            })
         }
         "bitbucket.org" => {
             let parsed = crate::skills::github::parse_spec(after_domain)
                 .map_err(|_| SkillHostError::InvalidSpec(original_spec.to_string()))?;
-            Ok(ParsedSpec { source: SkillSource { host: Host::Bitbucket, ..parsed }, needs_project_path_resolution: false })
+            Ok(ParsedSpec {
+                source: SkillSource {
+                    host: Host::Bitbucket,
+                    ..parsed
+                },
+                needs_project_path_resolution: false,
+            })
         }
         "gitlab.com" => parse_gitlab_url(after_domain, original_spec),
         _ => Err(SkillHostError::InvalidSpec(original_spec.to_string())),
@@ -185,7 +208,8 @@ mod tests {
 
     #[test]
     fn gitlab_url_with_tree_is_parsed_unambiguously_without_an_api_call() {
-        let parsed = parse_spec("https://gitlab.com/group/subgroup/project/-/tree/main/skills/pdf").unwrap();
+        let parsed =
+            parse_spec("https://gitlab.com/group/subgroup/project/-/tree/main/skills/pdf").unwrap();
         assert_eq!(parsed.source.host, Host::GitLab);
         assert_eq!(parsed.source.repo, "group/subgroup/project");
         assert_eq!(parsed.source.path, "skills/pdf");
@@ -195,7 +219,8 @@ mod tests {
 
     #[test]
     fn gitlab_url_with_blob_is_parsed() {
-        let parsed = parse_spec("https://gitlab.com/group/project/-/blob/main/skills/pdf/SKILL.md").unwrap();
+        let parsed =
+            parse_spec("https://gitlab.com/group/project/-/blob/main/skills/pdf/SKILL.md").unwrap();
         assert_eq!(parsed.source.repo, "group/project");
         assert_eq!(parsed.source.path, "skills/pdf/SKILL.md");
     }

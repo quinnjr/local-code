@@ -107,7 +107,10 @@ mod tests {
         // what a future edit to `classify_tool` is most likely to touch.
         assert_eq!(classify_tool("filesystem__write_file"), ToolKind::Edit);
         assert_eq!(classify_tool("filesystem__read_file"), ToolKind::Edit);
-        assert_eq!(classify_tool("some_remote_server__delete_everything"), ToolKind::Edit);
+        assert_eq!(
+            classify_tool("some_remote_server__delete_everything"),
+            ToolKind::Edit
+        );
     }
 
     #[test]

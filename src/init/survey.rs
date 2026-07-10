@@ -53,7 +53,9 @@ pub fn survey_project(project_root: &Path) -> ProjectSurvey {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
-        let Ok(relative) = entry.path().strip_prefix(project_root) else { continue };
+        let Ok(relative) = entry.path().strip_prefix(project_root) else {
+            continue;
+        };
         let relative_str = relative.to_string_lossy().to_string();
 
         survey.total_files_seen += 1;

@@ -2,7 +2,7 @@
 
 use ntui::props::{FlexDirection, Overflow};
 use ntui::style::{BorderStyle, Color};
-use ntui::{component, element, Element, KeyCode};
+use ntui::{Element, KeyCode, component, element};
 
 use crate::permissions::types::PermissionRequest;
 use crate::tui::components::permission_card::render_permission_card;
@@ -60,8 +60,10 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            Element::component::<TranscriptEntryView>(EntryProps { entry: entry.clone() })
-                .with_key(i.to_string())
+            Element::component::<TranscriptEntryView>(EntryProps {
+                entry: entry.clone(),
+            })
+            .with_key(i.to_string())
         })
         .collect();
 
@@ -95,7 +97,9 @@ struct EntryProps {
 impl Default for EntryProps {
     fn default() -> Self {
         EntryProps {
-            entry: TranscriptEntry::SystemNotice { text: String::new() },
+            entry: TranscriptEntry::SystemNotice {
+                text: String::new(),
+            },
         }
     }
 }
@@ -118,7 +122,10 @@ fn render_entry(entry: &TranscriptEntry) -> Element {
             }
         },
         TranscriptEntry::ToolCall(call) => render_tool_card(call),
-        TranscriptEntry::PermissionResolved { description, allowed } => {
+        TranscriptEntry::PermissionResolved {
+            description,
+            allowed,
+        } => {
             let (label, color) = if *allowed {
                 ("allowed", Color::Green)
             } else {
@@ -139,11 +146,7 @@ fn render_entry(entry: &TranscriptEntry) -> Element {
 }
 
 fn render_tool_card(call: &crate::tui::state::ToolCallEntry) -> Element {
-    let header = format!(
-        "{} {}",
-        if call.expanded { "▾" } else { "▸" },
-        call.name
-    );
+    let header = format!("{} {}", if call.expanded { "▾" } else { "▸" }, call.name);
     if !call.expanded {
         return element! {
             View(border_style: BorderStyle::Single, border_color: Color::DarkGrey, padding: 0) {
@@ -264,7 +267,10 @@ mod tests {
             }),
         };
         let t = TestTerminal::new(60, 10, Element::component::<Transcript>(props)).unwrap();
-        assert!(t.frame_text().contains("Permission requested: run shell command: rm x"));
+        assert!(
+            t.frame_text()
+                .contains("Permission requested: run shell command: rm x")
+        );
     }
 
     #[tokio::test]

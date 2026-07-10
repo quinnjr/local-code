@@ -1,13 +1,15 @@
-use crate::config::connection::{load_connections, save_connections, Connection, ProviderKind};
+use crate::config::connection::{Connection, ProviderKind, load_connections, save_connections};
 use crate::config::paths::Paths;
 use crate::config::secrets::SecretStore;
 use std::io::{BufRead, Write};
 
 pub fn list<W: Write>(paths: &Paths, mut out: W) -> anyhow::Result<()> {
-    let connections =
-        load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
+    let connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
     if connections.is_empty() {
-        writeln!(out, "No connections configured. Run `local-code connections add`.")?;
+        writeln!(
+            out,
+            "No connections configured. Run `local-code connections add`."
+        )?;
         return Ok(());
     }
     for conn in &connections {
@@ -26,8 +28,7 @@ pub fn list<W: Write>(paths: &Paths, mut out: W) -> anyhow::Result<()> {
 }
 
 pub fn remove<W: Write>(paths: &Paths, name: &str, mut out: W) -> anyhow::Result<()> {
-    let mut connections =
-        load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
+    let mut connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
     let before = connections.len();
     connections.retain(|c| c.name != name);
     if connections.len() == before {
@@ -76,8 +77,7 @@ pub fn add<R: BufRead, W: Write>(
         models: vec![],
     };
 
-    let mut connections =
-        load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
+    let mut connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
     connections.retain(|c| c.name != connection.name);
     connections.push(connection.clone());
     save_connections(&paths.project_config_dir, &connections)?;
@@ -124,7 +124,11 @@ mod tests {
         let paths = test_paths(dir.path());
         let mut out = Vec::new();
         list(&paths, &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("No connections configured"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("No connections configured")
+        );
     }
 
     #[test]
@@ -172,7 +176,8 @@ mod tests {
         let mut out = Vec::new();
         remove(&paths, "conn-y", &mut out).unwrap();
 
-        let remaining = load_connections(&paths.user_config_dir, &paths.project_config_dir).unwrap();
+        let remaining =
+            load_connections(&paths.user_config_dir, &paths.project_config_dir).unwrap();
         assert!(remaining.is_empty());
         assert_eq!(SecretStore::get_api_key("conn-y").unwrap(), None);
     }
@@ -184,7 +189,11 @@ mod tests {
         let paths = test_paths(dir.path());
         let mut out = Vec::new();
         remove(&paths, "does-not-exist", &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("No connection named"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("No connection named")
+        );
     }
 
     #[test]
@@ -193,7 +202,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let paths = test_paths(dir.path());
 
-        let transcript = "local-vllm\n1\nhttp://localhost:8000/v1\nqwen2.5-coder-32b\nsk-test-789\n";
+        let transcript =
+            "local-vllm\n1\nhttp://localhost:8000/v1\nqwen2.5-coder-32b\nsk-test-789\n";
         let mut out = Vec::new();
         let connection = add(&paths, transcript.as_bytes(), &mut out).unwrap();
 
@@ -221,9 +231,6 @@ mod tests {
         let connection = add(&paths, transcript.as_bytes(), &mut out).unwrap();
 
         assert_eq!(connection.provider, ProviderKind::Ollama);
-        assert_eq!(
-            SecretStore::get_api_key(&connection.name).unwrap(),
-            None
-        );
+        assert_eq!(SecretStore::get_api_key(&connection.name).unwrap(), None);
     }
 }

@@ -24,6 +24,8 @@ async fn generates_nonempty_agents_md_for_this_repo() {
     let model = build_model(&connection, None).expect("model construction should not fail");
 
     let survey = survey_project(std::path::Path::new(env!("CARGO_MANIFEST_DIR")));
-    let content = generate_agents_md(&model, &survey).await.expect("generation should succeed");
+    let content = generate_agents_md(&model, &survey)
+        .await
+        .expect("generation should succeed");
     assert!(!content.trim().is_empty());
 }

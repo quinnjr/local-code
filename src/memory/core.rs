@@ -1,6 +1,6 @@
 // src/memory/core.rs
 
-use crate::memory::{ensure_dir, MemoryError, MemoryPaths};
+use crate::memory::{MemoryError, MemoryPaths, ensure_dir};
 use chrono::{DateTime, Utc};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -17,7 +17,11 @@ pub fn read_core_memories(memory_dir: &Path) -> Result<String, MemoryError> {
     })
 }
 
-pub fn append_core_memory(memory_dir: &Path, now: DateTime<Utc>, text: &str) -> Result<(), MemoryError> {
+pub fn append_core_memory(
+    memory_dir: &Path,
+    now: DateTime<Utc>,
+    text: &str,
+) -> Result<(), MemoryError> {
     ensure_dir(memory_dir)?;
     let paths = MemoryPaths::new(memory_dir);
     let mut file = OpenOptions::new()

@@ -83,7 +83,9 @@ pub fn build_agent(model: SharedModel, gate: Arc<PermissionGate>) -> daimon::Res
 mod tests {
     use super::*;
     use crate::permissions::settings::PermissionSettings;
-    use crate::permissions::types::{PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier};
+    use crate::permissions::types::{
+        PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier,
+    };
     use daimon::model::types::{ChatRequest, ChatResponse, Message, StopReason, Usage};
     use daimon::stream::ResponseStream;
     use std::future::Future;
@@ -159,7 +161,10 @@ mod tests {
             fn parameters_schema(&self) -> serde_json::Value {
                 serde_json::json!({"type": "object"})
             }
-            async fn execute(&self, _input: &serde_json::Value) -> daimon::Result<daimon::tool::ToolOutput> {
+            async fn execute(
+                &self,
+                _input: &serde_json::Value,
+            ) -> daimon::Result<daimon::tool::ToolOutput> {
                 Ok(daimon::tool::ToolOutput::text("fixture echo"))
             }
         }

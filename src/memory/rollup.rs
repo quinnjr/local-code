@@ -1,6 +1,6 @@
 // src/memory/rollup.rs
 
-use crate::memory::{ensure_dir, MemoryError, MemoryPaths};
+use crate::memory::{MemoryError, MemoryPaths, ensure_dir};
 use chrono::{Duration, NaiveDate};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -123,8 +123,16 @@ mod tests {
         let memory_dir = dir.path().join("memory");
         let today = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
 
-        write_daily(&memory_dir, today - Duration::days(10), "## 09:00:00Z\nToo old.\n");
-        write_daily(&memory_dir, today - Duration::days(6), "## 09:00:00Z\nOldest in window.\n");
+        write_daily(
+            &memory_dir,
+            today - Duration::days(10),
+            "## 09:00:00Z\nToo old.\n",
+        );
+        write_daily(
+            &memory_dir,
+            today - Duration::days(6),
+            "## 09:00:00Z\nOldest in window.\n",
+        );
         write_daily(&memory_dir, today, "## 09:00:00Z\nToday's entry.\n");
 
         rollup_and_archive(&memory_dir, today).unwrap();
@@ -140,7 +148,10 @@ mod tests {
 
         let oldest_pos = recent.find("Oldest in window.").unwrap();
         let today_pos = recent.find("Today's entry.").unwrap();
-        assert!(oldest_pos < today_pos, "expected oldest-first ordering in recent.md");
+        assert!(
+            oldest_pos < today_pos,
+            "expected oldest-first ordering in recent.md"
+        );
     }
 
     #[test]

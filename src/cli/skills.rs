@@ -8,13 +8,19 @@ use crate::skills::bitbucket::BitbucketClient;
 use crate::skills::client::SkillClient;
 use crate::skills::github::GithubClient;
 use crate::skills::gitlab::GitlabClient;
-use crate::skills::install::{default_name, install_skill, list_skills, remove_skill, update_skill};
+use crate::skills::install::{
+    default_name, install_skill, list_skills, remove_skill, update_skill,
+};
 use crate::skills::types::{Host, Scope};
 
 fn skill_client(host: Host) -> anyhow::Result<SkillClient> {
     match host {
-        Host::GitHub => Ok(SkillClient::GitHub(GithubClient::new(SecretStore::get_api_key("github")?))),
-        Host::GitLab => Ok(SkillClient::GitLab(GitlabClient::new(SecretStore::get_api_key("gitlab")?))),
+        Host::GitHub => Ok(SkillClient::GitHub(GithubClient::new(
+            SecretStore::get_api_key("github")?,
+        ))),
+        Host::GitLab => Ok(SkillClient::GitLab(GitlabClient::new(
+            SecretStore::get_api_key("gitlab")?,
+        ))),
         Host::Bitbucket => {
             let credentials = match SecretStore::get_api_key("bitbucket")? {
                 Some(combined) => {
@@ -60,18 +66,34 @@ pub async fn install<W: Write>(
         let SkillClient::GitLab(gitlab_client) = &client else {
             unreachable!("needs_project_path_resolution is only ever true for Host::GitLab specs")
         };
-        let (project_path, in_repo_path) = gitlab_client.resolve_project_path(&parsed.source.repo).await?;
-        crate::skills::types::SkillSource { repo: project_path, path: in_repo_path, ..parsed.source }
+        let (project_path, in_repo_path) = gitlab_client
+            .resolve_project_path(&parsed.source.repo)
+            .await?;
+        crate::skills::types::SkillSource {
+            repo: project_path,
+            path: in_repo_path,
+            ..parsed.source
+        }
     } else {
         parsed.source
     };
 
-    let name = name_override.map(str::to_string).unwrap_or_else(|| default_name(&source));
+    let name = name_override
+        .map(str::to_string)
+        .unwrap_or_else(|| default_name(&source));
     validate_skill_name(&name)?;
-    let scope = if global { Scope::Global } else { Scope::Project };
+    let scope = if global {
+        Scope::Global
+    } else {
+        Scope::Project
+    };
 
     install_skill(&client, paths, scope, &source, &name).await?;
-    writeln!(out, "Installed skill '{name}' from {spec} ({})", scope_label(scope))?;
+    writeln!(
+        out,
+        "Installed skill '{name}' from {spec} ({})",
+        scope_label(scope)
+    )?;
     Ok(())
 }
 
@@ -82,28 +104,51 @@ pub fn list<W: Write>(paths: &Paths, mut out: W) -> anyhow::Result<()> {
         return Ok(());
     }
     for summary in summaries {
-        writeln!(out, "{} · {} · {}", summary.name, scope_label(summary.scope), summary.source)?;
+        writeln!(
+            out,
+            "{} · {} · {}",
+            summary.name,
+            scope_label(summary.scope),
+            summary.source
+        )?;
     }
     Ok(())
 }
 
 pub fn remove<W: Write>(paths: &Paths, name: &str, global: bool, mut out: W) -> anyhow::Result<()> {
     validate_skill_name(name)?;
-    let scope = if global { Scope::Global } else { Scope::Project };
+    let scope = if global {
+        Scope::Global
+    } else {
+        Scope::Project
+    };
     remove_skill(paths, scope, name)?;
     writeln!(out, "Removed skill '{name}' ({})", scope_label(scope))?;
     Ok(())
 }
 
-pub async fn update<W: Write>(paths: &Paths, name: Option<&str>, global: bool, mut out: W) -> anyhow::Result<()> {
+pub async fn update<W: Write>(
+    paths: &Paths,
+    name: Option<&str>,
+    global: bool,
+    mut out: W,
+) -> anyhow::Result<()> {
     if let Some(n) = name {
         validate_skill_name(n)?;
     }
-    let scope = if global { Scope::Global } else { Scope::Project };
+    let scope = if global {
+        Scope::Global
+    } else {
+        Scope::Project
+    };
 
     let names: Vec<String> = match name {
         Some(n) => vec![n.to_string()],
-        None => list_skills(paths)?.into_iter().filter(|s| s.scope == scope).map(|s| s.name).collect(),
+        None => list_skills(paths)?
+            .into_iter()
+            .filter(|s| s.scope == scope)
+            .map(|s| s.name)
+            .collect(),
     };
 
     if names.is_empty() {
@@ -153,7 +198,11 @@ mod tests {
         let paths = test_paths(root.path());
         let mut out = Vec::new();
         list(&paths, &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("No skills installed"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("No skills installed")
+        );
     }
 
     #[test]
@@ -172,7 +221,11 @@ mod tests {
         std::fs::create_dir_all(paths.project_config_dir.join("skills/pdf")).unwrap();
         let mut out = Vec::new();
         remove(&paths, "pdf", false, &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("Removed skill 'pdf'"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("Removed skill 'pdf'")
+        );
     }
 
     #[test]
@@ -212,7 +265,12 @@ mod tests {
         // validity.
         let result = install(&paths, "acme/widgets", false, Some("../escape"), out).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must not contain path separators"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must not contain path separators")
+        );
     }
 
     #[tokio::test]
@@ -222,7 +280,12 @@ mod tests {
         let out: Vec<u8> = Vec::new();
         let result = update(&paths, Some("../escape"), false, out).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must not contain path separators"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("must not contain path separators")
+        );
     }
 
     // `update()`'s `None`-name branch (list every skill in scope, call
@@ -243,8 +306,11 @@ mod tests {
         scope: Scope,
         mut out: W,
     ) -> anyhow::Result<()> {
-        let names: Vec<String> =
-            list_skills(paths)?.into_iter().filter(|s| s.scope == scope).map(|s| s.name).collect();
+        let names: Vec<String> = list_skills(paths)?
+            .into_iter()
+            .filter(|s| s.scope == scope)
+            .map(|s| s.name)
+            .collect();
         for name in names {
             let updated = update_skill(client, paths, scope, &name).await?;
             if updated {
@@ -264,37 +330,69 @@ mod tests {
 
         // Two skills from two different repos, so their commit-resolution
         // endpoints can be moved independently of one another.
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "w1"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/alpha"))
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "w1"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/contents/skills/alpha"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"name": "SKILL.md", "path": "skills/alpha/SKILL.md", "type": "file",
                  "download_url": format!("{}/raw/alpha.md", server.uri())}
             ])))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/raw/alpha.md"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: alpha\ndescription: d\n---\nbody"))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/raw/alpha.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("---\nname: alpha\ndescription: d\n---\nbody"),
+            )
+            .mount(&server)
+            .await;
 
-        Mock::given(method("GET")).and(wpath("/repos/acme/gadgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/gadgets/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "g1"})))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/gadgets/contents/skills/beta"))
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/gadgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/gadgets/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "g1"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/gadgets/contents/skills/beta"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"name": "SKILL.md", "path": "skills/beta/SKILL.md", "type": "file",
                  "download_url": format!("{}/raw/beta.md", server.uri())}
             ])))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/raw/beta.md"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: beta\ndescription: d\n---\nbody"))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/raw/beta.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("---\nname: beta\ndescription: d\n---\nbody"),
+            )
+            .mount(&server)
+            .await;
 
         let client = SkillClient::GitHub(GithubClient::new_for_test(None, server.uri()));
         let alpha_source = SkillSource {
@@ -311,39 +409,71 @@ mod tests {
             path: "skills/beta".into(),
             git_ref: None,
         };
-        install_skill(&client, &paths, Scope::Project, &alpha_source, "alpha").await.unwrap();
-        install_skill(&client, &paths, Scope::Project, &beta_source, "beta").await.unwrap();
+        install_skill(&client, &paths, Scope::Project, &alpha_source, "alpha")
+            .await
+            .unwrap();
+        install_skill(&client, &paths, Scope::Project, &beta_source, "beta")
+            .await
+            .unwrap();
 
         // Move `widgets`' ref (and its file content) to a new commit; leave
         // `gadgets` untouched so `beta` reports as already up to date.
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "w2"})))
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"sha": "w2"})),
+            )
             .with_priority(1)
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/repos/acme/widgets/contents/skills/alpha"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/repos/acme/widgets/contents/skills/alpha"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"name": "SKILL.md", "path": "skills/alpha/SKILL.md", "type": "file",
                  "download_url": format!("{}/raw/alpha2.md", server.uri())}
             ])))
             .with_priority(1)
-            .mount(&server).await;
-        Mock::given(method("GET")).and(wpath("/raw/alpha2.md"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: alpha\ndescription: updated\n---\nnew body"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(wpath("/raw/alpha2.md"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("---\nname: alpha\ndescription: updated\n---\nnew body"),
+            )
             .with_priority(1)
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
         let mut out = Vec::new();
-        update_all_in_scope_with_client(&client, &paths, Scope::Project, &mut out).await.unwrap();
+        update_all_in_scope_with_client(&client, &paths, Scope::Project, &mut out)
+            .await
+            .unwrap();
 
         let output = String::from_utf8(out).unwrap();
-        assert!(output.contains("Updated skill 'alpha'"), "missing moved-skill line, got: {output}");
-        assert!(output.contains("Skill 'beta' is already up to date"), "missing not-moved-skill line, got: {output}");
+        assert!(
+            output.contains("Updated skill 'alpha'"),
+            "missing moved-skill line, got: {output}"
+        );
+        assert!(
+            output.contains("Skill 'beta' is already up to date"),
+            "missing not-moved-skill line, got: {output}"
+        );
     }
 
     #[test]
     fn skill_client_maps_each_host_to_its_concrete_client_variant() {
-        assert!(matches!(skill_client(Host::GitHub).unwrap(), SkillClient::GitHub(_)));
-        assert!(matches!(skill_client(Host::GitLab).unwrap(), SkillClient::GitLab(_)));
-        assert!(matches!(skill_client(Host::Bitbucket).unwrap(), SkillClient::Bitbucket(_)));
+        assert!(matches!(
+            skill_client(Host::GitHub).unwrap(),
+            SkillClient::GitHub(_)
+        ));
+        assert!(matches!(
+            skill_client(Host::GitLab).unwrap(),
+            SkillClient::GitLab(_)
+        ));
+        assert!(matches!(
+            skill_client(Host::Bitbucket).unwrap(),
+            SkillClient::Bitbucket(_)
+        ));
     }
 }

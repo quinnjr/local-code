@@ -88,7 +88,11 @@ mod tests {
     fn finds_case_insensitive_matches_in_buffer() {
         let dir = tempdir().unwrap();
         let memory_dir = dir.path().join("memory");
-        write(&memory_dir, "now.md", "<!-- buffer-date: 2026-07-06 -->\n\n## 09:00:00Z\nFixed the Flaky test.\n");
+        write(
+            &memory_dir,
+            "now.md",
+            "<!-- buffer-date: 2026-07-06 -->\n\n## 09:00:00Z\nFixed the Flaky test.\n",
+        );
 
         let hits = search(&memory_dir, "flaky").unwrap();
         assert_eq!(hits.len(), 1);
@@ -100,9 +104,21 @@ mod tests {
     fn finds_matches_across_daily_recent_and_archive_files() {
         let dir = tempdir().unwrap();
         let memory_dir = dir.path().join("memory");
-        write(&memory_dir, "today-2026-07-05.md", "## 09:00:00Z\nDaily file mentions widgets.\n");
-        write(&memory_dir, "recent.md", "# 2026-07-06\n\n## 09:00:00Z\nRecent file mentions widgets too.\n");
-        write(&memory_dir, "archive.md", "# 2026-06-01\n\n## 09:00:00Z\nArchived widgets note.\n");
+        write(
+            &memory_dir,
+            "today-2026-07-05.md",
+            "## 09:00:00Z\nDaily file mentions widgets.\n",
+        );
+        write(
+            &memory_dir,
+            "recent.md",
+            "# 2026-07-06\n\n## 09:00:00Z\nRecent file mentions widgets too.\n",
+        );
+        write(
+            &memory_dir,
+            "archive.md",
+            "# 2026-06-01\n\n## 09:00:00Z\nArchived widgets note.\n",
+        );
 
         let hits = search(&memory_dir, "widgets").unwrap();
         assert_eq!(hits.len(), 3);
@@ -112,7 +128,11 @@ mod tests {
     fn does_not_search_core_memories_file() {
         let dir = tempdir().unwrap();
         let memory_dir = dir.path().join("memory");
-        write(&memory_dir, "core-memories.md", "## 2026-06-15\nNever use unwrap() outside tests.\n");
+        write(
+            &memory_dir,
+            "core-memories.md",
+            "## 2026-06-15\nNever use unwrap() outside tests.\n",
+        );
 
         let hits = search(&memory_dir, "unwrap").unwrap();
         assert!(hits.is_empty());
@@ -130,7 +150,11 @@ mod tests {
     fn line_numbers_are_one_indexed() {
         let dir = tempdir().unwrap();
         let memory_dir = dir.path().join("memory");
-        write(&memory_dir, "now.md", "line one\nline two matches HERE\nline three\n");
+        write(
+            &memory_dir,
+            "now.md",
+            "line one\nline two matches HERE\nline three\n",
+        );
 
         let hits = search(&memory_dir, "here").unwrap();
         assert_eq!(hits.len(), 1);

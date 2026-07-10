@@ -1,5 +1,5 @@
 use clap::Parser;
-use local_code::cli::{run, Cli};
+use local_code::cli::{Cli, run};
 
 /// Hidden CLI mode that turns this binary into the stdio MCP test fixture
 /// (see `local_code::mcp::fixture_server`), so integration tests can spawn a

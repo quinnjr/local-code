@@ -7,8 +7,8 @@ use tokio::sync::Mutex;
 
 use crate::permissions::settings::PermissionSettings;
 use crate::permissions::types::{
-    classify_tool, PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier,
-    ToolKind,
+    PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier, ToolKind,
+    classify_tool,
 };
 
 /// Result of [`PermissionGate::check`].
@@ -150,7 +150,10 @@ fn describe_call(tool_name: &str, arguments: &serde_json::Value) -> String {
     match tool_name {
         "bash" => format!(
             "run shell command: {}",
-            arguments.get("command").and_then(|v| v.as_str()).unwrap_or("")
+            arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
         ),
         "write_file" => format!(
             "write file: {}",
@@ -200,7 +203,9 @@ mod tests {
                 feedback: "should never be reached".into(),
             },
         );
-        let outcome = gate.check("read_file", &serde_json::json!({"path": "x"})).await;
+        let outcome = gate
+            .check("read_file", &serde_json::json!({"path": "x"}))
+            .await;
         assert_eq!(outcome, CheckOutcome::Allowed);
     }
 
@@ -212,7 +217,9 @@ mod tests {
                 feedback: "should never be reached".into(),
             },
         );
-        let outcome = gate.check("bash", &serde_json::json!({"command": "ls"})).await;
+        let outcome = gate
+            .check("bash", &serde_json::json!({"command": "ls"}))
+            .await;
         assert_eq!(outcome, CheckOutcome::Allowed);
     }
 
@@ -220,7 +227,10 @@ mod tests {
     async fn auto_accept_edits_allows_edit_but_still_prompts_bash() {
         let gate = gate_with(PermissionTier::AutoAcceptEdits, PermissionDecision::Allow);
         let edit_outcome = gate
-            .check("write_file", &serde_json::json!({"path": "x", "content": "y"}))
+            .check(
+                "write_file",
+                &serde_json::json!({"path": "x", "content": "y"}),
+            )
             .await;
         assert_eq!(edit_outcome, CheckOutcome::Allowed);
 
@@ -245,7 +255,10 @@ mod tests {
             },
         );
         let outcome = gate
-            .check("edit_file", &serde_json::json!({"path": "x", "find": "a", "replace": "b"}))
+            .check(
+                "edit_file",
+                &serde_json::json!({"path": "x", "find": "a", "replace": "b"}),
+            )
             .await;
         assert_eq!(
             outcome,
@@ -257,7 +270,10 @@ mod tests {
     async fn allow_always_this_session_skips_future_prompts_for_the_same_command_only() {
         // A prompter that always answers AllowAlwaysThisSession, used to record the
         // approval for the first ("cargo test") command.
-        let gate = gate_with(PermissionTier::Ask, PermissionDecision::AllowAlwaysThisSession);
+        let gate = gate_with(
+            PermissionTier::Ask,
+            PermissionDecision::AllowAlwaysThisSession,
+        );
         let first = gate
             .check("bash", &serde_json::json!({"command": "cargo test"}))
             .await;

@@ -54,7 +54,9 @@ mod tests {
     use super::*;
     use crate::agent::tools::{Bash, ReadFile, WriteFile};
     use crate::permissions::settings::PermissionSettings;
-    use crate::permissions::types::{PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier};
+    use crate::permissions::types::{
+        PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier,
+    };
     use std::future::Future;
     use std::pin::Pin;
 

@@ -24,7 +24,8 @@ impl MemoryPaths {
     }
 
     pub fn daily(&self, date: NaiveDate) -> PathBuf {
-        self.dir.join(format!("today-{}.md", date.format("%Y-%m-%d")))
+        self.dir
+            .join(format!("today-{}.md", date.format("%Y-%m-%d")))
     }
 }
 

@@ -34,9 +34,7 @@ fn get_or_insert_entry<'a>(
         let entry = keyring::Entry::new(SERVICE_NAME, connection_name)?;
         cache.insert(connection_name.to_string(), entry);
     }
-    Ok(cache
-        .get(connection_name)
-        .expect("entry was just inserted"))
+    Ok(cache.get(connection_name).expect("entry was just inserted"))
 }
 
 impl SecretStore {

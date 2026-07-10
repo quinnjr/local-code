@@ -16,7 +16,10 @@ pub enum ProviderError {
 /// and its (optional) API key. `OpenAiCompatible` connections use `daimon`'s generic
 /// OpenAI-compatible provider pointed at `connection.base_url`; `Ollama` connections use
 /// the dedicated Ollama provider. Later phases (`/model` switching) call this directly.
-pub fn build_model(connection: &Connection, api_key: Option<String>) -> Result<SharedModel, ProviderError> {
+pub fn build_model(
+    connection: &Connection,
+    api_key: Option<String>,
+) -> Result<SharedModel, ProviderError> {
     if connection.base_url.trim().is_empty() {
         return Err(ProviderError::EmptyBaseUrl(connection.name.clone()));
     }
@@ -31,7 +34,8 @@ pub fn build_model(connection: &Connection, api_key: Option<String>) -> Result<S
             )
         }
         ProviderKind::Ollama => std::sync::Arc::new(
-            Ollama::new(connection.default_model.clone()).with_base_url(connection.base_url.clone()),
+            Ollama::new(connection.default_model.clone())
+                .with_base_url(connection.base_url.clone()),
         ),
     };
 

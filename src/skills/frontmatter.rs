@@ -28,13 +28,20 @@ pub struct ParsedFrontmatter {
 /// deliberately not a general YAML parser, since skill frontmatter never
 /// needs more than this.
 pub fn parse_frontmatter(content: &str) -> Result<(ParsedFrontmatter, String), FrontmatterError> {
-    let content = content.strip_prefix("---\n").or_else(|| content.strip_prefix("---\r\n"))
+    let content = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
         .ok_or(FrontmatterError::MissingFrontmatter)?;
 
-    let end = content.find("\n---").ok_or(FrontmatterError::MissingFrontmatter)?;
+    let end = content
+        .find("\n---")
+        .ok_or(FrontmatterError::MissingFrontmatter)?;
     let block = &content[..end];
     let after_delim = &content[end + 4..];
-    let body = after_delim.strip_prefix('\n').unwrap_or(after_delim).to_string();
+    let body = after_delim
+        .strip_prefix('\n')
+        .unwrap_or(after_delim)
+        .to_string();
 
     let mut name = None;
     let mut description = None;
@@ -46,7 +53,9 @@ pub fn parse_frontmatter(content: &str) -> Result<(ParsedFrontmatter, String), F
         if line.is_empty() {
             continue;
         }
-        let Some((key, value)) = line.split_once(':') else { continue };
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
         let key = key.trim();
         let value = value.trim();
         match key {
@@ -61,7 +70,15 @@ pub fn parse_frontmatter(content: &str) -> Result<(ParsedFrontmatter, String), F
     let name = name.ok_or(FrontmatterError::MissingField("name"))?;
     let description = description.ok_or(FrontmatterError::MissingField("description"))?;
 
-    Ok((ParsedFrontmatter { name, description, globs, always_apply }, body))
+    Ok((
+        ParsedFrontmatter {
+            name,
+            description,
+            globs,
+            always_apply,
+        },
+        body,
+    ))
 }
 
 fn unquote(value: &str) -> String {
@@ -115,7 +132,9 @@ mod tests {
 
     #[test]
     fn parses_name_and_description() {
-        let (fm, body) = parse_frontmatter("---\nname: pdf\ndescription: Extract PDFs\n---\nDo the thing.").unwrap();
+        let (fm, body) =
+            parse_frontmatter("---\nname: pdf\ndescription: Extract PDFs\n---\nDo the thing.")
+                .unwrap();
         assert_eq!(fm.name, "pdf");
         assert_eq!(fm.description, "Extract PDFs");
         assert_eq!(body, "Do the thing.");
@@ -123,14 +142,18 @@ mod tests {
 
     #[test]
     fn parses_quoted_values() {
-        let (fm, _) = parse_frontmatter("---\nname: \"pdf\"\ndescription: 'Extract PDFs'\n---\nbody").unwrap();
+        let (fm, _) =
+            parse_frontmatter("---\nname: \"pdf\"\ndescription: 'Extract PDFs'\n---\nbody")
+                .unwrap();
         assert_eq!(fm.name, "pdf");
         assert_eq!(fm.description, "Extract PDFs");
     }
 
     #[test]
     fn parses_always_apply_true() {
-        let (fm, _) = parse_frontmatter("---\nname: a\ndescription: b\nalwaysApply: true\n---\nbody").unwrap();
+        let (fm, _) =
+            parse_frontmatter("---\nname: a\ndescription: b\nalwaysApply: true\n---\nbody")
+                .unwrap();
         assert!(fm.always_apply);
     }
 
@@ -142,7 +165,10 @@ mod tests {
 
     #[test]
     fn parses_globs_inline_array() {
-        let (fm, _) = parse_frontmatter("---\nname: a\ndescription: b\nglobs: [\"*.pdf\", \"*.docx\"]\n---\nbody").unwrap();
+        let (fm, _) = parse_frontmatter(
+            "---\nname: a\ndescription: b\nglobs: [\"*.pdf\", \"*.docx\"]\n---\nbody",
+        )
+        .unwrap();
         assert_eq!(fm.globs, vec!["*.pdf".to_string(), "*.docx".to_string()]);
     }
 
@@ -167,36 +193,64 @@ mod tests {
     #[test]
     fn errors_when_description_missing() {
         let result = parse_frontmatter("---\nname: a\n---\nbody");
-        assert_eq!(result.unwrap_err(), FrontmatterError::MissingField("description"));
+        assert_eq!(
+            result.unwrap_err(),
+            FrontmatterError::MissingField("description")
+        );
     }
 
     #[test]
     fn classify_plain_md_is_always_model_invoked() {
-        let fm = ParsedFrontmatter { name: "a".into(), description: "b".into(), globs: vec!["*.pdf".into()], always_apply: true };
+        let fm = ParsedFrontmatter {
+            name: "a".into(),
+            description: "b".into(),
+            globs: vec!["*.pdf".into()],
+            always_apply: true,
+        };
         assert_eq!(classify(&fm, false), LoadMode::ModelInvoked);
     }
 
     #[test]
     fn classify_mdc_always_apply() {
-        let fm = ParsedFrontmatter { name: "a".into(), description: "b".into(), globs: vec![], always_apply: true };
+        let fm = ParsedFrontmatter {
+            name: "a".into(),
+            description: "b".into(),
+            globs: vec![],
+            always_apply: true,
+        };
         assert_eq!(classify(&fm, true), LoadMode::AlwaysApply);
     }
 
     #[test]
     fn classify_mdc_globs() {
-        let fm = ParsedFrontmatter { name: "a".into(), description: "b".into(), globs: vec!["*.pdf".into()], always_apply: false };
+        let fm = ParsedFrontmatter {
+            name: "a".into(),
+            description: "b".into(),
+            globs: vec!["*.pdf".into()],
+            always_apply: false,
+        };
         assert_eq!(classify(&fm, true), LoadMode::Globs(vec!["*.pdf".into()]));
     }
 
     #[test]
     fn classify_mdc_with_neither_is_model_invoked() {
-        let fm = ParsedFrontmatter { name: "a".into(), description: "b".into(), globs: vec![], always_apply: false };
+        let fm = ParsedFrontmatter {
+            name: "a".into(),
+            description: "b".into(),
+            globs: vec![],
+            always_apply: false,
+        };
         assert_eq!(classify(&fm, true), LoadMode::ModelInvoked);
     }
 
     #[test]
     fn classify_always_apply_wins_over_globs() {
-        let fm = ParsedFrontmatter { name: "a".into(), description: "b".into(), globs: vec!["*.pdf".into()], always_apply: true };
+        let fm = ParsedFrontmatter {
+            name: "a".into(),
+            description: "b".into(),
+            globs: vec!["*.pdf".into()],
+            always_apply: true,
+        };
         assert_eq!(classify(&fm, true), LoadMode::AlwaysApply);
     }
 }

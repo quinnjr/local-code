@@ -1,4 +1,4 @@
-use crate::config::mcp_servers::{load_mcp_servers_raw, save_mcp_servers, McpTransportConfig};
+use crate::config::mcp_servers::{McpTransportConfig, load_mcp_servers_raw, save_mcp_servers};
 use crate::config::paths::Paths;
 use std::io::Write;
 
@@ -7,7 +7,10 @@ pub fn list<W: Write>(paths: &Paths, mut out: W) -> anyhow::Result<()> {
     // rather than resolving and printing the real secret to the screen.
     let servers = load_mcp_servers_raw(&paths.user_config_dir, &paths.project_config_dir)?;
     if servers.is_empty() {
-        writeln!(out, "No MCP servers configured. Run `/mcp add` inside the TUI.")?;
+        writeln!(
+            out,
+            "No MCP servers configured. Run `/mcp add` inside the TUI."
+        )?;
         return Ok(());
     }
     for server in &servers {
@@ -70,7 +73,11 @@ mod tests {
         let paths = test_paths(dir.path());
         let mut out = Vec::new();
         list(&paths, &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("No MCP servers configured"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("No MCP servers configured")
+        );
     }
 
     #[test]
@@ -83,7 +90,10 @@ mod tests {
                 name: "fs".into(),
                 transport: McpTransportConfig::Stdio {
                     command: "npx".into(),
-                    args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+                    args: vec![
+                        "-y".into(),
+                        "@modelcontextprotocol/server-filesystem".into(),
+                    ],
                 },
             }],
         )
@@ -132,7 +142,10 @@ mod tests {
             &[
                 McpServerConfig {
                     name: "gone".into(),
-                    transport: McpTransportConfig::Http { url: "http://x".into(), headers: HashMap::new() },
+                    transport: McpTransportConfig::Http {
+                        url: "http://x".into(),
+                        headers: HashMap::new(),
+                    },
                 },
                 McpServerConfig {
                     name: "kept".into(),
@@ -166,7 +179,10 @@ mod tests {
             &paths.project_config_dir,
             &[McpServerConfig {
                 name: "gone".into(),
-                transport: McpTransportConfig::Http { url: "http://x".into(), headers: HashMap::new() },
+                transport: McpTransportConfig::Http {
+                    url: "http://x".into(),
+                    headers: HashMap::new(),
+                },
             }],
         )
         .unwrap();
@@ -174,7 +190,8 @@ mod tests {
         let mut out = Vec::new();
         remove(&paths, "gone", &mut out).unwrap();
 
-        let remaining = load_mcp_servers_raw(&paths.user_config_dir, &paths.project_config_dir).unwrap();
+        let remaining =
+            load_mcp_servers_raw(&paths.user_config_dir, &paths.project_config_dir).unwrap();
         assert!(remaining.is_empty());
     }
 
@@ -184,7 +201,11 @@ mod tests {
         let paths = test_paths(dir.path());
         let mut out = Vec::new();
         remove(&paths, "does-not-exist", &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("No MCP server named"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("No MCP server named")
+        );
     }
 
     #[test]

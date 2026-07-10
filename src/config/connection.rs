@@ -130,10 +130,7 @@ fn load_one(path: &Path) -> Result<ConnectionsFile, ConnectionsError> {
 /// Used by `connections remove` — removal always targets the project-level file
 /// since that's the file this CLI writes to (user-level file is hand-edited or
 /// written by `connections add` when the user chooses to save it there).
-pub fn save_connections(
-    dir: &Path,
-    connections: &[Connection],
-) -> Result<(), ConnectionsError> {
+pub fn save_connections(dir: &Path, connections: &[Connection]) -> Result<(), ConnectionsError> {
     fs::create_dir_all(dir).map_err(|source| ConnectionsError::Read {
         path: dir.to_path_buf(),
         source,

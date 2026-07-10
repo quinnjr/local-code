@@ -34,8 +34,8 @@ pub fn InputBox(props: &InputBoxProps, _hooks: &mut ntui::Hooks) -> ntui::Elemen
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ntui::testing::TestTerminal;
     use ntui::Element;
+    use ntui::testing::TestTerminal;
 
     #[tokio::test]
     async fn renders_current_buffer_with_cursor_when_enabled() {

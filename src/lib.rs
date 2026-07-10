@@ -1,11 +1,11 @@
-pub mod config;
-pub mod cli;
-pub mod context;
-pub mod permissions;
 pub mod agent;
+pub mod cli;
+pub mod config;
+pub mod context;
 pub mod init;
-pub mod memory;
-pub mod tui;
 pub mod mcp;
+pub mod memory;
+pub mod permissions;
 pub mod session;
 pub mod skills;
+pub mod tui;

@@ -8,15 +8,17 @@ use daimon::stream::StreamEvent;
 use daimon::tool::Tool;
 use futures::StreamExt;
 use ntui::props::{Dimension, FlexDirection};
-use ntui::{component, element, Cleanup, Element, KeyCode};
+use ntui::{Cleanup, Element, KeyCode, component, element};
 
 use crate::permissions::types::{PermissionDecision, PermissionTier};
 use crate::tui::components::transcript::{Transcript, TranscriptProps};
-use crate::tui::components::{Dashboard, DashboardProps, Footer, FooterProps, InputBox, InputBoxProps};
+use crate::tui::components::{
+    Dashboard, DashboardProps, Footer, FooterProps, InputBox, InputBoxProps,
+};
 use crate::tui::permission_prompter::NtuiPermissionPrompter;
 use crate::tui::state::{
-    find_tool_call_mut, toggle_last_tool_call_expanded, ToolCallEntry, ToolCallResult,
-    TranscriptEntry, UsageSummary,
+    ToolCallEntry, ToolCallResult, TranscriptEntry, UsageSummary, find_tool_call_mut,
+    toggle_last_tool_call_expanded,
 };
 
 #[derive(Clone)]
@@ -831,7 +833,11 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
 
     let app_handle = hooks.use_app();
     hooks.use_input(move |ev, _ctx| {
-        if ev.code == KeyCode::Char('c') && ev.modifiers.contains(ntui::hooks::input::KeyModifiers::CONTROL) {
+        if ev.code == KeyCode::Char('c')
+            && ev
+                .modifiers
+                .contains(ntui::hooks::input::KeyModifiers::CONTROL)
+        {
             app_handle.exit();
         }
     });
@@ -922,13 +928,17 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
     match command {
         SlashCommand::Help => {
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text: HELP_TEXT.to_string() });
+                entries.push(TranscriptEntry::SystemNotice {
+                    text: HELP_TEXT.to_string(),
+                });
             });
         }
         SlashCommand::Unknown { raw } => {
             ctx.transcript.update(|entries| {
                 entries.push(TranscriptEntry::SystemNotice {
-                    text: format!("'{raw}' is not a recognized command. Type /help to see the list."),
+                    text: format!(
+                        "'{raw}' is not a recognized command. Type /help to see the list."
+                    ),
                 });
             });
         }
@@ -951,7 +961,9 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             if let Err(e) = crate::session::store::save_session(&new_path, &fresh) {
                 ctx.transcript.update(|entries| {
                     entries.push(TranscriptEntry::SystemNotice {
-                        text: format!("cleared transcript, but failed to start a new session file: {e}"),
+                        text: format!(
+                            "cleared transcript, but failed to start a new session file: {e}"
+                        ),
                     });
                 });
             }
@@ -959,11 +971,15 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             ctx.created_at.set(new_created_at);
         }
         SlashCommand::Model => {
-            match crate::config::connection::load_connections(&ctx.user_config_dir, &ctx.project_config_dir) {
+            match crate::config::connection::load_connections(
+                &ctx.user_config_dir,
+                &ctx.project_config_dir,
+            ) {
                 Ok(connections) if connections.is_empty() => {
                     ctx.transcript.update(|entries| {
                         entries.push(TranscriptEntry::SystemNotice {
-                            text: "no connections configured; run `local-code connections add`".to_string(),
+                            text: "no connections configured; run `local-code connections add`"
+                                .to_string(),
                         });
                     });
                 }
@@ -992,7 +1008,9 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                             ),
                         });
                     });
-                    ctx.pending_menu.set(PendingMenu::ModelChoice(choices.into_iter().take(9).collect()));
+                    ctx.pending_menu.set(PendingMenu::ModelChoice(
+                        choices.into_iter().take(9).collect(),
+                    ));
                 }
                 Err(e) => {
                     ctx.transcript.update(|entries| {
@@ -1011,8 +1029,16 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                  1) ask\n2) auto-accept-edits\n3) full-auto\n\
                  (press a digit key to switch, or Ctrl+A to cycle)\n\
                  always-allow: {}\nalways-deny: {}",
-                if ctx.always_allow.is_empty() { "(none)".to_string() } else { ctx.always_allow.join(", ") },
-                if ctx.always_deny.is_empty() { "(none)".to_string() } else { ctx.always_deny.join(", ") },
+                if ctx.always_allow.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    ctx.always_allow.join(", ")
+                },
+                if ctx.always_deny.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    ctx.always_deny.join(", ")
+                },
             );
             ctx.transcript.update(|entries| {
                 entries.push(TranscriptEntry::SystemNotice { text });
@@ -1267,10 +1293,15 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                         .collect();
                     ctx.transcript.update(|entries| {
                         entries.push(TranscriptEntry::SystemNotice {
-                            text: format!("Select a session to resume (press the digit key):\n{}", listing.join("\n")),
+                            text: format!(
+                                "Select a session to resume (press the digit key):\n{}",
+                                listing.join("\n")
+                            ),
                         });
                     });
-                    ctx.pending_menu.set(PendingMenu::ResumeChoice(sessions.into_iter().take(9).collect()));
+                    ctx.pending_menu.set(PendingMenu::ResumeChoice(
+                        sessions.into_iter().take(9).collect(),
+                    ));
                 }
                 Err(e) => {
                     ctx.transcript.update(|entries| {
@@ -1318,7 +1349,9 @@ fn format_turn_error(e: impl std::fmt::Display) -> String {
     let error_text = e.to_string();
     let lower = error_text.to_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
-        format!("error: request timed out — the local model server may be unresponsive ({error_text})")
+        format!(
+            "error: request timed out — the local model server may be unresponsive ({error_text})"
+        )
     } else {
         format!("error: {error_text}")
     }
@@ -1372,7 +1405,10 @@ async fn run_turn(
                     }));
                 });
             }
-            Ok(StreamEvent::ToolCallDelta { id, arguments_delta }) => {
+            Ok(StreamEvent::ToolCallDelta {
+                id,
+                arguments_delta,
+            }) => {
                 transcript.update(|entries| {
                     if let Some(call) = find_tool_call_mut(entries, &id) {
                         call.arguments_json.push_str(&arguments_delta);
@@ -1380,10 +1416,17 @@ async fn run_turn(
                 });
             }
             Ok(StreamEvent::ToolCallEnd { .. }) => {}
-            Ok(StreamEvent::ToolResult { id, content, is_error }) => {
+            Ok(StreamEvent::ToolResult {
+                id,
+                content,
+                is_error,
+            }) => {
                 transcript.update(|entries| {
                     if let Some(call) = find_tool_call_mut(entries, &id) {
-                        call.result = Some(ToolCallResult { content: content.into(), is_error });
+                        call.result = Some(ToolCallResult {
+                            content: content.into(),
+                            is_error,
+                        });
                     }
                 });
             }
@@ -1427,7 +1470,10 @@ async fn run_turn(
         session.entries = transcript.get();
         session.messages = messages;
         if let Err(e) = crate::session::store::save_session(&session_path.get(), &session) {
-            eprintln!("warning: failed to persist session to {}: {e}", session_path.get().display());
+            eprintln!(
+                "warning: failed to persist session to {}: {e}",
+                session_path.get().display()
+            );
         }
     }
 
@@ -1505,11 +1551,19 @@ mod tests {
 
         type_and_submit(&mut t, "/mcp add").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("Server name:"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("Server name:"),
+            "{}",
+            t.frame_text()
+        );
 
         type_and_submit(&mut t, "remote-tools").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("Choose a transport"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("Choose a transport"),
+            "{}",
+            t.frame_text()
+        );
 
         type_and_submit(&mut t, "4").await;
         t.tick().await.unwrap();
@@ -1558,7 +1612,11 @@ mod tests {
         t.tick().await.unwrap();
         type_and_submit(&mut t, "1").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("npm package name:"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("npm package name:"),
+            "{}",
+            t.frame_text()
+        );
 
         type_and_submit(&mut t, "definitely-not-a-real-npm-package-xyz-123").await;
         t.tick().await.unwrap();
@@ -1609,7 +1667,11 @@ mod tests {
 
         t.send_key(KeyCode::Esc).unwrap();
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("cancelled /mcp add"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("cancelled /mcp add"),
+            "{}",
+            t.frame_text()
+        );
 
         // Esc cancelled the wizard, so ordinary chat input works again —
         // confirms pending_menu was actually reset to None, not left stuck.
@@ -1639,7 +1701,11 @@ mod tests {
         t.tick().await.unwrap();
         type_and_submit(&mut t, "2").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("pipx package name:"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("pipx package name:"),
+            "{}",
+            t.frame_text()
+        );
 
         type_and_submit(&mut t, "some-pipx-pkg").await;
         t.tick().await.unwrap();
@@ -1761,7 +1827,11 @@ mod tests {
         t.tick().await.unwrap();
         type_and_submit(&mut t, "6").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("WebSocket URL:"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("WebSocket URL:"),
+            "{}",
+            t.frame_text()
+        );
 
         type_and_submit(&mut t, "ws://127.0.0.1:1").await;
         for _ in 0..10 {
@@ -1808,7 +1878,9 @@ mod tests {
     }
     impl StreamingToolCallModel {
         fn new() -> Self {
-            Self { call_count: std::sync::atomic::AtomicUsize::new(0) }
+            Self {
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+            }
         }
     }
     impl daimon::model::Model for StreamingToolCallModel {
@@ -1816,15 +1888,22 @@ mod tests {
             unreachable!("prompt_stream only ever calls generate_stream_erased")
         }
         async fn generate_stream(&self, _request: &ChatRequest) -> daimon::Result<ResponseStream> {
-            let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if count == 0 {
                 Ok(Box::pin(futures::stream::iter(vec![
-                    Ok(StreamEvent::ToolCallStart { id: "call_1".into(), name: "adder".into() }),
+                    Ok(StreamEvent::ToolCallStart {
+                        id: "call_1".into(),
+                        name: "adder".into(),
+                    }),
                     Ok(StreamEvent::ToolCallDelta {
                         id: "call_1".into(),
                         arguments_delta: "{\"a\":2,\"b\":3}".into(),
                     }),
-                    Ok(StreamEvent::ToolCallEnd { id: "call_1".into() }),
+                    Ok(StreamEvent::ToolCallEnd {
+                        id: "call_1".into(),
+                    }),
                     Ok(StreamEvent::Done),
                 ])))
             } else {
@@ -1851,7 +1930,10 @@ mod tests {
                 "required": ["a", "b"],
             })
         }
-        async fn execute(&self, input: &serde_json::Value) -> daimon::Result<daimon::tool::ToolOutput> {
+        async fn execute(
+            &self,
+            input: &serde_json::Value,
+        ) -> daimon::Result<daimon::tool::ToolOutput> {
             let a = input["a"].as_i64().unwrap_or(0);
             let b = input["b"].as_i64().unwrap_or(0);
             Ok(daimon::tool::ToolOutput::text(format!("{}", a + b)))
@@ -1939,7 +2021,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn run_turn_persists_tool_call_and_result_messages_to_memory() {
         let slot = AgentSlot::default();
-        let props = RunTurnHarnessProps { slot: slot.clone(), mode: HarnessMode::ToolCall };
+        let props = RunTurnHarnessProps {
+            slot: slot.clone(),
+            mode: HarnessMode::ToolCall,
+        };
         let mut t = TestTerminal::new(10, 1, Element::component::<RunTurnHarness>(props)).unwrap();
 
         for _ in 0..30 {
@@ -1947,11 +2032,18 @@ mod tests {
             t.tick().await.unwrap();
         }
 
-        let agent = slot.0.lock().unwrap().clone().expect("harness should have built an agent");
+        let agent = slot
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("harness should have built an agent");
         let messages = agent.memory().get_messages_erased().await.unwrap();
 
         assert!(
-            messages.iter().any(|m| m.role == Role::User && m.content.as_deref() == Some("add 2 and 3")),
+            messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content.as_deref() == Some("add 2 and 3")),
             "missing user message: {messages:?}"
         );
         assert!(
@@ -1970,7 +2062,9 @@ mod tests {
             "missing tool-result message: {messages:?}"
         );
         assert!(
-            messages.iter().any(|m| m.role == Role::Assistant && m.content.as_deref() == Some("The sum is 5")),
+            messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content.as_deref() == Some("The sum is 5")),
             "missing final assistant text message: {messages:?}"
         );
         // Exactly these four: user, assistant-with-tool-calls, tool-result,
@@ -1985,7 +2079,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn run_turn_persists_plain_text_reply_to_memory() {
         let slot = AgentSlot::default();
-        let props = RunTurnHarnessProps { slot: slot.clone(), mode: HarnessMode::TextOnly };
+        let props = RunTurnHarnessProps {
+            slot: slot.clone(),
+            mode: HarnessMode::TextOnly,
+        };
         let mut t = TestTerminal::new(10, 1, Element::component::<RunTurnHarness>(props)).unwrap();
 
         for _ in 0..30 {
@@ -1993,15 +2090,24 @@ mod tests {
             t.tick().await.unwrap();
         }
 
-        let agent = slot.0.lock().unwrap().clone().expect("harness should have built an agent");
+        let agent = slot
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("harness should have built an agent");
         let messages = agent.memory().get_messages_erased().await.unwrap();
 
         assert!(
-            messages.iter().any(|m| m.role == Role::User && m.content.as_deref() == Some("add 2 and 3")),
+            messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content.as_deref() == Some("add 2 and 3")),
             "missing user message: {messages:?}"
         );
         assert!(
-            messages.iter().any(|m| m.role == Role::Assistant && m.content.as_deref() == Some("Hello, world")),
+            messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content.as_deref() == Some("Hello, world")),
             "missing assistant reply message: {messages:?}"
         );
         assert_eq!(messages.len(), 2, "{messages:?}");
@@ -2026,7 +2132,10 @@ mod tests {
         // not a value this test controls directly — assert usage moved off
         // its zero default rather than pin an exact, implementation-detail
         // number.
-        assert!(!text.contains("0 in / 0 out"), "usage should have accumulated: {text}");
+        assert!(
+            !text.contains("0 in / 0 out"),
+            "usage should have accumulated: {text}"
+        );
         assert!(text.contains("ready"), "turn should have finished: {text}");
     }
 
@@ -2049,8 +2158,20 @@ mod tests {
         type_and_submit(&mut t, "/help").await;
         t.tick().await.unwrap();
         let text = t.frame_text();
-        for command in ["/model", "/connections", "/init", "/permissions", "/compact", "/resume", "/clear", "/help"] {
-            assert!(text.contains(command), "missing {command} in help text: {text}");
+        for command in [
+            "/model",
+            "/connections",
+            "/init",
+            "/permissions",
+            "/compact",
+            "/resume",
+            "/clear",
+            "/help",
+        ] {
+            assert!(
+                text.contains(command),
+                "missing {command} in help text: {text}"
+            );
         }
     }
 
@@ -2061,7 +2182,10 @@ mod tests {
         t.tick().await.unwrap();
         let text = t.frame_text();
         assert!(text.contains("not a recognized command"), "{text}");
-        assert!(!text.contains("Hello, world"), "must not have run a turn: {text}");
+        assert!(
+            !text.contains("Hello, world"),
+            "must not have run a turn: {text}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2122,15 +2246,25 @@ mod tests {
             .find(|p| p.file_name().unwrap() != "original.json")
             .expect("a new session file distinct from original.json should exist");
         let new_session = crate::session::store::load_session(new_path).unwrap();
-        assert!(new_session.entries.is_empty(), "new session should start with an empty transcript");
-        assert!(new_session.messages.is_empty(), "new session should start with empty message history");
+        assert!(
+            new_session.entries.is_empty(),
+            "new session should start with an empty transcript"
+        );
+        assert!(
+            new_session.messages.is_empty(),
+            "new session should start with empty message history"
+        );
 
         // original.json was written to by the "hi there" turn (which ran before
         // /clear), so it should still hold that turn's history — /clear must not
         // retroactively wipe it, only stop using it going forward.
-        let original = crate::session::store::load_session(&dir.path().join("original.json")).unwrap();
+        let original =
+            crate::session::store::load_session(&dir.path().join("original.json")).unwrap();
         assert!(
-            original.entries.iter().any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there")),
+            original
+                .entries
+                .iter()
+                .any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there")),
             "original.json should retain the pre-/clear turn history"
         );
     }
@@ -2163,7 +2297,12 @@ mod tests {
         }
 
         let saved = crate::session::store::load_session(&session_path).unwrap();
-        assert!(saved.entries.iter().any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there")));
+        assert!(
+            saved
+                .entries
+                .iter()
+                .any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there"))
+        );
         assert!(!saved.messages.is_empty());
         assert_eq!(saved.created_at, "2026-07-06T00:00:00Z");
     }
@@ -2225,7 +2364,11 @@ mod tests {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/model").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("no connections configured"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("no connections configured"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2233,7 +2376,11 @@ mod tests {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/permissions").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("Current tier: full-auto"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("Current tier: full-auto"),
+            "{}",
+            t.frame_text()
+        );
 
         t.send_key(KeyCode::Char('1')).unwrap();
         t.tick().await.unwrap();
@@ -2245,7 +2392,11 @@ mod tests {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/connections list").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("No connections configured"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("No connections configured"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2253,7 +2404,11 @@ mod tests {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/mcp list").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("No MCP servers configured"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("No MCP servers configured"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2261,7 +2416,11 @@ mod tests {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/mcp add").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("Server name:"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("Server name:"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2269,7 +2428,11 @@ mod tests {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/connections add").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("local-code connections add"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("local-code connections add"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2280,7 +2443,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             t.tick().await.unwrap();
         }
-        assert!(t.frame_text().contains("nothing to compact yet"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("nothing to compact yet"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -2389,7 +2556,11 @@ models = ["test-model"]
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             t.tick().await.unwrap();
         }
-        assert!(t.frame_text().contains("switched to test-ollama"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("switched to test-ollama"),
+            "{}",
+            t.frame_text()
+        );
 
         type_and_submit(&mut t, "/compact").await;
         for _ in 0..60 {
@@ -2448,7 +2619,11 @@ models = ["test-model"]
         // Sanity check: the Header starts out showing test_props()'s
         // original connection/model, exactly as it did before this fix.
         assert!(t.frame_text().contains("local-vllm"), "{}", t.frame_text());
-        assert!(t.frame_text().contains("qwen2.5-coder-32b"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("qwen2.5-coder-32b"),
+            "{}",
+            t.frame_text()
+        );
 
         type_and_submit(&mut t, "/model").await;
         t.tick().await.unwrap();
@@ -2459,7 +2634,11 @@ models = ["test-model"]
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             t.tick().await.unwrap();
         }
-        assert!(t.frame_text().contains("switched to test-ollama"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("switched to test-ollama"),
+            "{}",
+            t.frame_text()
+        );
 
         let text = t.frame_text();
         assert!(
@@ -2497,7 +2676,11 @@ models = ["test-model"]
             t.tick().await.unwrap();
         }
 
-        assert!(t.frame_text().contains("wrote AGENTS.md"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("wrote AGENTS.md"),
+            "{}",
+            t.frame_text()
+        );
         assert!(dir.path().join("AGENTS.md").exists());
     }
 
@@ -2509,7 +2692,11 @@ models = ["test-model"]
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
         type_and_submit(&mut t, "/resume").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("no previous sessions found"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("no previous sessions found"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     // `/resume`'s listing reads `list_sessions(&ctx.user_state_dir,
@@ -2532,8 +2719,11 @@ models = ["test-model"]
             PermissionTier::FullAuto,
             "2026-07-06T09:00:00Z".into(),
         );
-        session.entries.push(TranscriptEntry::UserTurn { text: "earlier turn".into() });
-        let path = crate::session::paths::new_session_path(dir.path(), &project_root, chrono::Utc::now());
+        session.entries.push(TranscriptEntry::UserTurn {
+            text: "earlier turn".into(),
+        });
+        let path =
+            crate::session::paths::new_session_path(dir.path(), &project_root, chrono::Utc::now());
         crate::session::store::save_session(&path, &session).unwrap();
 
         let mut props = test_props();
@@ -2542,7 +2732,11 @@ models = ["test-model"]
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
         type_and_submit(&mut t, "/resume").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("some-connection"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("some-connection"),
+            "{}",
+            t.frame_text()
+        );
 
         // Resuming when the session's connection is no longer configured
         // (test_props() sets up no real connections.toml) surfaces the
@@ -2551,7 +2745,11 @@ models = ["test-model"]
         // reachable one without a full connections.toml fixture.
         t.send_key(KeyCode::Char('1')).unwrap();
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("no longer exists"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("no longer exists"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     // Closes the coverage gap the test above deliberately leaves open: that
@@ -2588,8 +2786,14 @@ models = ["irrelevant-default", "resumed-model"]
             PermissionTier::Ask,
             "2026-07-06T09:00:00Z".into(),
         );
-        session.entries.push(TranscriptEntry::UserTurn { text: "earlier turn".into() });
-        let path = crate::session::paths::new_session_path(state_dir.path(), &project_root, chrono::Utc::now());
+        session.entries.push(TranscriptEntry::UserTurn {
+            text: "earlier turn".into(),
+        });
+        let path = crate::session::paths::new_session_path(
+            state_dir.path(),
+            &project_root,
+            chrono::Utc::now(),
+        );
         crate::session::store::save_session(&path, &session).unwrap();
 
         let mut props = test_props();
@@ -2606,7 +2810,11 @@ models = ["irrelevant-default", "resumed-model"]
 
         type_and_submit(&mut t, "/resume").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("resumed-connection"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("resumed-connection"),
+            "{}",
+            t.frame_text()
+        );
 
         t.send_key(KeyCode::Char('1')).unwrap();
         for _ in 0..20 {
@@ -2618,7 +2826,9 @@ models = ["irrelevant-default", "resumed-model"]
         assert!(!text.contains("no longer exists"), "{text}");
         assert!(!text.contains("failed to resume"), "{text}");
         assert!(text.contains("earlier turn"), "{text}");
-        assert!(text.contains("resumed-connection") && text.contains("resumed-model"), "{text}");
+        assert!(
+            text.contains("resumed-connection") && text.contains("resumed-model"),
+            "{text}"
+        );
     }
 }
-

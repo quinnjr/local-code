@@ -66,12 +66,19 @@ impl GitlabClient {
         req
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, SkillHostError> {
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<T, SkillHostError> {
         let response = self.request(url).send().await?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(SkillHostError::Api { status: status.as_u16(), url: url.to_string(), body });
+            return Err(SkillHostError::Api {
+                status: status.as_u16(),
+                url: url.to_string(),
+                body,
+            });
         }
         response.json::<T>().await.map_err(SkillHostError::Request)
     }
@@ -83,13 +90,24 @@ impl GitlabClient {
         urlencoding_path(project_path)
     }
 
-    pub async fn resolve_default_branch(&self, project_path: &str) -> Result<String, SkillHostError> {
-        let url = format!("{}/projects/{}", self.api_base, Self::encoded_id(project_path));
+    pub async fn resolve_default_branch(
+        &self,
+        project_path: &str,
+    ) -> Result<String, SkillHostError> {
+        let url = format!(
+            "{}/projects/{}",
+            self.api_base,
+            Self::encoded_id(project_path)
+        );
         let info: ProjectInfo = self.get_json(&url).await?;
         Ok(info.default_branch)
     }
 
-    pub async fn resolve_commit_sha(&self, project_path: &str, git_ref: &str) -> Result<String, SkillHostError> {
+    pub async fn resolve_commit_sha(
+        &self,
+        project_path: &str,
+        git_ref: &str,
+    ) -> Result<String, SkillHostError> {
         let url = format!(
             "{}/projects/{}/repository/commits/{}",
             self.api_base,
@@ -123,7 +141,11 @@ impl GitlabClient {
             let status = response.status();
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                return Err(SkillHostError::Api { status: status.as_u16(), url, body });
+                return Err(SkillHostError::Api {
+                    status: status.as_u16(),
+                    url,
+                    body,
+                });
             }
             let next = next_link_from_header(response.headers());
             let page: Vec<TreeEntry> = response.json().await.map_err(SkillHostError::Request)?;
@@ -144,33 +166,57 @@ impl GitlabClient {
         // Every blob's raw-content fetch is independent — download them
         // concurrently instead of one round trip at a time, since this is
         // the dominant cost for skills with more than a couple of files.
-        let downloads = entries.iter().filter(|e| e.entry_type == "blob").map(|entry| {
-            let id = id.clone();
-            async move {
-                let raw_url = format!(
-                    "{}/projects/{id}/repository/files/{}/raw?ref={commit_sha}",
-                    self.api_base,
-                    urlencoding_path(&entry.path)
-                );
-                let response = self.request(&raw_url).send().await?;
-                let status = response.status();
-                if !status.is_success() {
-                    let body = response.text().await.unwrap_or_default();
-                    return Err(SkillHostError::Api { status: status.as_u16(), url: raw_url, body });
+        let downloads = entries
+            .iter()
+            .filter(|e| e.entry_type == "blob")
+            .map(|entry| {
+                let id = id.clone();
+                async move {
+                    let raw_url = format!(
+                        "{}/projects/{id}/repository/files/{}/raw?ref={commit_sha}",
+                        self.api_base,
+                        urlencoding_path(&entry.path)
+                    );
+                    let response = self.request(&raw_url).send().await?;
+                    let status = response.status();
+                    if !status.is_success() {
+                        let body = response.text().await.unwrap_or_default();
+                        return Err(SkillHostError::Api {
+                            status: status.as_u16(),
+                            url: raw_url,
+                            body,
+                        });
+                    }
+                    let bytes = response
+                        .bytes()
+                        .await
+                        .map_err(SkillHostError::Request)?
+                        .to_vec();
+                    let relative = entry
+                        .path
+                        .strip_prefix(path)
+                        .unwrap_or(&entry.path)
+                        .trim_start_matches('/');
+                    Ok(FetchedFile {
+                        relative_path: PathBuf::from(relative),
+                        bytes,
+                    })
                 }
-                let bytes = response.bytes().await.map_err(SkillHostError::Request)?.to_vec();
-                let relative = entry.path.strip_prefix(path).unwrap_or(&entry.path).trim_start_matches('/');
-                Ok(FetchedFile { relative_path: PathBuf::from(relative), bytes })
-            }
-        });
-        futures::future::join_all(downloads).await.into_iter().collect()
+            });
+        futures::future::join_all(downloads)
+            .await
+            .into_iter()
+            .collect()
     }
 
     /// Walks prefixes of `raw_path` (split on `/`), longest first, calling
     /// `GET /projects/:encoded_prefix` for each until one resolves (200) —
     /// see design spec §2 "Deferred GitLab project-path resolution". Capped
     /// at 10 path segments.
-    pub async fn resolve_project_path(&self, raw_path: &str) -> Result<(String, String), SkillHostError> {
+    pub async fn resolve_project_path(
+        &self,
+        raw_path: &str,
+    ) -> Result<(String, String), SkillHostError> {
         let segments: Vec<&str> = raw_path.split('/').filter(|s| !s.is_empty()).collect();
         if segments.is_empty() || segments.len() > 10 {
             return Err(SkillHostError::InvalidSpec(raw_path.to_string()));
@@ -178,7 +224,11 @@ impl GitlabClient {
 
         for split_at in (1..=segments.len()).rev() {
             let candidate = segments[..split_at].join("/");
-            let url = format!("{}/projects/{}", self.api_base, Self::encoded_id(&candidate));
+            let url = format!(
+                "{}/projects/{}",
+                self.api_base,
+                Self::encoded_id(&candidate)
+            );
             let response = self.request(&url).send().await?;
             if response.status().is_success() {
                 let in_repo_path = segments[split_at..].join("/");
@@ -192,7 +242,10 @@ impl GitlabClient {
 /// GitLab requires the full `:id` path segment percent-encoded (including
 /// `/`), unlike the ref-encoding helper below which only needs to escape `/`.
 fn urlencoding_path(path: &str) -> String {
-    path.split('/').map(percent_encode_segment).collect::<Vec<_>>().join("%2F")
+    path.split('/')
+        .map(percent_encode_segment)
+        .collect::<Vec<_>>()
+        .join("%2F")
 }
 
 fn percent_encode_segment(segment: &str) -> String {
@@ -201,7 +254,9 @@ fn percent_encode_segment(segment: &str) -> String {
     let mut out = String::new();
     for byte in segment.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -236,49 +291,84 @@ mod gitlab_client_tests {
     #[tokio::test]
     async fn resolves_default_branch() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/projects/acme%2Fwidgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
         let client = GitlabClient::new_for_test(None, server.uri());
-        assert_eq!(client.resolve_default_branch("acme/widgets").await.unwrap(), "main");
+        assert_eq!(
+            client.resolve_default_branch("acme/widgets").await.unwrap(),
+            "main"
+        );
     }
 
     #[tokio::test]
     async fn resolves_commit_sha_using_gitlabs_id_field() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets/repository/commits/main"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "abc123"})))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/projects/acme%2Fwidgets/repository/commits/main"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "abc123"})),
+            )
+            .mount(&server)
+            .await;
         let client = GitlabClient::new_for_test(None, server.uri());
-        assert_eq!(client.resolve_commit_sha("acme/widgets", "main").await.unwrap(), "abc123");
+        assert_eq!(
+            client
+                .resolve_commit_sha("acme/widgets", "main")
+                .await
+                .unwrap(),
+            "abc123"
+        );
     }
 
     #[tokio::test]
     async fn sends_private_token_header_when_present() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets"))
+        Mock::given(method("GET"))
+            .and(path("/projects/acme%2Fwidgets"))
             .and(header("PRIVATE-TOKEN", "test-token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
         let client = GitlabClient::new_for_test(Some("test-token".to_string()), server.uri());
-        assert_eq!(client.resolve_default_branch("acme/widgets").await.unwrap(), "main");
+        assert_eq!(
+            client.resolve_default_branch("acme/widgets").await.unwrap(),
+            "main"
+        );
     }
 
     #[tokio::test]
     async fn fetches_files_from_a_flat_directory() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets/repository/tree"))
+        Mock::given(method("GET"))
+            .and(path("/projects/acme%2Fwidgets/repository/tree"))
             .and(query_param("path", "skills/pdf"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"path": "skills/pdf/SKILL.md", "type": "blob"}
             ])))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2FSKILL.md/raw"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2FSKILL.md/raw",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string("---\nname: pdf\n---\nbody"))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
 
         let client = GitlabClient::new_for_test(None, server.uri());
-        let files = client.fetch_directory_files("acme/widgets", "skills/pdf", "abc123").await.unwrap();
+        let files = client
+            .fetch_directory_files("acme/widgets", "skills/pdf", "abc123")
+            .await
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].relative_path, std::path::PathBuf::from("SKILL.md"));
     }
@@ -286,59 +376,108 @@ mod gitlab_client_tests {
     #[tokio::test]
     async fn fetches_files_from_nested_subdirectories_in_one_recursive_call() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets/repository/tree"))
+        Mock::given(method("GET"))
+            .and(path("/projects/acme%2Fwidgets/repository/tree"))
             .and(query_param("recursive", "true"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {"path": "skills/pdf/SKILL.md", "type": "blob"},
                 {"path": "skills/pdf/reference", "type": "tree"},
                 {"path": "skills/pdf/reference/notes.md", "type": "blob"}
             ])))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2FSKILL.md/raw"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("skill")).mount(&server).await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2Freference%2Fnotes.md/raw"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("notes")).mount(&server).await;
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2FSKILL.md/raw",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("skill"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2Freference%2Fnotes.md/raw",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("notes"))
+            .mount(&server)
+            .await;
 
         let client = GitlabClient::new_for_test(None, server.uri());
-        let mut files = client.fetch_directory_files("acme/widgets", "skills/pdf", "abc123").await.unwrap();
+        let mut files = client
+            .fetch_directory_files("acme/widgets", "skills/pdf", "abc123")
+            .await
+            .unwrap();
         files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         assert_eq!(files.len(), 2);
-        assert_eq!(files[1].relative_path, std::path::PathBuf::from("reference/notes.md"));
+        assert_eq!(
+            files[1].relative_path,
+            std::path::PathBuf::from("reference/notes.md")
+        );
     }
 
     #[tokio::test]
     async fn follows_link_header_pagination() {
         let server = MockServer::start().await;
-        let page2_url = format!("{}/projects/acme%2Fwidgets/repository/tree?page=2", server.uri());
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets/repository/tree"))
+        let page2_url = format!(
+            "{}/projects/acme%2Fwidgets/repository/tree?page=2",
+            server.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/projects/acme%2Fwidgets/repository/tree"))
             .and(query_param("path", "skills/pdf"))
-            .respond_with(ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!([{"path": "skills/pdf/a.md", "type": "blob"}]))
-                .insert_header("Link", format!("<{page2_url}>; rel=\"next\"")))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets/repository/tree"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([{"path": "skills/pdf/a.md", "type": "blob"}]))
+                    .insert_header("Link", format!("<{page2_url}>; rel=\"next\"")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/projects/acme%2Fwidgets/repository/tree"))
             .and(query_param("page", "2"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{"path": "skills/pdf/b.md", "type": "blob"}])))
-            .mount(&server).await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2Fa.md/raw"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("a")).mount(&server).await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2Fb.md/raw"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("b")).mount(&server).await;
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!([{"path": "skills/pdf/b.md", "type": "blob"}]),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2Fa.md/raw",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("a"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/projects/acme%2Fwidgets/repository/files/skills%2Fpdf%2Fb.md/raw",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("b"))
+            .mount(&server)
+            .await;
 
         let client = GitlabClient::new_for_test(None, server.uri());
-        let files = client.fetch_directory_files("acme/widgets", "skills/pdf", "abc123").await.unwrap();
+        let files = client
+            .fetch_directory_files("acme/widgets", "skills/pdf", "abc123")
+            .await
+            .unwrap();
         assert_eq!(files.len(), 2);
     }
 
     #[tokio::test]
     async fn surfaces_api_errors_with_status_and_body() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets"))
+        Mock::given(method("GET"))
+            .and(path("/projects/acme%2Fwidgets"))
             .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
-            .mount(&server).await;
+            .mount(&server)
+            .await;
         let client = GitlabClient::new_for_test(None, server.uri());
         let result = client.resolve_default_branch("acme/widgets").await;
-        assert!(matches!(result, Err(SkillHostError::Api { status: 404, .. })));
+        assert!(matches!(
+            result,
+            Err(SkillHostError::Api { status: 404, .. })
+        ));
     }
 
     // resolve_project_path
@@ -346,11 +485,19 @@ mod gitlab_client_tests {
     #[tokio::test]
     async fn resolve_project_path_finds_a_top_level_project() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/projects/acme%2Fwidgets"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/projects/acme%2Fwidgets"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
         let client = GitlabClient::new_for_test(None, server.uri());
-        let (project, in_repo) = client.resolve_project_path("acme/widgets/skills/pdf").await.unwrap();
+        let (project, in_repo) = client
+            .resolve_project_path("acme/widgets/skills/pdf")
+            .await
+            .unwrap();
         assert_eq!(project, "acme/widgets");
         assert_eq!(in_repo, "skills/pdf");
     }
@@ -358,13 +505,24 @@ mod gitlab_client_tests {
     #[tokio::test]
     async fn resolve_project_path_finds_a_one_level_nested_project() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/projects/group%2Fsub%2Fproj%2Fskills"))
-            .respond_with(ResponseTemplate::new(404)).mount(&server).await;
-        Mock::given(method("GET")).and(path("/projects/group%2Fsub%2Fproj"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/projects/group%2Fsub%2Fproj%2Fskills"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/projects/group%2Fsub%2Fproj"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
         let client = GitlabClient::new_for_test(None, server.uri());
-        let (project, in_repo) = client.resolve_project_path("group/sub/proj/skills").await.unwrap();
+        let (project, in_repo) = client
+            .resolve_project_path("group/sub/proj/skills")
+            .await
+            .unwrap();
         assert_eq!(project, "group/sub/proj");
         assert_eq!(in_repo, "skills");
     }
@@ -372,11 +530,19 @@ mod gitlab_client_tests {
     #[tokio::test]
     async fn resolve_project_path_finds_a_two_level_nested_project() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).and(path("/projects/a%2Fb%2Fc%2Fd"))
-            .respond_with(ResponseTemplate::new(404)).mount(&server).await;
-        Mock::given(method("GET")).and(path("/projects/a%2Fb%2Fc"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"default_branch": "main"})))
-            .mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/projects/a%2Fb%2Fc%2Fd"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/projects/a%2Fb%2Fc"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"default_branch": "main"})),
+            )
+            .mount(&server)
+            .await;
         let client = GitlabClient::new_for_test(None, server.uri());
         let (project, in_repo) = client.resolve_project_path("a/b/c/d").await.unwrap();
         assert_eq!(project, "a/b/c");
@@ -386,7 +552,10 @@ mod gitlab_client_tests {
     #[tokio::test]
     async fn resolve_project_path_errors_when_no_prefix_resolves() {
         let server = MockServer::start().await;
-        Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).mount(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
         let client = GitlabClient::new_for_test(None, server.uri());
         let result = client.resolve_project_path("a/b/c").await;
         assert!(matches!(result, Err(SkillHostError::InvalidSpec(_))));
@@ -395,7 +564,10 @@ mod gitlab_client_tests {
     #[tokio::test]
     async fn resolve_project_path_enforces_the_depth_cap() {
         let client = GitlabClient::new_for_test(None, "http://127.0.0.1:1".to_string());
-        let too_deep = (0..11).map(|i| format!("seg{i}")).collect::<Vec<_>>().join("/");
+        let too_deep = (0..11)
+            .map(|i| format!("seg{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
         let result = client.resolve_project_path(&too_deep).await;
         assert!(matches!(result, Err(SkillHostError::InvalidSpec(_))));
     }

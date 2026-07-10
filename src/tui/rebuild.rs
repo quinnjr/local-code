@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use daimon::agent::Agent;
-use daimon::model::types::Message;
 use daimon::model::SharedModel;
+use daimon::model::types::Message;
 use tokio::sync::oneshot;
 
 use crate::mcp::tool::NamespacedMcpTool;
@@ -45,7 +45,11 @@ pub fn rebuild_agent(
 ) -> (Arc<Agent>, Arc<PermissionGate>, ResponderHandle) {
     let prompter = NtuiPermissionPrompter::new(pending_permission);
     let responder = prompter.responder_handle();
-    let gate = Arc::new(PermissionGate::new(initial_tier, permission_settings, Arc::new(prompter)));
+    let gate = Arc::new(PermissionGate::new(
+        initial_tier,
+        permission_settings,
+        Arc::new(prompter),
+    ));
     let agent = Arc::new(
         build_streaming_agent_with_history(
             model,
@@ -76,7 +80,11 @@ pub async fn rebuild_agent_from_history(
     skills: Vec<Skill>,
     pending_permission: ntui::State<Option<PermissionRequest>>,
 ) -> (Arc<Agent>, Arc<PermissionGate>, ResponderHandle) {
-    let history = old_agent.memory().get_messages_erased().await.unwrap_or_default();
+    let history = old_agent
+        .memory()
+        .get_messages_erased()
+        .await
+        .unwrap_or_default();
     rebuild_agent(
         model,
         initial_tier,
@@ -95,7 +103,7 @@ mod tests {
     use daimon::model::types::{ChatRequest, ChatResponse, StopReason, Usage};
     use daimon::stream::ResponseStream;
     use ntui::testing::TestTerminal;
-    use ntui::{component, element, Element};
+    use ntui::{Element, component, element};
 
     struct EchoModel;
     impl daimon::model::Model for EchoModel {

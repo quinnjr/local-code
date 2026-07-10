@@ -50,7 +50,11 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_appends_without_evicting() {
-        let memory = SeededMemory::new((0..100).map(|i| Message::user(format!("msg {i}"))).collect());
+        let memory = SeededMemory::new(
+            (0..100)
+                .map(|i| Message::user(format!("msg {i}")))
+                .collect(),
+        );
         memory.add_message(Message::user("msg 100")).await.unwrap();
         let messages = memory.get_messages().await.unwrap();
         assert_eq!(messages.len(), 101);

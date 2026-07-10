@@ -21,7 +21,9 @@ pub fn discover_skills(paths: &Paths) -> Vec<Skill> {
     let mut skills = Vec::new();
 
     for (dir, scope) in scope_dirs(paths) {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let skill_dir = entry.path();
             if !skill_dir.is_dir() {
@@ -37,7 +39,10 @@ pub fn discover_skills(paths: &Paths) -> Vec<Skill> {
                 }
                 Err(SkillLoadError::NoSkillFile) => {} // not a skill directory, ignore silently
                 Err(SkillLoadError::Malformed(reason)) => {
-                    eprintln!("warning: skipping skill at {}: {reason}", skill_dir.display());
+                    eprintln!(
+                        "warning: skipping skill at {}: {reason}",
+                        skill_dir.display()
+                    );
                 }
             }
         }
@@ -62,10 +67,11 @@ fn load_skill_dir(dir: &Path, scope: Scope) -> Result<Skill, SkillLoadError> {
         return Err(SkillLoadError::NoSkillFile);
     };
 
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| SkillLoadError::Malformed(format!("failed to read {}: {e}", path.display())))?;
-    let (frontmatter, body) = parse_frontmatter(&content)
-        .map_err(|e| SkillLoadError::Malformed(e.to_string()))?;
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        SkillLoadError::Malformed(format!("failed to read {}: {e}", path.display()))
+    })?;
+    let (frontmatter, body) =
+        parse_frontmatter(&content).map_err(|e| SkillLoadError::Malformed(e.to_string()))?;
     let load_mode = classify(&frontmatter, is_mdc);
 
     Ok(Skill {
@@ -105,7 +111,9 @@ pub struct SkillContext {
 /// it isn't relevant to this project.
 pub fn resolve_skill_context(skills: &[Skill], project_root: &Path) -> SkillContext {
     let mut context = SkillContext::default();
-    let has_glob_skills = skills.iter().any(|s| matches!(s.load_mode, LoadMode::Globs(_)));
+    let has_glob_skills = skills
+        .iter()
+        .any(|s| matches!(s.load_mode, LoadMode::Globs(_)));
     let project_files = if has_glob_skills {
         Some(walk_project_files(project_root))
     } else {
@@ -114,12 +122,20 @@ pub fn resolve_skill_context(skills: &[Skill], project_root: &Path) -> SkillCont
 
     for skill in skills {
         match &skill.load_mode {
-            LoadMode::AlwaysApply => context.injected.push((skill.name.clone(), skill.body.clone())),
-            LoadMode::ModelInvoked => context.listing.push((skill.name.clone(), skill.description.clone())),
+            LoadMode::AlwaysApply => context
+                .injected
+                .push((skill.name.clone(), skill.body.clone())),
+            LoadMode::ModelInvoked => context
+                .listing
+                .push((skill.name.clone(), skill.description.clone())),
             LoadMode::Globs(globs) => {
-                let files = project_files.as_ref().expect("has_glob_skills guarantees this is Some");
+                let files = project_files
+                    .as_ref()
+                    .expect("has_glob_skills guarantees this is Some");
                 if any_glob_matches(files, globs) {
-                    context.injected.push((skill.name.clone(), skill.body.clone()));
+                    context
+                        .injected
+                        .push((skill.name.clone(), skill.body.clone()));
                 }
             }
         }
@@ -135,7 +151,13 @@ fn walk_project_files(project_root: &Path) -> Vec<PathBuf> {
         .build()
         .flatten()
         .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
-        .filter_map(|entry| entry.path().strip_prefix(project_root).ok().map(Path::to_path_buf))
+        .filter_map(|entry| {
+            entry
+                .path()
+                .strip_prefix(project_root)
+                .ok()
+                .map(Path::to_path_buf)
+        })
         .collect()
 }
 
@@ -208,7 +230,13 @@ mod tests {
         }
     }
 
-    fn write_skill(dir: &Path, filename: &str, name: &str, description: &str, extra_frontmatter: &str) {
+    fn write_skill(
+        dir: &Path,
+        filename: &str,
+        name: &str,
+        description: &str,
+        extra_frontmatter: &str,
+    ) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(
             dir.join(filename),
@@ -229,7 +257,13 @@ mod tests {
     fn discovers_a_project_scope_skill() {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
-        write_skill(&paths.project_config_dir.join("skills/pdf"), "SKILL.md", "pdf", "Extract PDFs", "");
+        write_skill(
+            &paths.project_config_dir.join("skills/pdf"),
+            "SKILL.md",
+            "pdf",
+            "Extract PDFs",
+            "",
+        );
 
         let skills = discover_skills(&paths);
         assert_eq!(skills.len(), 1);
@@ -243,7 +277,13 @@ mod tests {
     fn discovers_a_global_scope_skill() {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
-        write_skill(&paths.user_config_dir.join("skills/pdf"), "SKILL.md", "pdf", "Extract PDFs", "");
+        write_skill(
+            &paths.user_config_dir.join("skills/pdf"),
+            "SKILL.md",
+            "pdf",
+            "Extract PDFs",
+            "",
+        );
 
         let skills = discover_skills(&paths);
         assert_eq!(skills.len(), 1);
@@ -254,8 +294,20 @@ mod tests {
     fn project_scope_shadows_global_scope_by_name() {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
-        write_skill(&paths.project_config_dir.join("skills/pdf"), "SKILL.md", "pdf", "Project version", "");
-        write_skill(&paths.user_config_dir.join("skills/pdf"), "SKILL.md", "pdf", "Global version", "");
+        write_skill(
+            &paths.project_config_dir.join("skills/pdf"),
+            "SKILL.md",
+            "pdf",
+            "Project version",
+            "",
+        );
+        write_skill(
+            &paths.user_config_dir.join("skills/pdf"),
+            "SKILL.md",
+            "pdf",
+            "Global version",
+            "",
+        );
 
         let skills = discover_skills(&paths);
         assert_eq!(skills.len(), 1);
@@ -276,7 +328,13 @@ mod tests {
             "alwaysApply: true\n",
         );
         // Global copy: plain `.md`, no special frontmatter (ModelInvoked).
-        write_skill(&paths.user_config_dir.join("skills/pdf"), "SKILL.md", "pdf", "Global version", "");
+        write_skill(
+            &paths.user_config_dir.join("skills/pdf"),
+            "SKILL.md",
+            "pdf",
+            "Global version",
+            "",
+        );
 
         let skills = discover_skills(&paths);
         assert_eq!(skills.len(), 1);
@@ -289,8 +347,20 @@ mod tests {
     fn discovers_two_differently_named_skills_in_the_same_scope() {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
-        write_skill(&paths.project_config_dir.join("skills/pdf"), "SKILL.md", "pdf", "Extract PDFs", "");
-        write_skill(&paths.project_config_dir.join("skills/docx"), "SKILL.md", "docx", "Extract DOCX", "");
+        write_skill(
+            &paths.project_config_dir.join("skills/pdf"),
+            "SKILL.md",
+            "pdf",
+            "Extract PDFs",
+            "",
+        );
+        write_skill(
+            &paths.project_config_dir.join("skills/docx"),
+            "SKILL.md",
+            "docx",
+            "Extract DOCX",
+            "",
+        );
 
         let skills = discover_skills(&paths);
         assert_eq!(skills.len(), 2);
@@ -317,8 +387,18 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         std::fs::create_dir_all(paths.project_config_dir.join("skills/broken")).unwrap();
-        std::fs::write(paths.project_config_dir.join("skills/broken/SKILL.md"), "no frontmatter here").unwrap();
-        write_skill(&paths.project_config_dir.join("skills/ok"), "SKILL.md", "ok", "Fine", "");
+        std::fs::write(
+            paths.project_config_dir.join("skills/broken/SKILL.md"),
+            "no frontmatter here",
+        )
+        .unwrap();
+        write_skill(
+            &paths.project_config_dir.join("skills/ok"),
+            "SKILL.md",
+            "ok",
+            "Fine",
+            "",
+        );
 
         let skills = discover_skills(&paths);
         assert_eq!(skills.len(), 1);
@@ -330,7 +410,13 @@ mod tests {
         let root = tempdir().unwrap();
         let paths = test_paths(root.path());
         std::fs::create_dir_all(paths.project_config_dir.join("skills/not-a-skill")).unwrap();
-        std::fs::write(paths.project_config_dir.join("skills/not-a-skill/README.md"), "hi").unwrap();
+        std::fs::write(
+            paths
+                .project_config_dir
+                .join("skills/not-a-skill/README.md"),
+            "hi",
+        )
+        .unwrap();
 
         let skills = discover_skills(&paths);
         assert!(skills.is_empty());
@@ -352,7 +438,10 @@ mod tests {
         let root = tempdir().unwrap();
         let skills = vec![skill("a", LoadMode::AlwaysApply)];
         let context = resolve_skill_context(&skills, root.path());
-        assert_eq!(context.injected, vec![("a".to_string(), "a body".to_string())]);
+        assert_eq!(
+            context.injected,
+            vec![("a".to_string(), "a body".to_string())]
+        );
         assert!(context.listing.is_empty());
     }
 
@@ -362,7 +451,10 @@ mod tests {
         let skills = vec![skill("a", LoadMode::ModelInvoked)];
         let context = resolve_skill_context(&skills, root.path());
         assert!(context.injected.is_empty());
-        assert_eq!(context.listing, vec![("a".to_string(), "a description".to_string())]);
+        assert_eq!(
+            context.listing,
+            vec![("a".to_string(), "a description".to_string())]
+        );
     }
 
     #[test]
@@ -371,7 +463,10 @@ mod tests {
         std::fs::write(root.path().join("doc.pdf"), "").unwrap();
         let skills = vec![skill("pdf", LoadMode::Globs(vec!["*.pdf".to_string()]))];
         let context = resolve_skill_context(&skills, root.path());
-        assert_eq!(context.injected, vec![("pdf".to_string(), "pdf body".to_string())]);
+        assert_eq!(
+            context.injected,
+            vec![("pdf".to_string(), "pdf body".to_string())]
+        );
         assert!(context.listing.is_empty());
     }
 

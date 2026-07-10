@@ -34,7 +34,10 @@ where
 impl StdioPrompter<tokio::io::BufReader<tokio::io::Stdin>, tokio::io::Stdout> {
     /// Convenience constructor wired to the real process stdin/stdout.
     pub fn real() -> Self {
-        Self::new(tokio::io::BufReader::new(tokio::io::stdin()), tokio::io::stdout())
+        Self::new(
+            tokio::io::BufReader::new(tokio::io::stdin()),
+            tokio::io::stdout(),
+        )
     }
 }
 
@@ -74,7 +77,9 @@ where
                 "2" => PermissionDecision::AllowAlwaysThisSession,
                 _ => {
                     let mut out = self.output.lock().await;
-                    let _ = out.write_all(b"Feedback (why not / what to do instead): ").await;
+                    let _ = out
+                        .write_all(b"Feedback (why not / what to do instead): ")
+                        .await;
                     let _ = out.flush().await;
                     drop(out);
 

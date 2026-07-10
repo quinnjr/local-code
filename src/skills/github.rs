@@ -179,19 +179,34 @@ impl GithubClient {
         req
     }
 
-    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T, SkillHostError> {
-        let response = self.request(url).send().await.map_err(SkillHostError::Request)?;
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+    ) -> Result<T, SkillHostError> {
+        let response = self
+            .request(url)
+            .send()
+            .await
+            .map_err(SkillHostError::Request)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(SkillHostError::Api { status: status.as_u16(), url: url.to_string(), body });
+            return Err(SkillHostError::Api {
+                status: status.as_u16(),
+                url: url.to_string(),
+                body,
+            });
         }
         response.json::<T>().await.map_err(SkillHostError::Request)
     }
 
     /// Resolves the repo's default branch name (used when the user didn't
     /// supply an explicit `@ref`).
-    pub async fn resolve_default_branch(&self, owner: &str, repo: &str) -> Result<String, SkillHostError> {
+    pub async fn resolve_default_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<String, SkillHostError> {
         let url = format!("{}/repos/{owner}/{repo}", self.api_base);
         let info: RepoInfo = self.get_json(&url).await?;
         Ok(info.default_branch)
@@ -201,8 +216,17 @@ impl GithubClient {
     /// subsequent directory fetch is a stable snapshot even if the branch
     /// moves mid-fetch, and so `update_skill` has something to compare
     /// against later.
-    pub async fn resolve_commit_sha(&self, owner: &str, repo: &str, git_ref: &str) -> Result<String, SkillHostError> {
-        let url = format!("{}/repos/{owner}/{repo}/commits/{}", self.api_base, urlencoding_ref(git_ref));
+    pub async fn resolve_commit_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Result<String, SkillHostError> {
+        let url = format!(
+            "{}/repos/{owner}/{repo}/commits/{}",
+            self.api_base,
+            urlencoding_ref(git_ref)
+        );
         let info: CommitInfo = self.get_json(&url).await?;
         Ok(info.sha)
     }
@@ -220,7 +244,8 @@ impl GithubClient {
         commit_sha: &str,
     ) -> Result<Vec<FetchedFile>, SkillHostError> {
         let mut files = Vec::new();
-        self.fetch_directory_files_into(owner, repo, path, path, commit_sha, &mut files).await?;
+        self.fetch_directory_files_into(owner, repo, path, path, commit_sha, &mut files)
+            .await?;
         Ok(files)
     }
 
@@ -232,7 +257,8 @@ impl GithubClient {
         current_path: &'a str,
         commit_sha: &'a str,
         out: &'a mut Vec<FetchedFile>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SkillHostError>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SkillHostError>> + Send + 'a>>
+    {
         Box::pin(async move {
             let url = format!(
                 "{}/repos/{owner}/{repo}/contents/{current_path}?ref={commit_sha}",
@@ -250,7 +276,15 @@ impl GithubClient {
             for entry in entries {
                 match entry.entry_type.as_str() {
                     "dir" => {
-                        self.fetch_directory_files_into(owner, repo, base_path, &entry.path, commit_sha, out).await?;
+                        self.fetch_directory_files_into(
+                            owner,
+                            repo,
+                            base_path,
+                            &entry.path,
+                            commit_sha,
+                            out,
+                        )
+                        .await?;
                     }
                     "file" => file_entries.push(entry),
                     _ => {} // symlinks/submodules: skip, not relevant to skill content
@@ -267,15 +301,34 @@ impl GithubClient {
                     url: entry.path.clone(),
                     body: "file entry missing download_url".to_string(),
                 })?;
-                let response = self.request(&download_url).send().await.map_err(SkillHostError::Request)?;
+                let response = self
+                    .request(&download_url)
+                    .send()
+                    .await
+                    .map_err(SkillHostError::Request)?;
                 let status = response.status();
                 if !status.is_success() {
                     let body = response.text().await.unwrap_or_default();
-                    return Err(SkillHostError::Api { status: status.as_u16(), url: download_url, body });
+                    return Err(SkillHostError::Api {
+                        status: status.as_u16(),
+                        url: download_url,
+                        body,
+                    });
                 }
-                let bytes = response.bytes().await.map_err(SkillHostError::Request)?.to_vec();
-                let relative = entry.path.strip_prefix(base_path).unwrap_or(&entry.path).trim_start_matches('/');
-                Ok(FetchedFile { relative_path: PathBuf::from(relative), bytes })
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(SkillHostError::Request)?
+                    .to_vec();
+                let relative = entry
+                    .path
+                    .strip_prefix(base_path)
+                    .unwrap_or(&entry.path)
+                    .trim_start_matches('/');
+                Ok(FetchedFile {
+                    relative_path: PathBuf::from(relative),
+                    bytes,
+                })
             });
             for result in futures::future::join_all(downloads).await {
                 out.push(result?);
@@ -309,7 +362,10 @@ mod github_client_tests {
             .await;
 
         let client = GithubClient::new_for_test(None, server.uri());
-        let branch = client.resolve_default_branch("acme", "widgets").await.unwrap();
+        let branch = client
+            .resolve_default_branch("acme", "widgets")
+            .await
+            .unwrap();
         assert_eq!(branch, "main");
     }
 
@@ -325,7 +381,10 @@ mod github_client_tests {
             .await;
 
         let client = GithubClient::new_for_test(None, server.uri());
-        let sha = client.resolve_commit_sha("acme", "widgets", "main").await.unwrap();
+        let sha = client
+            .resolve_commit_sha("acme", "widgets", "main")
+            .await
+            .unwrap();
         assert_eq!(sha, "abc123");
     }
 
@@ -342,7 +401,10 @@ mod github_client_tests {
             .await;
 
         let client = GithubClient::new_for_test(Some("test-token".to_string()), server.uri());
-        let branch = client.resolve_default_branch("acme", "widgets").await.unwrap();
+        let branch = client
+            .resolve_default_branch("acme", "widgets")
+            .await
+            .unwrap();
         assert_eq!(branch, "main");
     }
 
@@ -369,7 +431,10 @@ mod github_client_tests {
             .await;
 
         let client = GithubClient::new_for_test(None, server.uri());
-        let files = client.fetch_directory_files("acme", "widgets", "skills/pdf", "abc123").await.unwrap();
+        let files = client
+            .fetch_directory_files("acme", "widgets", "skills/pdf", "abc123")
+            .await
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].relative_path, PathBuf::from("SKILL.md"));
         assert_eq!(files[0].bytes, b"---\nname: pdf\n---\nbody");
@@ -408,13 +473,22 @@ mod github_client_tests {
             ])))
             .mount(&server)
             .await;
-        Mock::given(method("GET")).and(path("/raw/SKILL.md"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("skill body")).mount(&server).await;
-        Mock::given(method("GET")).and(path("/raw/notes.md"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("notes")).mount(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/raw/SKILL.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("skill body"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/raw/notes.md"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("notes"))
+            .mount(&server)
+            .await;
 
         let client = GithubClient::new_for_test(None, server.uri());
-        let mut files = client.fetch_directory_files("acme", "widgets", "skills/pdf", "abc123").await.unwrap();
+        let mut files = client
+            .fetch_directory_files("acme", "widgets", "skills/pdf", "abc123")
+            .await
+            .unwrap();
         files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].relative_path, PathBuf::from("SKILL.md"));
@@ -436,7 +510,9 @@ mod github_client_tests {
             .await;
 
         let client = GithubClient::new_for_test(None, server.uri());
-        let result = client.fetch_directory_files("acme", "widgets", "skills/pdf/SKILL.md", "abc123").await;
+        let result = client
+            .fetch_directory_files("acme", "widgets", "skills/pdf/SKILL.md", "abc123")
+            .await;
         assert!(matches!(result, Err(SkillHostError::NotADirectory(_))));
     }
 
@@ -451,7 +527,10 @@ mod github_client_tests {
 
         let client = GithubClient::new_for_test(None, server.uri());
         let result = client.resolve_default_branch("acme", "widgets").await;
-        assert!(matches!(result, Err(SkillHostError::Api { status: 404, .. })));
+        assert!(matches!(
+            result,
+            Err(SkillHostError::Api { status: 404, .. })
+        ));
     }
 
     #[tokio::test]
@@ -476,13 +555,21 @@ mod github_client_tests {
             .await;
 
         let client = GithubClient::new_for_test(None, server.uri());
-        let result = client.fetch_directory_files("acme", "widgets", "skills/pdf", "abc123").await;
-        assert!(matches!(result, Err(SkillHostError::Api { status: 500, .. })));
+        let result = client
+            .fetch_directory_files("acme", "widgets", "skills/pdf", "abc123")
+            .await;
+        assert!(matches!(
+            result,
+            Err(SkillHostError::Api { status: 500, .. })
+        ));
     }
 
     #[tokio::test]
     async fn does_not_send_bearer_token_to_non_github_host() {
-        let client = GithubClient::new_for_test(Some("test-token".to_string()), "http://127.0.0.1:1".to_string());
+        let client = GithubClient::new_for_test(
+            Some("test-token".to_string()),
+            "http://127.0.0.1:1".to_string(),
+        );
         let request = client.request("https://example.invalid/SKILL.md");
         let built = request.build().unwrap();
         assert!(built.headers().get("Authorization").is_none());

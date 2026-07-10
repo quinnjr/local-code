@@ -15,7 +15,7 @@ pub use app::{App, AppProps};
 use std::path::Path;
 
 use crate::agent::provider::build_model;
-use crate::config::connection::{load_connections, Connection};
+use crate::config::connection::{Connection, load_connections};
 use crate::config::mcp_servers::load_mcp_servers;
 use crate::config::paths::Paths;
 use crate::config::secrets::SecretStore;
@@ -25,7 +25,7 @@ use crate::permissions::settings::load_settings;
 use crate::permissions::types::PermissionTier;
 use crate::session::paths::new_session_path;
 use crate::session::types::SessionFile;
-use crate::skills::discovery::{discover_skills, resolve_skill_context, render_skill_context};
+use crate::skills::discovery::{discover_skills, render_skill_context, resolve_skill_context};
 use daimon::model::types::Message;
 
 #[derive(Debug, thiserror::Error)]
@@ -288,7 +288,10 @@ mod tests {
     fn select_connection_errors_when_ambiguous_without_a_name() {
         let connections = vec![conn("a"), conn("b")];
         let result = select_connection(&connections, None);
-        assert!(matches!(result, Err(TuiSessionError::AmbiguousConnection(_))));
+        assert!(matches!(
+            result,
+            Err(TuiSessionError::AmbiguousConnection(_))
+        ));
     }
 
     #[test]

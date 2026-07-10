@@ -143,9 +143,7 @@ mod tests {
 
     #[test]
     fn toggle_last_tool_call_expanded_is_a_no_op_when_no_tool_calls_exist() {
-        let mut entries = vec![TranscriptEntry::UserTurn {
-            text: "hi".into(),
-        }];
+        let mut entries = vec![TranscriptEntry::UserTurn { text: "hi".into() }];
         toggle_last_tool_call_expanded(&mut entries); // must not panic
         assert_eq!(entries.len(), 1);
     }
@@ -163,17 +161,29 @@ mod tests {
     #[test]
     fn transcript_entry_round_trips_through_json() {
         let entries = vec![
-            TranscriptEntry::UserTurn { text: "fix the bug".into() },
+            TranscriptEntry::UserTurn {
+                text: "fix the bug".into(),
+            },
             TranscriptEntry::ToolCall(ToolCallEntry {
                 id: "1".into(),
                 name: "edit_file".into(),
                 arguments_json: "{}".into(),
-                result: Some(ToolCallResult { content: "edited x.rs".into(), is_error: false }),
+                result: Some(ToolCallResult {
+                    content: "edited x.rs".into(),
+                    is_error: false,
+                }),
                 expanded: true,
             }),
-            TranscriptEntry::AssistantText { text: "done".into() },
-            TranscriptEntry::PermissionResolved { description: "run rm".into(), allowed: false },
-            TranscriptEntry::SystemNotice { text: "note".into() },
+            TranscriptEntry::AssistantText {
+                text: "done".into(),
+            },
+            TranscriptEntry::PermissionResolved {
+                description: "run rm".into(),
+                allowed: false,
+            },
+            TranscriptEntry::SystemNotice {
+                text: "note".into(),
+            },
         ];
         let json = serde_json::to_string(&entries).unwrap();
         let back: Vec<TranscriptEntry> = serde_json::from_str(&json).unwrap();
@@ -182,7 +192,11 @@ mod tests {
 
     #[test]
     fn usage_summary_round_trips_through_json() {
-        let usage = UsageSummary { input_tokens: 10, output_tokens: 5, estimated_cost: 0.01 };
+        let usage = UsageSummary {
+            input_tokens: 10,
+            output_tokens: 5,
+            estimated_cost: 0.01,
+        };
         let json = serde_json::to_string(&usage).unwrap();
         let back: UsageSummary = serde_json::from_str(&json).unwrap();
         assert_eq!(back, usage);

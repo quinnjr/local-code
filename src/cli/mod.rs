@@ -7,7 +7,7 @@ use crate::agent::headless::run_headless;
 use crate::config::paths::Paths;
 use crate::permissions::types::PermissionTier;
 use clap::{Parser, Subcommand, ValueEnum};
-use std::io::{stdin, stdout, IsTerminal};
+use std::io::{IsTerminal, stdin, stdout};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -212,7 +212,8 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
         },
         None => {
             let resume = if cli.resume {
-                let sessions = crate::session::store::list_sessions(&paths.user_state_dir, &project_root)?;
+                let sessions =
+                    crate::session::store::list_sessions(&paths.user_state_dir, &project_root)?;
                 let chosen = select_session_to_resume(&sessions, stdin().lock(), stdout())?;
                 match chosen {
                     Some(summary) => {
@@ -265,7 +266,11 @@ pub fn select_session_to_resume<R: BufRead, W: Write>(
         return Ok(None);
     }
     if sessions.len() == 1 {
-        writeln!(out, "Resuming the only previous session ({}).", sessions[0].updated_at)?;
+        writeln!(
+            out,
+            "Resuming the only previous session ({}).",
+            sessions[0].updated_at
+        )?;
         return Ok(Some(sessions[0].clone()));
     }
 
@@ -278,10 +283,17 @@ pub fn select_session_to_resume<R: BufRead, W: Write>(
             s.updated_at,
             s.connection_name,
             s.model_name,
-            s.first_user_turn_preview.as_ref().map(|p| format!(" · \"{p}\"")).unwrap_or_default()
+            s.first_user_turn_preview
+                .as_ref()
+                .map(|p| format!(" · \"{p}\""))
+                .unwrap_or_default()
         )?;
     }
-    write!(out, "Resume which session? [1-{}, blank for most recent]: ", sessions.len())?;
+    write!(
+        out,
+        "Resume which session? [1-{}, blank for most recent]: ",
+        sessions.len()
+    )?;
     out.flush()?;
 
     let mut line = String::new();
@@ -290,7 +302,12 @@ pub fn select_session_to_resume<R: BufRead, W: Write>(
     let index = if trimmed.is_empty() {
         0
     } else {
-        trimmed.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= sessions.len()).map(|n| n - 1).unwrap_or(0)
+        trimmed
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1 && *n <= sessions.len())
+            .map(|n| n - 1)
+            .unwrap_or(0)
     };
     Ok(Some(sessions[index].clone()))
 }
@@ -332,7 +349,11 @@ mod select_session_tests {
         let mut out = Vec::new();
         let result = select_session_to_resume(&[], &b""[..], &mut out).unwrap();
         assert!(result.is_none());
-        assert!(String::from_utf8(out).unwrap().contains("No previous sessions"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("No previous sessions")
+        );
     }
 
     #[test]
@@ -345,7 +366,10 @@ mod select_session_tests {
 
     #[test]
     fn blank_input_selects_the_most_recent() {
-        let sessions = vec![summary("newest", "2026-07-06T00:00:00Z"), summary("older", "2026-07-01T00:00:00Z")];
+        let sessions = vec![
+            summary("newest", "2026-07-06T00:00:00Z"),
+            summary("older", "2026-07-01T00:00:00Z"),
+        ];
         let mut out = Vec::new();
         let result = select_session_to_resume(&sessions, &b"\n"[..], &mut out).unwrap();
         assert_eq!(result.unwrap().connection_name, "newest");
@@ -353,7 +377,10 @@ mod select_session_tests {
 
     #[test]
     fn numeric_input_selects_by_index() {
-        let sessions = vec![summary("newest", "2026-07-06T00:00:00Z"), summary("older", "2026-07-01T00:00:00Z")];
+        let sessions = vec![
+            summary("newest", "2026-07-06T00:00:00Z"),
+            summary("older", "2026-07-01T00:00:00Z"),
+        ];
         let mut out = Vec::new();
         let result = select_session_to_resume(&sessions, &b"2\n"[..], &mut out).unwrap();
         assert_eq!(result.unwrap().connection_name, "older");
@@ -361,7 +388,10 @@ mod select_session_tests {
 
     #[test]
     fn out_of_range_input_falls_back_to_most_recent() {
-        let sessions = vec![summary("newest", "2026-07-06T00:00:00Z"), summary("older", "2026-07-01T00:00:00Z")];
+        let sessions = vec![
+            summary("newest", "2026-07-06T00:00:00Z"),
+            summary("older", "2026-07-01T00:00:00Z"),
+        ];
         let mut out = Vec::new();
         let result = select_session_to_resume(&sessions, &b"99\n"[..], &mut out).unwrap();
         assert_eq!(result.unwrap().connection_name, "newest");
@@ -376,14 +406,21 @@ mod mcp_cli_tests {
     #[test]
     fn parses_mcp_list() {
         let cli = Cli::parse_from(["local-code", "mcp", "list"]);
-        assert!(matches!(cli.command, Some(Command::Mcp { action: McpAction::List })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Mcp {
+                action: McpAction::List
+            })
+        ));
     }
 
     #[test]
     fn parses_mcp_remove_with_name() {
         let cli = Cli::parse_from(["local-code", "mcp", "remove", "fs"]);
         match cli.command {
-            Some(Command::Mcp { action: McpAction::Remove { name } }) => assert_eq!(name, "fs"),
+            Some(Command::Mcp {
+                action: McpAction::Remove { name },
+            }) => assert_eq!(name, "fs"),
             other => panic!("expected Mcp::Remove, got {other:?}"),
         }
     }
@@ -391,7 +428,12 @@ mod mcp_cli_tests {
     #[test]
     fn parses_mcp_add() {
         let cli = Cli::parse_from(["local-code", "mcp", "add"]);
-        assert!(matches!(cli.command, Some(Command::Mcp { action: McpAction::Add })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Mcp {
+                action: McpAction::Add
+            })
+        ));
     }
 }
 

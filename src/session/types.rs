@@ -81,9 +81,9 @@ fn messages_eq(a: &[Message], b: &[Message]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).all(|(x, y)| {
-        serde_json::to_string(x).ok() == serde_json::to_string(y).ok()
-    })
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| serde_json::to_string(x).ok() == serde_json::to_string(y).ok())
 }
 
 /// One row in a `/resume` or `--resume` listing — everything needed to show
@@ -113,7 +113,9 @@ mod tests {
             PermissionTier::Ask,
             "2026-07-06T10:00:00Z".into(),
         );
-        session.entries.push(TranscriptEntry::UserTurn { text: "hi".into() });
+        session
+            .entries
+            .push(TranscriptEntry::UserTurn { text: "hi".into() });
         session.messages.push(Message::user("hi"));
 
         let json = serde_json::to_string_pretty(&session).unwrap();

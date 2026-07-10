@@ -24,7 +24,11 @@ pub enum SkillClient {
 }
 
 impl SkillClient {
-    pub async fn resolve_default_branch(&self, owner: &str, repo: &str) -> Result<String, SkillHostError> {
+    pub async fn resolve_default_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<String, SkillHostError> {
         match self {
             SkillClient::GitHub(c) => c.resolve_default_branch(owner, repo).await,
             SkillClient::GitLab(c) => c.resolve_default_branch(repo).await,
@@ -32,7 +36,12 @@ impl SkillClient {
         }
     }
 
-    pub async fn resolve_commit_sha(&self, owner: &str, repo: &str, git_ref: &str) -> Result<String, SkillHostError> {
+    pub async fn resolve_commit_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        git_ref: &str,
+    ) -> Result<String, SkillHostError> {
         match self {
             SkillClient::GitHub(c) => c.resolve_commit_sha(owner, repo, git_ref).await,
             SkillClient::GitLab(c) => c.resolve_commit_sha(repo, git_ref).await,
@@ -50,7 +59,9 @@ impl SkillClient {
         match self {
             SkillClient::GitHub(c) => c.fetch_directory_files(owner, repo, path, commit_sha).await,
             SkillClient::GitLab(c) => c.fetch_directory_files(repo, path, commit_sha).await,
-            SkillClient::Bitbucket(c) => c.fetch_directory_files(owner, repo, path, commit_sha).await,
+            SkillClient::Bitbucket(c) => {
+                c.fetch_directory_files(owner, repo, path, commit_sha).await
+            }
         }
     }
 }

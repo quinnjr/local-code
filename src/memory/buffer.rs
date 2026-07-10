@@ -1,6 +1,6 @@
 // src/memory/buffer.rs
 
-use crate::memory::{ensure_dir, MemoryError, MemoryPaths};
+use crate::memory::{MemoryError, MemoryPaths, ensure_dir};
 use chrono::{DateTime, NaiveDate, Utc};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -152,7 +152,11 @@ mod tests {
 
         let paths = MemoryPaths::new(&memory_dir);
         assert!(paths.buffer.exists());
-        assert!(!paths.daily(NaiveDate::from_ymd_opt(2026, 7, 6).unwrap()).exists());
+        assert!(
+            !paths
+                .daily(NaiveDate::from_ymd_opt(2026, 7, 6).unwrap())
+                .exists()
+        );
     }
 
     #[test]

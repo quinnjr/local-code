@@ -23,13 +23,12 @@ fn fixture_server_config(name: &str) -> McpServerConfig {
 #[tokio::test]
 async fn discovers_and_namespaces_the_fixture_servers_echo_tool() {
     let config = fixture_server_config("fixture");
-    let tools = connect_one(&config).await.expect("fixture server should connect");
+    let tools = connect_one(&config)
+        .await
+        .expect("fixture server should connect");
 
     assert_eq!(tools.len(), 1);
-    assert_eq!(
-        daimon::tool::Tool::name(&tools[0]),
-        "fixture__echo"
-    );
+    assert_eq!(daimon::tool::Tool::name(&tools[0]), "fixture__echo");
 }
 
 #[tokio::test]
@@ -37,7 +36,9 @@ async fn calls_the_fixture_servers_echo_tool_and_gets_real_output_back() {
     use daimon::tool::Tool;
 
     let config = fixture_server_config("fixture2");
-    let tools = connect_one(&config).await.expect("fixture server should connect");
+    let tools = connect_one(&config)
+        .await
+        .expect("fixture server should connect");
     let echo_tool = &tools[0];
 
     let output = echo_tool
@@ -54,7 +55,9 @@ async fn fixture_servers_tool_level_error_surfaces_as_error_output() {
     use daimon::tool::Tool;
 
     let config = fixture_server_config("fixture3");
-    let tools = connect_one(&config).await.expect("fixture server should connect");
+    let tools = connect_one(&config)
+        .await
+        .expect("fixture server should connect");
     let echo_tool = &tools[0];
 
     let output = echo_tool

@@ -33,7 +33,13 @@ pub fn build_init_prompt(survey: &ProjectSurvey) -> String {
     };
     prompt.push_str(&format!(
         "{header}{}\n",
-        survey.file_paths.iter().take(200).map(|p| format!("- {p}")).collect::<Vec<_>>().join("\n")
+        survey
+            .file_paths
+            .iter()
+            .take(200)
+            .map(|p| format!("- {p}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     ));
 
     prompt
@@ -47,7 +53,10 @@ mod tests {
     fn includes_manifest_contents_when_present() {
         let survey = ProjectSurvey {
             file_paths: vec!["Cargo.toml".into(), "src/main.rs".into()],
-            manifests: vec![("Cargo.toml".into(), "[package]\nname = \"local-code\"".into())],
+            manifests: vec![(
+                "Cargo.toml".into(),
+                "[package]\nname = \"local-code\"".into(),
+            )],
             ..Default::default()
         };
         let prompt = build_init_prompt(&survey);

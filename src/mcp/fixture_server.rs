@@ -56,7 +56,10 @@ pub fn run() {
         let Ok(request) = serde_json::from_slice::<serde_json::Value>(&body) else {
             continue;
         };
-        let method = request.get("method").and_then(|v| v.as_str()).unwrap_or_default();
+        let method = request
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         let id = request.get("id").and_then(|v| v.as_u64());
 
         match method {

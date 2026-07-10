@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::agent::build::build_agent_with_mcp_tools;
 use crate::agent::provider::build_model;
-use crate::config::connection::{load_connections, Connection};
+use crate::config::connection::{Connection, load_connections};
 use crate::config::mcp_servers::load_mcp_servers;
 use crate::config::paths::Paths;
 use crate::config::secrets::SecretStore;
@@ -174,7 +174,9 @@ mod tests {
     fn select_connection_errors_when_named_connection_missing() {
         let connections = vec![conn("a")];
         let result = select_connection(&connections, Some("does-not-exist"));
-        assert!(matches!(result, Err(HeadlessError::ConnectionNotFound(name)) if name == "does-not-exist"));
+        assert!(
+            matches!(result, Err(HeadlessError::ConnectionNotFound(name)) if name == "does-not-exist")
+        );
     }
 
     #[test]
@@ -184,12 +186,18 @@ mod tests {
 
     #[test]
     fn combined_system_context_returns_project_context_alone_when_skills_are_empty() {
-        assert_eq!(combined_system_context("project rules", ""), "project rules");
+        assert_eq!(
+            combined_system_context("project rules", ""),
+            "project rules"
+        );
     }
 
     #[test]
     fn combined_system_context_returns_skill_context_alone_when_project_context_is_empty() {
-        assert_eq!(combined_system_context("", "skill context"), "skill context");
+        assert_eq!(
+            combined_system_context("", "skill context"),
+            "skill context"
+        );
     }
 
     #[test]
@@ -204,7 +212,7 @@ mod tests {
     async fn mcp_report_errors_do_not_prevent_agent_construction() {
         use crate::agent::build::build_agent_with_mcp_tools;
         use crate::config::mcp_servers::{McpServerConfig, McpTransportConfig};
-        use crate::mcp::connect::{connect_all, McpConnectError};
+        use crate::mcp::connect::{McpConnectError, connect_all};
         use crate::permissions::settings::PermissionSettings;
         use crate::permissions::stdio::StdioPrompter;
 

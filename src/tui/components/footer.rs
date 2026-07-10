@@ -19,7 +19,11 @@ pub struct FooterProps {
 /// not as a slash-command implementation.
 #[component]
 pub fn Footer(props: &FooterProps, _hooks: &mut ntui::Hooks) -> ntui::Element {
-    let status = if props.streaming { "generating…" } else { "ready" };
+    let status = if props.streaming {
+        "generating…"
+    } else {
+        "ready"
+    };
     let tokens = format!(
         "{} in / {} out",
         props.usage.input_tokens, props.usage.output_tokens
@@ -36,8 +40,8 @@ pub fn Footer(props: &FooterProps, _hooks: &mut ntui::Hooks) -> ntui::Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ntui::testing::TestTerminal;
     use ntui::Element;
+    use ntui::testing::TestTerminal;
 
     #[tokio::test]
     async fn renders_hints_status_and_token_usage() {
