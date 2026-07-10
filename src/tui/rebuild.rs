@@ -32,7 +32,9 @@ pub type ResponderHandle = Arc<Mutex<Option<oneshot::Sender<PermissionDecision>>
 /// `always_allow`/`always_deny: Vec<String>` parameters deliberately: two
 /// adjacent same-typed `Vec<String>` params are a real footgun a caller
 /// could transpose without a compile error, and `PermissionSettings` is the
-/// type this function builds internally anyway.
+/// type this function builds internally anyway. The resulting 8-parameter
+/// signature is intentional (see above), hence the lint suppression below.
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild_agent(
     model: SharedModel,
     initial_tier: PermissionTier,
@@ -70,6 +72,7 @@ pub fn rebuild_agent(
 /// the active model, `/mcp add` merges in newly-discovered tools). `/resume`
 /// does NOT use this — it rebuilds from a *loaded session's* messages, not
 /// the live agent's current history, so reloading would be wrong there.
+#[allow(clippy::too_many_arguments)]
 pub async fn rebuild_agent_from_history(
     old_agent: &Agent,
     model: SharedModel,

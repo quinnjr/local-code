@@ -33,8 +33,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-There is no CI config in this repo — `cargo test` + `cargo clippy -- -D warnings` is the de facto
-gate; run both before considering a change done.
+`.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+and `cargo test` as three parallel jobs on push/PR to `main`/`develop`. Run all three locally
+before considering a change done — CI is the same three commands, not a superset.
 
 ### Live/ignored tests
 
