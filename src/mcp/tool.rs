@@ -53,39 +53,40 @@ impl Tool for NamespacedMcpTool {
 mod tests {
     use super::*;
     use daimon::mcp::McpTransport;
-    use daimon::mcp::protocol::{
-        JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpToolInfo,
-    };
+    use daimon::mcp::protocol::{JsonRpcNotification, JsonRpcResponse, McpToolInfo};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
 
     /// An in-process fake `McpTransport` for fast, deterministic unit tests —
-    /// no real process/socket involved. Records the last request it received
-    /// and always answers `tools/call` with a fixed text content block, or an
-    /// MCP-level error if `fail_calls` is set.
+    /// no real process/socket involved. Always answers `tools/call` with a
+    /// fixed text content block, or an MCP-level error if `fail_calls` is
+    /// set. Request-id allocation is the transport's job (per
+    /// `McpTransport::request`'s contract); these tests never inspect the
+    /// response id, so a fixed `0` stands in for whatever a real transport
+    /// would allocate.
     struct MockTransport {
         fail_calls: bool,
     }
 
     impl McpTransport for MockTransport {
-        fn send<'a>(
+        fn request<'a>(
             &'a self,
-            request: &'a JsonRpcRequest,
+            _method: &'a str,
+            _params: Option<serde_json::Value>,
         ) -> Pin<Box<dyn Future<Output = daimon::Result<JsonRpcResponse>> + Send + 'a>> {
             let fail_calls = self.fail_calls;
-            let id = request.id;
             Box::pin(async move {
                 let body = if fail_calls {
                     serde_json::json!({
                         "jsonrpc": "2.0",
-                        "id": id,
+                        "id": 0,
                         "error": { "code": -32000, "message": "tool failed" }
                     })
                 } else {
                     serde_json::json!({
                         "jsonrpc": "2.0",
-                        "id": id,
+                        "id": 0,
                         "result": {
                             "content": [{"type": "text", "text": "mock tool output"}],
                             "isError": false
