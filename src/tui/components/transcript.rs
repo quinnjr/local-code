@@ -74,7 +74,7 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
     element! {
         View(
             flex_direction: FlexDirection::Column,
-            flex_grow: 1.0,
+            flex_grow: 1.0_f32,
             overflow: Overflow::Scroll,
             scroll: Some(scroll),
             padding: 0

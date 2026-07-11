@@ -654,9 +654,9 @@ dependencies = [
 
 [[package]]
 name = "daimon"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f8d66ba7499e0a6f642bc24b93a7e498f9de71482b55affea135e483ebc52c"
+checksum = "c41b0116729c59da2e98d78ace0657145851d3a46f46bf1aa4229d9f354077f9"
 dependencies = [
  "async-stream",
  "daimon-core",
@@ -680,9 +680,9 @@ dependencies = [
 
 [[package]]
 name = "daimon-core"
-version = "0.18.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63909c3a77d0447e9f28c74243354e17d85e186522463e0321d8d512f8680903"
+checksum = "12cc5905b781052bbbcaec51e893ec3db2a1241a990c2f9053eaa7e7b664daa2"
 dependencies = [
  "async-stream",
  "futures",
@@ -696,9 +696,9 @@ dependencies = [
 
 [[package]]
 name = "daimon-macros"
-version = "0.18.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d23ef0a65ebc8129d8a42cf2014614a08dc44bc93e3af0ac3a29084f92d914e"
+checksum = "7af9221172002e54443c3230fafc52e922b9668b27002c1d245d59236c267a89"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1639,8 +1639,6 @@ dependencies = [
  "percent-encoding",
  "referencing",
  "regex",
- "reqwest 0.13.4",
- "rustls",
  "serde",
  "serde_json",
  "unicode-general-category",
@@ -2478,10 +2476,8 @@ checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
- "futures-channel",
  "futures-core",
  "futures-util",
- "h2",
  "http",
  "http-body",
  "http-body-util",

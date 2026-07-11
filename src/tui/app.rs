@@ -1204,11 +1204,11 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 }
                 let _ = agent
                     .memory()
-                    .add_message_erased(daimon::model::types::Message::system(format!(
+                    .add_message_erased(&daimon::model::types::Message::system(format!(
                         "Previous conversation summary: {summary_text}"
                     )))
                     .await;
-                for msg in recent.iter().cloned() {
+                for msg in recent {
                     let _ = agent.memory().add_message_erased(msg).await;
                 }
 
