@@ -32,6 +32,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # keyring's Linux secret-service backend (libdbus-sys) needs libdbus's
+      # headers + pkg-config to build; ubuntu-latest doesn't ship them.
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -41,6 +44,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       # live_*.rs integration tests are #[ignore]d by default (see CLAUDE.md)
       # and require a real running LLM server, so the default `cargo test`
       # filter already excludes them here.
