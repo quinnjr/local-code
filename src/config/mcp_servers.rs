@@ -256,9 +256,9 @@ fn load_one(path: &Path) -> Result<McpServersFile, McpServersError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
     use crate::config::secrets::SecretStore;
     use std::sync::Once;
+    use tempfile::tempdir;
 
     static KEYRING_INIT: Once = Once::new();
     fn use_mock_keyring() {
@@ -778,8 +778,7 @@ Authorization = "Bearer ${keyring:mcp-github}"
 "#,
         )
         .unwrap();
-        let servers =
-            load_mcp_servers(dir.path(), std::path::Path::new("/nonexistent")).unwrap();
+        let servers = load_mcp_servers(dir.path(), std::path::Path::new("/nonexistent")).unwrap();
         let McpTransportConfig::Http { headers, .. } = &servers[0].transport else {
             panic!("expected Http transport");
         };

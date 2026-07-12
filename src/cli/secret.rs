@@ -118,7 +118,11 @@ mod tests {
         set(&paths, "drop", &b"v2\n"[..], Vec::new()).unwrap();
         let mut out = Vec::new();
         rm(&paths, "drop", &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("Removed secret 'drop'."));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("Removed secret 'drop'.")
+        );
 
         let mut out = Vec::new();
         ls(&paths, &mut out).unwrap();
