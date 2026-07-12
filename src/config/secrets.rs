@@ -146,6 +146,9 @@ pub fn store_secret(user_config_dir: &Path, name: &str, value: &str) -> Result<(
 /// Deletes the keyring entry (a missing entry is not an error) and removes
 /// the name from the index.
 pub fn remove_secret(user_config_dir: &Path, name: &str) -> Result<(), SecretsError> {
+    if !is_valid_secret_name(name) {
+        return Err(SecretsError::InvalidName(name.to_string()));
+    }
     SecretStore::delete_secret(name)?;
     let mut names = list_secret_names(user_config_dir)?;
     names.retain(|n| n != name);
@@ -346,6 +349,14 @@ mod tests {
         use_mock_keyring();
         let dir = tempfile::tempdir().unwrap();
         let err = store_secret(dir.path(), "bad name", "v").unwrap_err();
+        assert!(matches!(err, SecretsError::InvalidName(n) if n == "bad name"));
+    }
+
+    #[test]
+    fn remove_secret_rejects_invalid_names() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let err = remove_secret(dir.path(), "bad name").unwrap_err();
         assert!(matches!(err, SecretsError::InvalidName(n) if n == "bad name"));
     }
 

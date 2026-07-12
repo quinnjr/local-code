@@ -179,7 +179,8 @@ fn interpolate_refs(value: &str) -> String {
         .into_owned()
 }
 
-/// Resolves `${VAR}` references in a single, already-in-hand server config —
+/// Resolves `${VAR}` and `${keyring:<name>}` references in a single,
+/// already-in-hand server config —
 /// for a caller (the `/mcp add` wizard's live-connect step) that built the
 /// config directly from user input rather than loading it from disk via
 /// [`load_mcp_servers`], but still needs the same env resolution before

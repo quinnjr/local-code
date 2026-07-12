@@ -34,10 +34,21 @@ pub struct McpAddWizard {
 
 /// A bearer token captured by the wizard that still needs to be written to
 /// the OS keyring by the caller (the wizard itself is side-effect-free).
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct PendingSecret {
     pub name: String,
     pub value: String,
+}
+
+impl std::fmt::Debug for PendingSecret {
+    /// Redacts `value` so the raw token never lands in test panic messages,
+    /// logs, or anything else that formats this with `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingSecret")
+            .field("name", &self.name)
+            .field("value", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -371,6 +382,18 @@ fn bearer_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_secret_debug_redacts_value() {
+        let pending = PendingSecret {
+            name: "my-secret".to_string(),
+            value: "tok".to_string(),
+        };
+        let debug = format!("{pending:?}");
+        assert!(!debug.contains("tok"));
+        assert!(debug.contains("my-secret"));
+        assert!(debug.contains("[redacted]"));
+    }
 
     #[test]
     fn empty_name_is_invalid_and_keeps_asking_for_a_name() {
