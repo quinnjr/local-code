@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+
+use serde::{Deserialize, Serialize};
 
 const SERVICE_NAME: &str = "local-code";
 
@@ -7,6 +10,20 @@ const SERVICE_NAME: &str = "local-code";
 pub enum SecretsError {
     #[error("keyring operation failed: {0}")]
     Keyring(#[from] keyring::Error),
+    #[error("invalid secret name '{0}': allowed characters are A-Z, a-z, 0-9, '-' and '_'")]
+    InvalidName(String),
+    #[error("failed to read/write secret index {path}: {source}")]
+    Index {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse secret index {path}: {source}")]
+    IndexParse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
 }
 
 pub struct SecretStore;
@@ -50,6 +67,89 @@ pub fn is_valid_secret_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Maps every character outside the secret-name charset to `-`, so a name
+/// derived from arbitrary user input (e.g. an MCP server name) is always a
+/// valid secret name and a valid `${keyring:...}` reference.
+pub fn sanitize_secret_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Names-only index of stored secrets, needed because no keyring backend can
+/// enumerate its entries portably. Values never appear here.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct SecretNamesFile {
+    #[serde(default)]
+    names: Vec<String>,
+}
+
+fn index_path(user_config_dir: &Path) -> PathBuf {
+    user_config_dir.join("secret-names.toml")
+}
+
+/// Names of all secrets stored via [`store_secret`], sorted. A secret set by
+/// external tools directly in the OS keyring won't appear here until it is
+/// re-`set` through local-code.
+pub fn list_secret_names(user_config_dir: &Path) -> Result<Vec<String>, SecretsError> {
+    let path = index_path(user_config_dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&path).map_err(|source| SecretsError::Index {
+        path: path.clone(),
+        source,
+    })?;
+    let file: SecretNamesFile =
+        toml::from_str(&text).map_err(|source| SecretsError::IndexParse { path, source })?;
+    Ok(file.names)
+}
+
+fn write_index(user_config_dir: &Path, names: &[String]) -> Result<(), SecretsError> {
+    std::fs::create_dir_all(user_config_dir).map_err(|source| SecretsError::Index {
+        path: user_config_dir.to_path_buf(),
+        source,
+    })?;
+    let file = SecretNamesFile {
+        names: names.to_vec(),
+    };
+    let text = toml::to_string_pretty(&file).expect("SecretNamesFile serializes without error");
+    let path = index_path(user_config_dir);
+    std::fs::write(&path, text).map_err(|source| SecretsError::Index { path, source })
+}
+
+/// Validates `name`, stores the value in the OS keyring, and records the name
+/// in the index. The single write path for named secrets — the `secret set`
+/// CLI and the `/mcp add` wizard both go through here so the index stays
+/// consistent.
+pub fn store_secret(user_config_dir: &Path, name: &str, value: &str) -> Result<(), SecretsError> {
+    if !is_valid_secret_name(name) {
+        return Err(SecretsError::InvalidName(name.to_string()));
+    }
+    SecretStore::set_secret(name, value)?;
+    let mut names = list_secret_names(user_config_dir)?;
+    if !names.iter().any(|n| n == name) {
+        names.push(name.to_string());
+        names.sort();
+    }
+    write_index(user_config_dir, &names)
+}
+
+/// Deletes the keyring entry (a missing entry is not an error) and removes
+/// the name from the index.
+pub fn remove_secret(user_config_dir: &Path, name: &str) -> Result<(), SecretsError> {
+    SecretStore::delete_secret(name)?;
+    let mut names = list_secret_names(user_config_dir)?;
+    names.retain(|n| n != name);
+    write_index(user_config_dir, &names)
 }
 
 impl SecretStore {
@@ -207,5 +307,58 @@ mod tests {
         assert!(!is_valid_secret_name("has space"));
         assert!(!is_valid_secret_name("has:colon"));
         assert!(!is_valid_secret_name("hàs-unicode"));
+    }
+
+    #[test]
+    fn store_secret_writes_keyring_and_index_sorted() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        store_secret(dir.path(), "zeta", "v1").unwrap();
+        store_secret(dir.path(), "alpha", "v2").unwrap();
+        store_secret(dir.path(), "alpha", "v3").unwrap(); // overwrite, no dup in index
+        assert_eq!(
+            list_secret_names(dir.path()).unwrap(),
+            vec!["alpha".to_string(), "zeta".to_string()]
+        );
+        assert_eq!(
+            SecretStore::get_secret("alpha").unwrap(),
+            Some("v3".to_string())
+        );
+        let index_text = std::fs::read_to_string(dir.path().join("secret-names.toml")).unwrap();
+        assert!(
+            !index_text.contains("v3"),
+            "index must never contain values"
+        );
+    }
+
+    #[test]
+    fn remove_secret_deletes_keyring_entry_and_index_line() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        store_secret(dir.path(), "gone", "v").unwrap();
+        remove_secret(dir.path(), "gone").unwrap();
+        assert_eq!(SecretStore::get_secret("gone").unwrap(), None);
+        assert!(list_secret_names(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_secret_rejects_invalid_names() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let err = store_secret(dir.path(), "bad name", "v").unwrap_err();
+        assert!(matches!(err, SecretsError::InvalidName(n) if n == "bad name"));
+    }
+
+    #[test]
+    fn list_secret_names_with_no_index_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(list_secret_names(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sanitize_secret_name_maps_out_of_charset_chars_to_dashes() {
+        assert_eq!(sanitize_secret_name("my tools"), "my-tools");
+        assert_eq!(sanitize_secret_name("ok-name_1"), "ok-name_1");
+        assert_eq!(sanitize_secret_name("a:b/c"), "a-b-c");
     }
 }
