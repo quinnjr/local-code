@@ -29,12 +29,63 @@ Ollama. No cloud calls, no API keys required.
   in-TUI or via `local-code --resume`
 - MCP (Model Context Protocol) client support (stdio/HTTP/SSE/WebSocket)
   alongside built-in file/shell tools, configurable via `/mcp add`'s in-TUI
-  wizard or by hand-editing `mcp.toml` — `${VAR_NAME}` references in
-  `mcp.toml` are expanded from the environment at load time, so secrets
-  (API keys, tokens) don't need to be stored in the file itself
+  wizard or by hand-editing `mcp.toml` (see below)
 - Flat-file cross-session memory (`memory search` / `memory core` / `memory add`)
 - GitHub-backed skills (`skills install` / `skills list` / `skills remove` / `skills update`)
 - Headless mode (`local-code -p "..."`) for scripted, non-interactive use
+
+## Configuring MCP servers (`mcp.toml`)
+
+MCP servers are configured in `mcp.toml`, loaded from two places: the user-level
+config dir (e.g. `~/.config/local-code/` on Linux) and the project-local
+`.local-code/` dir. A project server replaces a user-level server with the same
+name; otherwise both lists are merged. The easiest way to add one is the in-TUI
+`/mcp add` wizard, which also captures an optional bearer token for HTTP/SSE
+servers; the file can equally be edited by hand:
+
+```toml
+# stdio: spawn a child process and speak JSON-RPC over its stdin/stdout
+[[server]]
+name = "fs"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+# http: POST each JSON-RPC message; headers are attached to every request
+[[server]]
+name = "github"
+transport = "http"
+url = "https://api.example.com/mcp"
+[server.headers]
+Authorization = "Bearer ${keyring:github-mcp}"
+
+# sse: HTTP+SSE transport (persistent GET for responses, POSTs for requests)
+[[server]]
+name = "events"
+transport = "sse"
+url = "https://api.example.com/sse"
+
+# websocket: persistent WebSocket; auth must be encoded in the URL itself
+[[server]]
+name = "ws-tools"
+transport = "websocket"
+url = "ws://localhost:9001/mcp?token=${WS_TOKEN}"
+```
+
+Every string field supports two kinds of secret references, resolved at load
+time and never written back to the file:
+
+- `${VAR_NAME}` — replaced with that environment variable's value.
+- `${keyring:<name>}` — replaced with a secret from the OS keyring (Secret
+  Service/libsecret on Linux, Keychain on macOS, Credential Manager on
+  Windows). Store one with `local-code secret set <name>` (the value is
+  prompted, so it never lands in shell history), list names with
+  `local-code secret ls`, delete with `local-code secret rm <name>`. Secret
+  names may contain letters, digits, `-` and `_`.
+
+An unset variable or missing keyring entry resolves to an empty string, so a
+misconfigured secret shows up as an auth failure from the server rather than
+an error at startup.
 
 ## Getting started
 
