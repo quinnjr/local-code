@@ -37,6 +37,21 @@ fn get_or_insert_entry<'a>(
     Ok(cache.get(connection_name).expect("entry was just inserted"))
 }
 
+/// Keyring `user` prefix for generic named secrets, keeping them in a
+/// namespace that can never collide with connection-key entries
+/// (`user = <connection-name>`) or skill host tokens (`user = "github"`…).
+const SECRET_PREFIX: &str = "secret:";
+
+/// Valid names for generic named secrets: non-empty, ASCII alphanumerics
+/// plus `-` and `_`. This is also the exact charset the `${keyring:<name>}`
+/// reference pattern in `config::mcp_servers` matches.
+pub fn is_valid_secret_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 impl SecretStore {
     /// Returns `Ok(None)` if no key is stored for this connection (e.g. the local
     /// server needs no auth), `Ok(Some(key))` if one is, and `Err` on a genuine
@@ -61,6 +76,35 @@ impl SecretStore {
     pub fn delete_api_key(connection_name: &str) -> Result<(), SecretsError> {
         let mut cache = entry_cache().lock().expect("secret entry cache poisoned");
         let entry = get_or_insert_entry(&mut cache, connection_name)?;
+        match entry.delete_credential() {
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    /// Generic named secret, stored under `user = "secret:<name>"`. Returns
+    /// `Ok(None)` when no such secret exists.
+    pub fn get_secret(name: &str) -> Result<Option<String>, SecretsError> {
+        let mut cache = entry_cache().lock().expect("secret entry cache poisoned");
+        let entry = get_or_insert_entry(&mut cache, &format!("{SECRET_PREFIX}{name}"))?;
+        match entry.get_password() {
+            Ok(password) => Ok(Some(password)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    pub fn set_secret(name: &str, value: &str) -> Result<(), SecretsError> {
+        let mut cache = entry_cache().lock().expect("secret entry cache poisoned");
+        let entry = get_or_insert_entry(&mut cache, &format!("{SECRET_PREFIX}{name}"))?;
+        entry.set_password(value)?;
+        Ok(())
+    }
+
+    pub fn delete_secret(name: &str) -> Result<(), SecretsError> {
+        let mut cache = entry_cache().lock().expect("secret entry cache poisoned");
+        let entry = get_or_insert_entry(&mut cache, &format!("{SECRET_PREFIX}{name}"))?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),
@@ -113,5 +157,55 @@ mod tests {
     fn delete_on_missing_key_is_not_an_error() {
         use_mock_keyring();
         SecretStore::delete_api_key("conn-never-existed").unwrap();
+    }
+
+    #[test]
+    fn named_secret_round_trips() {
+        use_mock_keyring();
+        SecretStore::set_secret("github-mcp", "tok-123").unwrap();
+        assert_eq!(
+            SecretStore::get_secret("github-mcp").unwrap(),
+            Some("tok-123".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_named_secret_returns_none() {
+        use_mock_keyring();
+        assert_eq!(SecretStore::get_secret("never-set").unwrap(), None);
+    }
+
+    #[test]
+    fn delete_named_secret_removes_it_and_is_idempotent() {
+        use_mock_keyring();
+        SecretStore::set_secret("to-delete", "v").unwrap();
+        SecretStore::delete_secret("to-delete").unwrap();
+        assert_eq!(SecretStore::get_secret("to-delete").unwrap(), None);
+        SecretStore::delete_secret("to-delete").unwrap(); // missing is not an error
+    }
+
+    #[test]
+    fn named_secrets_do_not_collide_with_connection_keys() {
+        use_mock_keyring();
+        SecretStore::set_api_key("same-name", "connection-key").unwrap();
+        SecretStore::set_secret("same-name", "named-secret").unwrap();
+        assert_eq!(
+            SecretStore::get_api_key("same-name").unwrap(),
+            Some("connection-key".to_string())
+        );
+        assert_eq!(
+            SecretStore::get_secret("same-name").unwrap(),
+            Some("named-secret".to_string())
+        );
+    }
+
+    #[test]
+    fn secret_name_validation_accepts_the_documented_charset_only() {
+        assert!(is_valid_secret_name("github-mcp"));
+        assert!(is_valid_secret_name("A1_b-2"));
+        assert!(!is_valid_secret_name(""));
+        assert!(!is_valid_secret_name("has space"));
+        assert!(!is_valid_secret_name("has:colon"));
+        assert!(!is_valid_secret_name("hàs-unicode"));
     }
 }
