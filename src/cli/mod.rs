@@ -1,6 +1,7 @@
 pub mod connections;
 pub mod mcp;
 pub mod memory;
+pub mod secret;
 pub mod skills;
 
 use crate::agent::headless::run_headless;
@@ -57,6 +58,11 @@ pub enum Command {
         #[command(subcommand)]
         action: SkillsAction,
     },
+    /// Manage named secrets in the OS keyring, referenced from mcp.toml as ${keyring:<name>}
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -109,6 +115,16 @@ pub enum SkillsAction {
         #[arg(long)]
         global: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecretAction {
+    /// Store a secret (value is prompted, never passed as an argument)
+    Set { name: String },
+    /// Delete a secret
+    Rm { name: String },
+    /// List stored secret names (never values)
+    Ls,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -208,6 +224,17 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             }
             SkillsAction::Update { name, global } => {
                 skills::update(&paths, name.as_deref(), global, stdout()).await?;
+            }
+        },
+        Some(Command::Secret { action }) => match action {
+            SecretAction::Set { name } => {
+                secret::set(&paths, &name, stdin().lock(), stdout())?;
+            }
+            SecretAction::Rm { name } => {
+                secret::rm(&paths, &name, stdout())?;
+            }
+            SecretAction::Ls => {
+                secret::ls(&paths, stdout())?;
             }
         },
         None => {
@@ -553,5 +580,36 @@ mod skills_cli_tests {
         } else {
             panic!("expected Some(Command::Skills)");
         }
+    }
+}
+
+#[cfg(test)]
+mod secret_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_secret_set_rm_ls() {
+        let cli = Cli::parse_from(["local-code", "secret", "set", "gh-token"]);
+        match cli.command {
+            Some(Command::Secret {
+                action: SecretAction::Set { name },
+            }) => assert_eq!(name, "gh-token"),
+            other => panic!("expected Secret::Set, got {other:?}"),
+        }
+        let cli = Cli::parse_from(["local-code", "secret", "rm", "gh-token"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret {
+                action: SecretAction::Rm { .. }
+            })
+        ));
+        let cli = Cli::parse_from(["local-code", "secret", "ls"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret {
+                action: SecretAction::Ls
+            })
+        ));
     }
 }
