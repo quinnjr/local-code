@@ -608,14 +608,10 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 });
                             }
                             crate::tui::mcp_wizard::Advance::Finalize(output) => {
-                                // pending_secret is stored in the keyring by the
-                                // finalize task below (see the spawn) — Task 6 wires
-                                // this; until then it is intentionally unused here.
                                 let crate::tui::mcp_wizard::WizardOutput {
                                     config,
                                     pending_secret,
                                 } = output;
-                                let _ = &pending_secret;
                                 pending_menu.set(PendingMenu::McpAddConnecting);
                                 let server_name = config.name.clone();
                                 transcript.update(|entries| {
@@ -640,6 +636,30 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 let model_for_rebuild = current_model.get();
 
                                 tokio::spawn(async move {
+                                    // Store the wizard-captured bearer token in the OS
+                                    // keyring BEFORE saving mcp.toml: a failure here must
+                                    // not leave a config referencing a secret that was
+                                    // never stored (the reverse — a stored secret with no
+                                    // config referencing it — is harmless).
+                                    if let Some(secret) = pending_secret
+                                        && let Err(e) = crate::config::secrets::store_secret(
+                                            &user_config_dir_for_task,
+                                            &secret.name,
+                                            &secret.value,
+                                        )
+                                    {
+                                        transcript_for_task.update(|entries| {
+                                            entries.push(TranscriptEntry::SystemNotice {
+                                                text: format!(
+                                                    "failed to store the bearer token in the OS keyring: {e}. Server '{}' was NOT saved.",
+                                                    config.name
+                                                ),
+                                            });
+                                        });
+                                        pending_menu_for_task.set(PendingMenu::None);
+                                        return;
+                                    }
+
                                     // Save first, using the *raw* (un-interpolated) merged
                                     // list — loading via the interpolating `load_mcp_servers`
                                     // here would permanently bake every other server's
@@ -1549,6 +1569,71 @@ mod tests {
             user_config_dir: dir.join("user-config-unused"),
             ..test_props()
         }
+    }
+
+    static KEYRING_INIT: std::sync::Once = std::sync::Once::new();
+    fn use_mock_keyring() {
+        KEYRING_INIT.call_once(|| {
+            keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_bearer_token_lands_in_keyring_and_reference_in_config() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let user_config_dir = props.user_config_dir.clone();
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "secure-tools").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "4").await; // HTTP
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "http://127.0.0.1:1").await; // nothing listens here
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Bearer token"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "sekrit-tok").await;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        // The token never appears anywhere on screen or on disk.
+        assert!(!t.frame_text().contains("sekrit-tok"), "{}", t.frame_text());
+
+        // Config saved with the literal reference (raw load — no resolution).
+        let saved = crate::config::mcp_servers::load_mcp_servers_raw(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        let crate::config::mcp_servers::McpTransportConfig::Http { headers, .. } =
+            &saved[0].transport
+        else {
+            panic!("expected Http transport");
+        };
+        assert_eq!(
+            headers["Authorization"],
+            "Bearer ${keyring:mcp-secure-tools}"
+        );
+
+        // Token in the (mock) keyring, name in the index.
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_secret("mcp-secure-tools").unwrap(),
+            Some("sekrit-tok".to_string())
+        );
+        assert_eq!(
+            crate::config::secrets::list_secret_names(&user_config_dir).unwrap(),
+            vec!["mcp-secure-tools".to_string()]
+        );
     }
 
     #[tokio::test(start_paused = true)]
