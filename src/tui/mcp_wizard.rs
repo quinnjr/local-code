@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::config::mcp_servers::{McpServerConfig, McpTransportConfig};
+use crate::config::secrets::sanitize_secret_name;
 
 /// Which question the wizard is currently waiting for an answer to. Args are
 /// collected one line at a time (blank line finishes the loop) rather than
@@ -19,7 +20,9 @@ pub enum McpAddStep {
     AskCustomCommand,
     AskCustomArgs { command: String, args: Vec<String> },
     AskHttpUrl,
+    AskHttpBearer { url: String },
     AskSseUrl,
+    AskSseBearer { url: String },
     AskWebsocketUrl,
 }
 
@@ -29,13 +32,30 @@ pub struct McpAddWizard {
     pub step: McpAddStep,
 }
 
+/// A bearer token captured by the wizard that still needs to be written to
+/// the OS keyring by the caller (the wizard itself is side-effect-free).
+#[derive(Debug, PartialEq)]
+pub struct PendingSecret {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct WizardOutput {
+    pub config: McpServerConfig,
+    /// `Some` only when the user entered a bearer token; the caller must
+    /// store it under this name *before* saving the config, which references
+    /// it as `${keyring:<name>}`.
+    pub pending_secret: Option<PendingSecret>,
+}
+
 /// The result of feeding one line of input into `advance`.
 #[derive(Debug, PartialEq)]
 pub enum Advance {
     /// Move to the next step; the `String` is the prompt to show for it.
     Continue(McpAddWizard, String),
     /// All required fields are collected — build the server config.
-    Finalize(McpServerConfig),
+    Finalize(WizardOutput),
     /// The line was invalid for the current step (e.g. blank where a value
     /// is required); re-prompt with the same wizard state (the `String` is
     /// the message to show, ending with a repeat of the original prompt).
@@ -52,6 +72,7 @@ const COMMAND_PROMPT: &str = "Command: ";
 const HTTP_URL_PROMPT: &str = "HTTP URL: ";
 const SSE_URL_PROMPT: &str = "SSE URL: ";
 const WEBSOCKET_URL_PROMPT: &str = "WebSocket URL: ";
+const BEARER_PROMPT: &str = "Bearer token (blank for none): ";
 
 /// Starts a fresh wizard, returning its initial state and the first prompt
 /// to show the user.
@@ -155,12 +176,15 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
             if trimmed.is_empty() {
                 let mut full_args = vec!["-y".to_string(), package];
                 full_args.extend(args);
-                return Advance::Finalize(McpServerConfig {
-                    name: wizard.name,
-                    transport: McpTransportConfig::Stdio {
-                        command: "npx".to_string(),
-                        args: full_args,
+                return Advance::Finalize(WizardOutput {
+                    config: McpServerConfig {
+                        name: wizard.name,
+                        transport: McpTransportConfig::Stdio {
+                            command: "npx".to_string(),
+                            args: full_args,
+                        },
                     },
+                    pending_secret: None,
                 });
             }
             args.push(trimmed.to_string());
@@ -194,12 +218,15 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
             if trimmed.is_empty() {
                 let mut full_args = vec!["run".to_string(), package];
                 full_args.extend(args);
-                return Advance::Finalize(McpServerConfig {
-                    name: wizard.name,
-                    transport: McpTransportConfig::Stdio {
-                        command: "pipx".to_string(),
-                        args: full_args,
+                return Advance::Finalize(WizardOutput {
+                    config: McpServerConfig {
+                        name: wizard.name,
+                        transport: McpTransportConfig::Stdio {
+                            command: "pipx".to_string(),
+                            args: full_args,
+                        },
                     },
+                    pending_secret: None,
                 });
             }
             args.push(trimmed.to_string());
@@ -231,9 +258,12 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
         }
         McpAddStep::AskCustomArgs { command, mut args } => {
             if trimmed.is_empty() {
-                return Advance::Finalize(McpServerConfig {
-                    name: wizard.name,
-                    transport: McpTransportConfig::Stdio { command, args },
+                return Advance::Finalize(WizardOutput {
+                    config: McpServerConfig {
+                        name: wizard.name,
+                        transport: McpTransportConfig::Stdio { command, args },
+                    },
+                    pending_secret: None,
                 });
             }
             args.push(trimmed.to_string());
@@ -249,24 +279,48 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
             if trimmed.is_empty() {
                 return Advance::Invalid(wizard, format!("URL cannot be empty. {HTTP_URL_PROMPT}"));
             }
-            Advance::Finalize(McpServerConfig {
-                name: wizard.name,
-                transport: McpTransportConfig::Http {
-                    url: trimmed.to_string(),
-                    headers: HashMap::new(),
+            Advance::Continue(
+                McpAddWizard {
+                    name: wizard.name,
+                    step: McpAddStep::AskHttpBearer {
+                        url: trimmed.to_string(),
+                    },
                 },
+                BEARER_PROMPT.to_string(),
+            )
+        }
+        McpAddStep::AskHttpBearer { url } => {
+            let (headers, pending_secret) = bearer_headers(&wizard.name, trimmed);
+            Advance::Finalize(WizardOutput {
+                config: McpServerConfig {
+                    name: wizard.name,
+                    transport: McpTransportConfig::Http { url, headers },
+                },
+                pending_secret,
             })
         }
         McpAddStep::AskSseUrl => {
             if trimmed.is_empty() {
                 return Advance::Invalid(wizard, format!("URL cannot be empty. {SSE_URL_PROMPT}"));
             }
-            Advance::Finalize(McpServerConfig {
-                name: wizard.name,
-                transport: McpTransportConfig::Sse {
-                    url: trimmed.to_string(),
-                    headers: HashMap::new(),
+            Advance::Continue(
+                McpAddWizard {
+                    name: wizard.name,
+                    step: McpAddStep::AskSseBearer {
+                        url: trimmed.to_string(),
+                    },
                 },
+                BEARER_PROMPT.to_string(),
+            )
+        }
+        McpAddStep::AskSseBearer { url } => {
+            let (headers, pending_secret) = bearer_headers(&wizard.name, trimmed);
+            Advance::Finalize(WizardOutput {
+                config: McpServerConfig {
+                    name: wizard.name,
+                    transport: McpTransportConfig::Sse { url, headers },
+                },
+                pending_secret,
             })
         }
         McpAddStep::AskWebsocketUrl => {
@@ -276,14 +330,42 @@ pub fn advance(wizard: McpAddWizard, line: &str) -> Advance {
                     format!("URL cannot be empty. {WEBSOCKET_URL_PROMPT}"),
                 );
             }
-            Advance::Finalize(McpServerConfig {
-                name: wizard.name,
-                transport: McpTransportConfig::Websocket {
-                    url: trimmed.to_string(),
+            Advance::Finalize(WizardOutput {
+                config: McpServerConfig {
+                    name: wizard.name,
+                    transport: McpTransportConfig::Websocket {
+                        url: trimmed.to_string(),
+                    },
                 },
+                pending_secret: None,
             })
         }
     }
+}
+
+/// Builds the header map and pending keyring secret for a bearer token
+/// entered in the wizard. A blank token means no headers and no secret. The
+/// secret name is derived from the (sanitized) server name so the header
+/// reference and the keyring entry always agree.
+fn bearer_headers(
+    server_name: &str,
+    token: &str,
+) -> (HashMap<String, String>, Option<PendingSecret>) {
+    if token.is_empty() {
+        return (HashMap::new(), None);
+    }
+    let secret_name = format!("mcp-{}", sanitize_secret_name(server_name));
+    let headers = HashMap::from([(
+        "Authorization".to_string(),
+        format!("Bearer ${{keyring:{secret_name}}}"),
+    )]);
+    (
+        headers,
+        Some(PendingSecret {
+            name: secret_name,
+            value: token.to_string(),
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -340,10 +422,10 @@ mod tests {
             panic!("expected Continue")
         };
         match advance(wizard, "") {
-            Advance::Finalize(config) => {
-                assert_eq!(config.name, "my-server");
+            Advance::Finalize(output) => {
+                assert_eq!(output.config.name, "my-server");
                 assert_eq!(
-                    config.transport,
+                    output.config.transport,
                     McpTransportConfig::Stdio {
                         command: "npx".into(),
                         args: vec![
@@ -365,9 +447,9 @@ mod tests {
             panic!("expected Continue")
         };
         match advance(wizard, "") {
-            Advance::Finalize(config) => {
+            Advance::Finalize(output) => {
                 assert_eq!(
-                    config.transport,
+                    output.config.transport,
                     McpTransportConfig::Stdio {
                         command: "pipx".into(),
                         args: vec!["run".into(), "some-pipx-tool".into()],
@@ -388,9 +470,9 @@ mod tests {
             panic!("expected Continue")
         };
         match advance(wizard, "") {
-            Advance::Finalize(config) => {
+            Advance::Finalize(output) => {
                 assert_eq!(
-                    config.transport,
+                    output.config.transport,
                     McpTransportConfig::Stdio {
                         command: "my-mcp-binary".into(),
                         args: vec!["--flag".into()]
@@ -402,12 +484,17 @@ mod tests {
     }
 
     #[test]
-    fn http_branch_finalizes_directly_from_the_url_with_no_headers() {
+    fn http_branch_with_blank_token_finalizes_with_no_headers_and_no_secret() {
         let wizard = name_and_transport("4");
-        match advance(wizard, "http://localhost:9000/mcp") {
-            Advance::Finalize(config) => {
+        let Advance::Continue(wizard, prompt) = advance(wizard, "http://localhost:9000/mcp") else {
+            panic!("expected Continue to the bearer prompt")
+        };
+        assert!(prompt.contains("Bearer token"));
+        match advance(wizard, "") {
+            Advance::Finalize(output) => {
+                assert_eq!(output.pending_secret, None);
                 assert_eq!(
-                    config.transport,
+                    output.config.transport,
                     McpTransportConfig::Http {
                         url: "http://localhost:9000/mcp".into(),
                         headers: HashMap::new()
@@ -419,12 +506,47 @@ mod tests {
     }
 
     #[test]
-    fn sse_branch_finalizes_directly_from_the_url() {
-        let wizard = name_and_transport("5");
-        match advance(wizard, "http://localhost:9002/sse") {
-            Advance::Finalize(config) => {
+    fn http_branch_with_token_finalizes_with_keyring_reference_and_pending_secret() {
+        let wizard = name_and_transport("4");
+        let Advance::Continue(wizard, _) = advance(wizard, "http://localhost:9000/mcp") else {
+            panic!("expected Continue")
+        };
+        match advance(wizard, "tok-secret-1") {
+            Advance::Finalize(output) => {
                 assert_eq!(
-                    config.transport,
+                    output.pending_secret,
+                    Some(PendingSecret {
+                        name: "mcp-my-server".into(),
+                        value: "tok-secret-1".into(),
+                    })
+                );
+                assert_eq!(
+                    output.config.transport,
+                    McpTransportConfig::Http {
+                        url: "http://localhost:9000/mcp".into(),
+                        headers: HashMap::from([(
+                            "Authorization".to_string(),
+                            "Bearer ${keyring:mcp-my-server}".to_string(),
+                        )]),
+                    }
+                );
+            }
+            other => panic!("expected Finalize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sse_branch_with_blank_token_finalizes_with_no_headers_and_no_secret() {
+        let wizard = name_and_transport("5");
+        let Advance::Continue(wizard, prompt) = advance(wizard, "http://localhost:9002/sse") else {
+            panic!("expected Continue to the bearer prompt")
+        };
+        assert!(prompt.contains("Bearer token"));
+        match advance(wizard, "") {
+            Advance::Finalize(output) => {
+                assert_eq!(output.pending_secret, None);
+                assert_eq!(
+                    output.config.transport,
                     McpTransportConfig::Sse {
                         url: "http://localhost:9002/sse".into(),
                         headers: HashMap::new()
@@ -436,12 +558,50 @@ mod tests {
     }
 
     #[test]
+    fn sse_branch_with_token_finalizes_with_keyring_reference() {
+        let wizard = name_and_transport("5");
+        let Advance::Continue(wizard, prompt) = advance(wizard, "http://localhost:9002/sse") else {
+            panic!("expected Continue to the bearer prompt")
+        };
+        assert!(prompt.contains("Bearer token"));
+        match advance(wizard, "tok-sse") {
+            Advance::Finalize(output) => {
+                let McpTransportConfig::Sse { headers, .. } = &output.config.transport else {
+                    panic!("expected Sse transport");
+                };
+                assert_eq!(headers["Authorization"], "Bearer ${keyring:mcp-my-server}");
+            }
+            other => panic!("expected Finalize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_name_is_sanitized_from_the_server_name() {
+        let (wizard, _) = start();
+        let Advance::Continue(wizard, _) = advance(wizard, "my tools!") else {
+            panic!("expected Continue")
+        };
+        let Advance::Continue(wizard, _) = advance(wizard, "4") else {
+            panic!("expected Continue")
+        };
+        let Advance::Continue(wizard, _) = advance(wizard, "http://localhost:9000/mcp") else {
+            panic!("expected Continue")
+        };
+        match advance(wizard, "tok") {
+            Advance::Finalize(output) => {
+                assert_eq!(output.pending_secret.unwrap().name, "mcp-my-tools-");
+            }
+            other => panic!("expected Finalize, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn websocket_branch_finalizes_directly_from_the_url() {
         let wizard = name_and_transport("6");
         match advance(wizard, "ws://localhost:9001/mcp") {
-            Advance::Finalize(config) => {
+            Advance::Finalize(output) => {
                 assert_eq!(
-                    config.transport,
+                    output.config.transport,
                     McpTransportConfig::Websocket {
                         url: "ws://localhost:9001/mcp".into()
                     }

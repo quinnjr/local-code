@@ -607,7 +607,15 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     entries.push(TranscriptEntry::SystemNotice { text: message });
                                 });
                             }
-                            crate::tui::mcp_wizard::Advance::Finalize(config) => {
+                            crate::tui::mcp_wizard::Advance::Finalize(output) => {
+                                // pending_secret is stored in the keyring by the
+                                // finalize task below (see the spawn) — Task 6 wires
+                                // this; until then it is intentionally unused here.
+                                let crate::tui::mcp_wizard::WizardOutput {
+                                    config,
+                                    pending_secret,
+                                } = output;
+                                let _ = &pending_secret;
                                 pending_menu.set(PendingMenu::McpAddConnecting);
                                 let server_name = config.name.clone();
                                 transcript.update(|entries| {
@@ -1570,6 +1578,13 @@ mod tests {
         assert!(t.frame_text().contains("HTTP URL:"), "{}", t.frame_text());
 
         type_and_submit(&mut t, "http://127.0.0.1:1").await; // nothing listens here
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Bearer token"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "").await; // no token
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             t.tick().await.unwrap();
@@ -1792,6 +1807,13 @@ mod tests {
         assert!(t.frame_text().contains("SSE URL:"), "{}", t.frame_text());
 
         type_and_submit(&mut t, "http://127.0.0.1:1").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Bearer token"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "").await; // no token
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             t.tick().await.unwrap();
