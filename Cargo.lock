@@ -654,13 +654,14 @@ dependencies = [
 
 [[package]]
 name = "daimon"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c41b0116729c59da2e98d78ace0657145851d3a46f46bf1aa4229d9f354077f9"
+checksum = "4118553c2c0923e3e275b22ce6c378ce1b20f4b75e35826d20d06ee2e507fdb8"
 dependencies = [
  "async-stream",
  "daimon-core",
  "daimon-macros",
+ "daimon-provider-local",
  "futures",
  "itoa",
  "jsonschema",
@@ -680,9 +681,9 @@ dependencies = [
 
 [[package]]
 name = "daimon-core"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12cc5905b781052bbbcaec51e893ec3db2a1241a990c2f9053eaa7e7b664daa2"
+checksum = "2e1958968a7df903e15d9561326eba50110b63414591bfaecd66745d2d68fad5"
 dependencies = [
  "async-stream",
  "futures",
@@ -696,13 +697,29 @@ dependencies = [
 
 [[package]]
 name = "daimon-macros"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7af9221172002e54443c3230fafc52e922b9668b27002c1d245d59236c267a89"
+checksum = "f6e766fe871bf4320c3b1d2e7630303102088ca5bf863a1b6a39221441926fa1"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "daimon-provider-local"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9aea7b81a72101001361e4299fd5ece8c749fe239c707b3235e5ae750087165a"
+dependencies = [
+ "async-stream",
+ "daimon-core",
+ "futures",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
