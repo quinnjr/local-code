@@ -87,6 +87,24 @@ An unset variable or missing keyring entry resolves to an empty string, so a
 misconfigured secret shows up as an auth failure from the server rather than
 an error at startup.
 
+## Secret storage
+
+API keys and named secrets never live in plaintext files. They are stored in:
+
+- **macOS** — the Keychain
+- **Windows** — the Credential Manager
+- **Linux and other unix** — the Secret Service (GNOME Keyring / KWallet).
+  If no Secret Service daemon is running — headless boxes, minimal window
+  managers, servers — local-code automatically falls back to
+  [`pass`](https://www.passwordstore.org/), the standard unix password
+  manager: entries are GPG-encrypted under `local-code/` in your password
+  store (`$PASSWORD_STORE_DIR` or `~/.password-store`) and are fully
+  readable with the `pass` CLI. The store must be initialized first
+  (`pass init <gpg-id>`); building from source on unix requires libgpgme
+  (`libgpgme-dev` on Debian/Ubuntu, `gpgme` on Arch).
+
+The backend is chosen once per run, at the first secret access.
+
 ## Getting started
 
 ```bash
