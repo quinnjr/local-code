@@ -31,6 +31,7 @@ futures = "0.3.32"
 chrono = { version = "0.4", features = ["clock"] }
 ignore = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tracing = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }

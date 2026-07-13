@@ -59,7 +59,7 @@ cargo test --test live_ollama -- --ignored --nocapture
 ### Module map (`src/`)
 
 - `cli/` — clap `Cli`/`Command` definitions and the non-interactive subcommand handlers
-  (`connections`, `mcp`, `memory`, `skills`). `cli::run` is the top-level dispatcher called from
+  (`connections`, `mcp`, `memory`, `skills`, `secret`). `cli::run` is the top-level dispatcher called from
   `main.rs`: `-p/--prompt` routes to headless mode, a `Command` routes to a CLI subcommand handler,
   and no args/command launches the TUI.
 - `tui/` — the interactive terminal UI, built as an `ntui` component tree.
@@ -90,7 +90,8 @@ cargo test --test live_ollama -- --ignored --nocapture
 - `config/` — `Paths` (resolves user config/state dirs via `directories::ProjectDirs` plus the
   project-local `.local-code/` dir), `connection.rs` (LLM server connections), `mcp_servers.rs`
   (`mcp.toml` load/save with `${VAR}` env interpolation — see below), `secrets.rs` (OS
-  keyring-backed API key storage via the `keyring` crate).
+  keyring-backed API key + generic named-secret storage via the `keyring` crate, plus the
+  names-only `secret-names.toml` index for `secret ls`).
 - `mcp/` — MCP (Model Context Protocol) client support. `connect.rs::connect_all` discovers tools
   from every configured server (stdio/HTTP/SSE/WebSocket transports, from `daimon`), tolerating
   individual server failures without aborting startup. `tool.rs::NamespacedMcpTool` wraps a
@@ -145,7 +146,8 @@ cargo test --test live_ollama -- --ignored --nocapture
   `user_config_dir` (OS config dir via `directories`), `project_config_dir` (`.local-code/` under
   the project root), `user_state_dir` (OS state dir, sessions live here). Always resolve via
   `Paths::resolve(project_root)`, don't hand-roll path joins elsewhere.
-- **`mcp.toml`** supports `${VAR_NAME}` interpolation from the environment at load time
+- **`mcp.toml`** supports `${VAR_NAME}` (environment) and `${keyring:<name>}` (OS keyring via
+  `SecretStore`, managed by `local-code secret set/rm/ls`) interpolation at load time
   (`config::mcp_servers::load_mcp_servers` interpolates; `load_mcp_servers_raw` does not — used
   when round-tripping the file for editing so secrets aren't baked into what gets written back).
 - **Secrets** are never stored in plaintext config files — `config::secrets::SecretStore` goes

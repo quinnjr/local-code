@@ -8,6 +8,8 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::config::secrets::SecretStore;
+
 /// How to reach an MCP server: the four client transports `daimon`'s vendored
 /// `mcp` feature supports (`daimon::mcp::{StdioTransport, HttpTransport, WebSocketTransport}`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -80,7 +82,7 @@ pub enum McpServersError {
 }
 
 /// Loads and merges `mcp.toml` from `user_config_dir` and
-/// `project_config_dir`, resolving `${VAR}` references along the way. A
+/// `project_config_dir`, resolving `${VAR}` and `${keyring:<name>}` references along the way. A
 /// server in the project file replaces a user-level server of the same
 /// name; otherwise servers from both files are kept, user-level first.
 /// Missing files yield an empty list, not an error — the same layering
@@ -148,57 +150,81 @@ pub fn save_mcp_servers(dir: &Path, servers: &[McpServerConfig]) -> Result<(), M
     fs::write(&path, text).map_err(|source| McpServersError::Write { path, source })
 }
 
-static ENV_VAR_PATTERN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap());
+/// One combined pattern for both reference forms, resolved in a single pass
+/// so a substituted value is never itself re-scanned for references:
+/// capture 1 = `${keyring:<name>}` (secret-name charset), capture 2 =
+/// `${VAR_NAME}` (env-var charset, unchanged from the original pattern).
+static REF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$\{(?:keyring:([A-Za-z0-9_-]+)|([A-Za-z_][A-Za-z0-9_]*))\}").unwrap()
+});
 
-/// Replaces every `${VAR_NAME}` occurrence in `value` with that environment
-/// variable's value, or an empty string if it's unset — a misconfigured
-/// secret then fails at the point of use (e.g. an empty Bearer token gets a
-/// 401 from the server) rather than at config-load time.
-fn interpolate_env(value: &str) -> String {
-    ENV_VAR_PATTERN
+/// Replaces every `${keyring:<name>}` occurrence with that secret from the OS
+/// keyring, and every `${VAR_NAME}` occurrence with that environment
+/// variable's value. A missing secret/variable becomes an empty string — a
+/// misconfigured secret then fails at the point of use (e.g. an empty Bearer
+/// token gets a 401 from the server) rather than at config-load time; a
+/// keyring backend error is logged and resolves to an empty string.
+fn interpolate_refs(value: &str) -> String {
+    REF_PATTERN
         .replace_all(value, |caps: &regex::Captures| {
-            std::env::var(&caps[1]).unwrap_or_default()
+            if let Some(name) = caps.get(1) {
+                match SecretStore::get_secret(name.as_str()) {
+                    Ok(Some(secret)) => secret,
+                    Ok(None) => String::new(),
+                    Err(err) => {
+                        tracing::warn!(
+                            secret_name = name.as_str(),
+                            error = %err,
+                            "keyring backend error while resolving secret reference"
+                        );
+                        String::new()
+                    }
+                }
+            } else {
+                std::env::var(&caps[2]).unwrap_or_default()
+            }
         })
         .into_owned()
 }
 
-/// Resolves `${VAR}` references in a single, already-in-hand server config —
+/// Resolves `${VAR}` and `${keyring:<name>}` references in a single,
+/// already-in-hand server config —
 /// for a caller (the `/mcp add` wizard's live-connect step) that built the
 /// config directly from user input rather than loading it from disk via
-/// [`load_mcp_servers`], but still needs the same env resolution before
-/// attempting to connect.
-pub fn resolve_server_env(server: McpServerConfig) -> McpServerConfig {
+/// [`load_mcp_servers`], but still needs the same reference resolution
+/// before attempting to connect.
+pub fn resolve_server_refs(server: McpServerConfig) -> McpServerConfig {
     McpServerConfig {
         name: server.name,
         transport: interpolate_transport(server.transport),
     }
 }
 
-/// Applies `interpolate_env` to every string field of a transport config:
-/// `command`, each `args` entry, `url`, and every header key/value.
+/// Applies `interpolate_refs` to every string field of a transport config:
+/// `command`, each `args` entry, `url`, and every header key/value, resolving
+/// `${VAR}` and `${keyring:<name>}` references.
 fn interpolate_transport(transport: McpTransportConfig) -> McpTransportConfig {
     match transport {
         McpTransportConfig::Stdio { command, args } => McpTransportConfig::Stdio {
-            command: interpolate_env(&command),
-            args: args.iter().map(|a| interpolate_env(a)).collect(),
+            command: interpolate_refs(&command),
+            args: args.iter().map(|a| interpolate_refs(a)).collect(),
         },
         McpTransportConfig::Http { url, headers } => McpTransportConfig::Http {
-            url: interpolate_env(&url),
+            url: interpolate_refs(&url),
             headers: headers
                 .into_iter()
-                .map(|(k, v)| (interpolate_env(&k), interpolate_env(&v)))
+                .map(|(k, v)| (interpolate_refs(&k), interpolate_refs(&v)))
                 .collect(),
         },
         McpTransportConfig::Sse { url, headers } => McpTransportConfig::Sse {
-            url: interpolate_env(&url),
+            url: interpolate_refs(&url),
             headers: headers
                 .into_iter()
-                .map(|(k, v)| (interpolate_env(&k), interpolate_env(&v)))
+                .map(|(k, v)| (interpolate_refs(&k), interpolate_refs(&v)))
                 .collect(),
         },
         McpTransportConfig::Websocket { url } => McpTransportConfig::Websocket {
-            url: interpolate_env(&url),
+            url: interpolate_refs(&url),
         },
     }
 }
@@ -239,7 +265,16 @@ fn load_one(path: &Path) -> Result<McpServersFile, McpServersError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::secrets::SecretStore;
+    use std::sync::Once;
     use tempfile::tempdir;
+
+    static KEYRING_INIT: Once = Once::new();
+    fn use_mock_keyring() {
+        KEYRING_INIT.call_once(|| {
+            keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        });
+    }
 
     #[test]
     fn parses_stdio_transport() {
@@ -732,5 +767,83 @@ url = "http://localhost:9002/sse"
                 headers: HashMap::new()
             }
         );
+    }
+
+    #[test]
+    fn keyring_reference_resolves_from_the_secret_store() {
+        use_mock_keyring();
+        SecretStore::set_secret("mcp-github", "tok-abc").unwrap();
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mcp.toml"),
+            r#"
+[[server]]
+name = "github"
+transport = "http"
+url = "http://localhost:9000/mcp"
+
+[server.headers]
+Authorization = "Bearer ${keyring:mcp-github}"
+"#,
+        )
+        .unwrap();
+        let servers = load_mcp_servers(dir.path(), std::path::Path::new("/nonexistent")).unwrap();
+        let McpTransportConfig::Http { headers, .. } = &servers[0].transport else {
+            panic!("expected Http transport");
+        };
+        assert_eq!(headers["Authorization"], "Bearer tok-abc");
+    }
+
+    #[test]
+    fn missing_keyring_reference_resolves_to_empty_string() {
+        use_mock_keyring();
+        let resolved = super::interpolate_refs("Bearer ${keyring:not-stored-anywhere}");
+        assert_eq!(resolved, "Bearer ");
+    }
+
+    #[test]
+    fn keyring_and_env_references_coexist_in_one_value() {
+        use_mock_keyring();
+        SecretStore::set_secret("mix-secret", "S").unwrap();
+        // SAFETY-of-test: set_var is fine in a test that owns this var name.
+        unsafe { std::env::set_var("MCP_MIX_ENV_VAR", "E") };
+        let resolved = super::interpolate_refs("${MCP_MIX_ENV_VAR}/${keyring:mix-secret}");
+        assert_eq!(resolved, "E/S");
+    }
+
+    #[test]
+    fn substituted_secret_values_are_never_rescanned_for_references() {
+        use_mock_keyring();
+        SecretStore::set_secret("cr-outer", "${keyring:cr-inner}").unwrap();
+        SecretStore::set_secret("cr-inner", "PWNED").unwrap();
+        let resolved = super::interpolate_refs("${keyring:cr-outer}");
+        assert_eq!(resolved, "${keyring:cr-inner}");
+        assert!(!resolved.contains("PWNED"));
+    }
+
+    #[test]
+    fn raw_load_keeps_keyring_references_literal() {
+        use_mock_keyring();
+        SecretStore::set_secret("mcp-raw", "should-not-appear").unwrap();
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("mcp.toml"),
+            r#"
+[[server]]
+name = "raw"
+transport = "http"
+url = "http://localhost:9000/mcp"
+
+[server.headers]
+Authorization = "Bearer ${keyring:mcp-raw}"
+"#,
+        )
+        .unwrap();
+        let servers =
+            load_mcp_servers_raw(dir.path(), std::path::Path::new("/nonexistent")).unwrap();
+        let McpTransportConfig::Http { headers, .. } = &servers[0].transport else {
+            panic!("expected Http transport");
+        };
+        assert_eq!(headers["Authorization"], "Bearer ${keyring:mcp-raw}");
     }
 }
