@@ -47,12 +47,55 @@ fn entry_cache() -> &'static Mutex<HashMap<String, keyring::Entry>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Fallback selection for unix systems whose primary backend is Secret
+/// Service: probe it once per process and switch to pass (password-store)
+/// if it is unreachable. See `config::pass_backend`.
+#[cfg(all(unix, not(target_os = "macos")))]
+mod backend {
+    use std::sync::OnceLock;
+
+    /// True when the probe shows the current default credential store
+    /// answered: `Ok` or a clean "no such entry" both mean the daemon is
+    /// reachable; any other error means it is not.
+    pub(super) fn secret_service_reachable(probe: &keyring::Result<String>) -> bool {
+        matches!(probe, Ok(_) | Err(keyring::Error::NoEntry))
+    }
+
+    /// Probes the default credential store once per process and, if it is
+    /// unreachable (no Secret Service daemon), installs the pass-backed
+    /// builder instead. Runs lazily at first secret use, so interactive
+    /// startup never pays the D-Bus connection cost. Test modules that
+    /// install the mock builder first are unaffected: the probe goes
+    /// through the mock, answers `NoEntry`, and the mock stays in place.
+    pub(super) fn ensure_backend() {
+        static PROBED: OnceLock<()> = OnceLock::new();
+        PROBED.get_or_init(|| {
+            let probe = keyring::Entry::new(super::SERVICE_NAME, "__backend-probe")
+                .and_then(|entry| entry.get_password());
+            if !secret_service_reachable(&probe) {
+                if let Err(err) = &probe {
+                    tracing::warn!(
+                        error = %err,
+                        "secret service unavailable; falling back to pass (password-store)"
+                    );
+                }
+                keyring::set_default_credential_builder(Box::new(
+                    crate::config::pass_backend::PassCredentialBuilder::new(),
+                ));
+            }
+        });
+    }
+}
+
 /// Fetches the cached `Entry` for `connection_name`, creating and caching one if
 /// absent.
 fn get_or_insert_entry<'a>(
     cache: &'a mut HashMap<String, keyring::Entry>,
     connection_name: &str,
 ) -> Result<&'a keyring::Entry, SecretsError> {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    backend::ensure_backend();
+
     if !cache.contains_key(connection_name) {
         let entry = keyring::Entry::new(SERVICE_NAME, connection_name)?;
         cache.insert(connection_name.to_string(), entry);
@@ -412,5 +455,23 @@ mod tests {
         assert_eq!(sanitize_secret_name("my tools"), "my-tools");
         assert_eq!(sanitize_secret_name("ok-name_1"), "ok-name_1");
         assert_eq!(sanitize_secret_name("a:b/c"), "a-b-c");
+    }
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(test)]
+mod backend_tests {
+    use super::backend::secret_service_reachable;
+
+    #[test]
+    fn ok_and_no_entry_mean_reachable() {
+        assert!(secret_service_reachable(&Ok("anything".to_string())));
+        assert!(secret_service_reachable(&Err(keyring::Error::NoEntry)));
+    }
+
+    #[test]
+    fn platform_failure_means_unreachable() {
+        let err = keyring::Error::PlatformFailure("no dbus session".to_string().into());
+        assert!(!secret_service_reachable(&Err(err)));
     }
 }
