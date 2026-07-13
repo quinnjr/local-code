@@ -654,14 +654,16 @@ dependencies = [
 
 [[package]]
 name = "daimon"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4118553c2c0923e3e275b22ce6c378ce1b20f4b75e35826d20d06ee2e507fdb8"
+checksum = "25cd31a58023dab1a56644453b5a7ca960992963668aca16e415bcf7bea655b3"
 dependencies = [
  "async-stream",
  "daimon-core",
  "daimon-macros",
+ "daimon-provider-anthropic",
  "daimon-provider-local",
+ "daimon-provider-openai",
  "futures",
  "itoa",
  "jsonschema",
@@ -681,9 +683,9 @@ dependencies = [
 
 [[package]]
 name = "daimon-core"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e1958968a7df903e15d9561326eba50110b63414591bfaecd66745d2d68fad5"
+checksum = "91b315b69d1131f6e3b18ddfccc2d8dd7db14a42d71c21e7594e0e1b312652ad"
 dependencies = [
  "async-stream",
  "futures",
@@ -697,9 +699,9 @@ dependencies = [
 
 [[package]]
 name = "daimon-macros"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6e766fe871bf4320c3b1d2e7630303102088ca5bf863a1b6a39221441926fa1"
+checksum = "ccbcc6f2922472af2a434a3e07a1c0b1b1041b8ed0d26be8e941a5f7e9e9764b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -707,10 +709,42 @@ dependencies = [
 ]
 
 [[package]]
-name = "daimon-provider-local"
-version = "0.21.0"
+name = "daimon-provider-anthropic"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9aea7b81a72101001361e4299fd5ece8c749fe239c707b3235e5ae750087165a"
+checksum = "557b8228910693126c5e14bfe84473763f761113186bcb9ad9fd8221bd6cb4a2"
+dependencies = [
+ "async-stream",
+ "daimon-core",
+ "futures",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "daimon-provider-local"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65e4cff9694346c51d9c800742584a557e13c044eed37dce7a3cc3bca9224527"
+dependencies = [
+ "async-stream",
+ "daimon-core",
+ "futures",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "daimon-provider-openai"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "919517ec935d2b27fcbe82b647c098f4659af2f57528eb2959c776dd8e643f5c"
 dependencies = [
  "async-stream",
  "daimon-core",

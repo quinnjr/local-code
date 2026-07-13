@@ -31,7 +31,12 @@ pub fn build_model(
                     .with_model(connection.default_model.clone())
                     .with_timeout(std::time::Duration::from_secs(300));
             if let Some(key) = api_key.filter(|k| !k.is_empty()) {
-                m = m.with_api_key(key);
+                // Since daimon 0.22, sending an API key over plaintext `http://` is a
+                // hard error unless explicitly allowed. This binary only ever talks to
+                // local/local-network servers (vLLM `--api-key`, LM Studio, ...), where
+                // keyed-but-plaintext is the normal deployment, so opt in here rather
+                // than break every keyed local connection.
+                m = m.with_api_key(key).allow_plaintext_api_key();
             }
             std::sync::Arc::new(m)
         }
