@@ -228,7 +228,12 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
         },
         Some(Command::Secret { action }) => match action {
             SecretAction::Set { name } => {
-                secret::set(&paths, &name, stdin().lock(), stdout())?;
+                if stdin().is_terminal() {
+                    let value = rpassword::prompt_password(format!("Value for '{name}': "))?;
+                    secret::store_value(&paths, &name, value.trim(), stdout())?;
+                } else {
+                    secret::set(&paths, &name, stdin().lock(), stdout())?;
+                }
             }
             SecretAction::Rm { name } => {
                 secret::rm(&paths, &name, stdout())?;

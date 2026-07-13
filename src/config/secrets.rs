@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,11 @@ pub struct SecretStore;
 /// persistence keyed by service/user), so a fresh `Entry::new(...)` per call would
 /// never see data set by an earlier call. Reusing the same `Entry` per connection
 /// name fixes that without changing behavior against real backends.
+///
+/// This cache is process-global and is never cleared, so under the mock
+/// backend every keyring-touching test in the whole crate shares the same
+/// underlying store for the lifetime of the test process — tests must use
+/// globally-unique connection/secret names to avoid seeing each other's data.
 fn entry_cache() -> &'static Mutex<HashMap<String, keyring::Entry>> {
     static CACHE: OnceLock<Mutex<HashMap<String, keyring::Entry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -113,6 +119,20 @@ pub fn list_secret_names(user_config_dir: &Path) -> Result<Vec<String>, SecretsE
     Ok(file.names)
 }
 
+/// Returns a per-process-unique suffix for temp file names, so concurrent
+/// `write_index` calls within the same process never race on the same temp
+/// path.
+fn next_tmp_suffix() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Writes `names` to the index atomically: the new contents are written to a
+/// temp file in the same directory, then renamed over `secret-names.toml`.
+/// `rename` within one filesystem is atomic, so a crash or a concurrent
+/// writer can never observe a truncated or partially-written index — the
+/// file that exists at `secret-names.toml` is always either the old
+/// contents or the new contents in full.
 fn write_index(user_config_dir: &Path, names: &[String]) -> Result<(), SecretsError> {
     std::fs::create_dir_all(user_config_dir).map_err(|source| SecretsError::Index {
         path: user_config_dir.to_path_buf(),
@@ -123,7 +143,16 @@ fn write_index(user_config_dir: &Path, names: &[String]) -> Result<(), SecretsEr
     };
     let text = toml::to_string_pretty(&file).expect("SecretNamesFile serializes without error");
     let path = index_path(user_config_dir);
-    std::fs::write(&path, text).map_err(|source| SecretsError::Index { path, source })
+    let tmp_path = user_config_dir.join(format!(
+        "secret-names.toml.tmp-{}-{}",
+        std::process::id(),
+        next_tmp_suffix()
+    ));
+    std::fs::write(&tmp_path, text).map_err(|source| SecretsError::Index {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp_path, &path).map_err(|source| SecretsError::Index { path, source })
 }
 
 /// Validates `name`, stores the value in the OS keyring, and records the name
@@ -226,6 +255,10 @@ mod tests {
     /// Switches keyring to its platform-independent in-memory mock store so tests
     /// don't touch the real OS secret manager and can run in CI without a display
     /// server / Keychain prompt.
+    ///
+    /// The mock builder is installed once, process-wide, and the `entry_cache` it
+    /// backs is never cleared — every keyring test in the whole crate must use a
+    /// unique name — parallel tests share this process-global store.
     fn use_mock_keyring() {
         INIT.call_once(|| {
             keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
@@ -364,6 +397,14 @@ mod tests {
     fn list_secret_names_with_no_index_file_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(list_secret_names(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_secret_names_rejects_malformed_index() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret-names.toml"), "not valid toml [[[").unwrap();
+        let err = list_secret_names(dir.path()).unwrap_err();
+        assert!(matches!(err, SecretsError::IndexParse { .. }));
     }
 
     #[test]

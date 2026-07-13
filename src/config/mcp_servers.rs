@@ -160,18 +160,26 @@ static REF_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Replaces every `${keyring:<name>}` occurrence with that secret from the OS
 /// keyring, and every `${VAR_NAME}` occurrence with that environment
-/// variable's value. A missing secret/variable (or a keyring backend error)
-/// becomes an empty string — a misconfigured secret then fails at the point
-/// of use (e.g. an empty Bearer token gets a 401 from the server) rather
-/// than at config-load time.
+/// variable's value. A missing secret/variable becomes an empty string — a
+/// misconfigured secret then fails at the point of use (e.g. an empty Bearer
+/// token gets a 401 from the server) rather than at config-load time; a
+/// keyring backend error is logged and resolves to an empty string.
 fn interpolate_refs(value: &str) -> String {
     REF_PATTERN
         .replace_all(value, |caps: &regex::Captures| {
             if let Some(name) = caps.get(1) {
-                SecretStore::get_secret(name.as_str())
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default()
+                match SecretStore::get_secret(name.as_str()) {
+                    Ok(Some(secret)) => secret,
+                    Ok(None) => String::new(),
+                    Err(err) => {
+                        tracing::warn!(
+                            secret_name = name.as_str(),
+                            error = %err,
+                            "keyring backend error while resolving secret reference"
+                        );
+                        String::new()
+                    }
+                }
             } else {
                 std::env::var(&caps[2]).unwrap_or_default()
             }
@@ -183,9 +191,9 @@ fn interpolate_refs(value: &str) -> String {
 /// already-in-hand server config —
 /// for a caller (the `/mcp add` wizard's live-connect step) that built the
 /// config directly from user input rather than loading it from disk via
-/// [`load_mcp_servers`], but still needs the same env resolution before
-/// attempting to connect.
-pub fn resolve_server_env(server: McpServerConfig) -> McpServerConfig {
+/// [`load_mcp_servers`], but still needs the same reference resolution
+/// before attempting to connect.
+pub fn resolve_server_refs(server: McpServerConfig) -> McpServerConfig {
     McpServerConfig {
         name: server.name,
         transport: interpolate_transport(server.transport),
@@ -801,6 +809,16 @@ Authorization = "Bearer ${keyring:mcp-github}"
         unsafe { std::env::set_var("MCP_MIX_ENV_VAR", "E") };
         let resolved = super::interpolate_refs("${MCP_MIX_ENV_VAR}/${keyring:mix-secret}");
         assert_eq!(resolved, "E/S");
+    }
+
+    #[test]
+    fn substituted_secret_values_are_never_rescanned_for_references() {
+        use_mock_keyring();
+        SecretStore::set_secret("cr-outer", "${keyring:cr-inner}").unwrap();
+        SecretStore::set_secret("cr-inner", "PWNED").unwrap();
+        let resolved = super::interpolate_refs("${keyring:cr-outer}");
+        assert_eq!(resolved, "${keyring:cr-inner}");
+        assert!(!resolved.contains("PWNED"));
     }
 
     #[test]

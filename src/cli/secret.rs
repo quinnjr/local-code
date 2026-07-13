@@ -18,6 +18,19 @@ pub fn set<R: BufRead, W: Write>(
     let mut line = String::new();
     input.read_line(&mut line)?;
     let value = line.trim();
+    store_value(paths, name, value, out)
+}
+
+/// Stores `value` under `name` and writes the confirmation line to `out`.
+/// Shared by `set` (after reading from `input`) and the interactive
+/// non-echoing prompt path in `cli::run`, which reads the value via
+/// `rpassword` instead of a `BufRead`.
+pub fn store_value<W: Write>(
+    paths: &Paths,
+    name: &str,
+    value: &str,
+    mut out: W,
+) -> anyhow::Result<()> {
     if value.is_empty() {
         anyhow::bail!("secret value cannot be empty");
     }
@@ -87,6 +100,26 @@ mod tests {
             secrets::list_secret_names(&paths.user_config_dir).unwrap(),
             vec!["gh-token".to_string()]
         );
+    }
+
+    #[test]
+    fn store_value_stores_confirms_and_rejects_empty() {
+        use_mock_keyring();
+        let dir = tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let mut out = Vec::new();
+        store_value(&paths, "gh-token", "tok-999", &mut out).unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("Stored secret 'gh-token'."));
+        assert!(!printed.contains("tok-999"), "value must never be echoed");
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_secret("gh-token").unwrap(),
+            Some("tok-999".to_string())
+        );
+
+        let mut out = Vec::new();
+        let err = store_value(&paths, "empty-val", "", &mut out).unwrap_err();
+        assert!(err.to_string().contains("cannot be empty"));
     }
 
     #[test]

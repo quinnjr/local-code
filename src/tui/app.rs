@@ -641,6 +641,21 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     // not leave a config referencing a secret that was
                                     // never stored (the reverse — a stored secret with no
                                     // config referencing it — is harmless).
+                                    if let Some(secret) = &pending_secret
+                                        && crate::config::secrets::list_secret_names(
+                                            &user_config_dir_for_task,
+                                        )
+                                        .is_ok_and(|names| names.contains(&secret.name))
+                                    {
+                                        transcript_for_task.update(|entries| {
+                                            entries.push(TranscriptEntry::SystemNotice {
+                                                text: format!(
+                                                    "overwriting existing keyring secret '{}'",
+                                                    secret.name
+                                                ),
+                                            });
+                                        });
+                                    }
                                     if let Some(secret) = pending_secret
                                         && let Err(e) = crate::config::secrets::store_secret(
                                             &user_config_dir_for_task,
@@ -690,7 +705,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     // Resolve ${VAR} references before connecting — the
                                     // wizard's config is raw user input, never passed
                                     // through interpolation the way a disk-loaded config is.
-                                    let resolved_config = crate::config::mcp_servers::resolve_server_env(config.clone());
+                                    let resolved_config = crate::config::mcp_servers::resolve_server_refs(config.clone());
                                     let connect_result = tokio::time::timeout(
                                         std::time::Duration::from_secs(30),
                                         crate::mcp::connect::connect_one(&resolved_config),
@@ -892,9 +907,21 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         }
         .with_key("transcript"),
     );
+    let displayed_input_buffer = match &pending_menu.get() {
+        PendingMenu::McpAddWizard(w)
+            if matches!(
+                w.step,
+                crate::tui::mcp_wizard::McpAddStep::AskHttpBearer { .. }
+                    | crate::tui::mcp_wizard::McpAddStep::AskSseBearer { .. }
+            ) =>
+        {
+            "•".repeat(input_buffer.get().chars().count())
+        }
+        _ => input_buffer.get(),
+    };
     body.push(
         element! {
-            InputBox(buffer: input_buffer.get(), disabled: streaming.get())
+            InputBox(buffer: displayed_input_buffer, disabled: streaming.get())
         }
         .with_key("input"),
     );
@@ -1599,7 +1626,16 @@ mod tests {
             "{}",
             t.frame_text()
         );
-        type_and_submit(&mut t, "sekrit-tok").await;
+        // While typing the bearer token, the input box must mask it rather
+        // than echoing the raw characters.
+        for c in "sekrit-tok".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.tick().await.unwrap();
+        let masked_frame = t.frame_text();
+        assert!(!masked_frame.contains("sekrit-tok"), "{}", masked_frame);
+        assert!(masked_frame.contains('•'), "{}", masked_frame);
+        t.send_key(KeyCode::Enter).unwrap();
         for _ in 0..10 {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             t.tick().await.unwrap();
@@ -1634,6 +1670,75 @@ mod tests {
             crate::config::secrets::list_secret_names(&user_config_dir).unwrap(),
             vec!["mcp-secure-tools".to_string()]
         );
+    }
+
+    /// If storing the bearer token in the keyring/index fails, the wizard
+    /// must abort before ever writing `mcp.toml` — a config that references
+    /// a secret which was never actually stored is worse than no config at
+    /// all. Here the index write is forced to fail by pointing
+    /// `user_config_dir` at a path whose parent component is a regular file,
+    /// so `create_dir_all` (inside `write_index`) errors.
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_keyring_failure_aborts_save() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_file = dir.path().join("user-config-blocked");
+        std::fs::write(&blocked_file, b"not a directory").unwrap();
+        let bogus_user_config_dir = blocked_file.join("nested");
+
+        // Sanity-check the assumption this test relies on: creating a
+        // directory under a path whose parent is a regular file must error
+        // on this platform.
+        assert!(
+            crate::config::secrets::store_secret(
+                &bogus_user_config_dir,
+                "sanity-check-name",
+                "sanity-check-value",
+            )
+            .is_err(),
+            "expected store_secret to fail when user_config_dir's parent is a regular file"
+        );
+
+        let props = AppProps {
+            project_config_dir: dir.path().to_path_buf(),
+            user_config_dir: bogus_user_config_dir,
+            ..test_props()
+        };
+        // Wide viewport: the failure notice embeds a long temp-dir path with
+        // no natural word breaks, so at a normal 80-column width it gets
+        // clipped mid-word (its tail, including "was NOT saved", never
+        // renders at all rather than wrapping onto another line).
+        let mut t = TestTerminal::new(400, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "abort-server").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "4").await; // HTTP
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "http://127.0.0.1:1").await; // nothing listens here
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Bearer token"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "tok-abort-1").await;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        let frame = t.frame_text();
+        assert!(frame.contains("was NOT saved"), "{frame}");
+        assert!(!frame.contains("tok-abort-1"), "{frame}");
+
+        let saved = crate::config::mcp_servers::load_mcp_servers_raw(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
     }
 
     #[tokio::test(start_paused = true)]
