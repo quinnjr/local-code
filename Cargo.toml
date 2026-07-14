@@ -39,8 +39,12 @@ keyring = { version = "3", features = ["apple-native"] }
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# All non-mac unix (Linux, BSDs): Secret Service as the primary backend,
+# with pass (the standard unix password manager) as the fallback when no
+# Secret Service daemon is running — see config::pass_backend.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+pass-sys = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

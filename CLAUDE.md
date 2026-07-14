@@ -91,7 +91,8 @@ cargo test --test live_ollama -- --ignored --nocapture
   project-local `.local-code/` dir), `connection.rs` (LLM server connections), `mcp_servers.rs`
   (`mcp.toml` load/save with `${VAR}` env interpolation — see below), `secrets.rs` (OS
   keyring-backed API key + generic named-secret storage via the `keyring` crate, plus the
-  names-only `secret-names.toml` index for `secret ls`).
+  names-only `secret-names.toml` index for `secret ls`); `pass_backend.rs` (unix-only pass/password-store credential builder, installed as the
+  keyring fallback when Secret Service is unreachable).
 - `mcp/` — MCP (Model Context Protocol) client support. `connect.rs::connect_all` discovers tools
   from every configured server (stdio/HTTP/SSE/WebSocket transports, from `daimon`), tolerating
   individual server failures without aborting startup. `tool.rs::NamespacedMcpTool` wraps a
@@ -152,7 +153,10 @@ cargo test --test live_ollama -- --ignored --nocapture
   when round-tripping the file for editing so secrets aren't baked into what gets written back).
 - **Secrets** are never stored in plaintext config files — `config::secrets::SecretStore` goes
   through the OS keyring (`keyring` crate, platform-specific backend per `Cargo.toml`'s
-  `target.'cfg(...)'.dependencies`).
+  `target.'cfg(...)'.dependencies`). On non-mac unix, if the Secret Service daemon is
+  unreachable at first secret use, a once-per-process probe swaps in the pass-backed builder
+  (`config::pass_backend`, via `pass-sys`) — entries land GPG-encrypted under `local-code/` in
+  the user's password store.
 - Many modules that read/write via `stdin`/`stdout` (CLI wizards, `select_session_to_resume`, etc.)
   are generic over `BufRead`/`Write` specifically so they can be unit-tested without a real
   terminal — follow this pattern for any new interactive CLI flow.
