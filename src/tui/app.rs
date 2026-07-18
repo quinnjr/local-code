@@ -83,6 +83,24 @@ pub struct AppProps {
     /// full session-file read+parse on every turn just to recover this one
     /// already-known field (see `run_turn`'s `created_at` state).
     pub created_at: String,
+    /// Whether this session's pane has keyboard focus. `Workspace` mounts
+    /// many `App`s at once (tmux-style windows/panes); only the focused one
+    /// may react to input, so both `use_input` handlers below early-return
+    /// (without stopping propagation) when this is false.
+    pub focused: bool,
+    /// Set to `true` by `Workspace` while a `C-b` prefix chord is armed —
+    /// the next key is a workspace command, so even the focused session must
+    /// let it bubble up untouched. `None` (tests, standalone use) behaves as
+    /// "never armed".
+    pub input_gate: Option<ntui::State<bool>>,
+    /// This session's workspace id, used only as the key it reports its
+    /// streaming status under in `streaming_flags`. 0 when standalone.
+    pub session_tag: u64,
+    /// Shared map of session id → "a turn is streaming", written by every
+    /// mounted session and read by the workspace tab bar so a background
+    /// window can show a busy indicator. `None` (tests, standalone use)
+    /// disables reporting.
+    pub streaming_flags: Option<ntui::State<std::collections::HashMap<u64, bool>>>,
 }
 
 impl Default for AppProps {
@@ -105,18 +123,24 @@ impl Default for AppProps {
             project_config_dir: std::path::PathBuf::new(),
             project_root: std::path::PathBuf::new(),
             created_at: String::new(),
+            focused: true,
+            input_gate: None,
+            session_tag: 0,
+            streaming_flags: None,
         }
     }
 }
 
 impl PartialEq for AppProps {
-    /// `App` is mounted exactly once, at the TUI's root (`run_tui` calls
-    /// `ntui::render(element!(App(...)))` a single time), so its props never
-    /// actually change between renders — this impl exists only to satisfy the
-    /// `Component::Props: PartialEq` bound, and always reports "unchanged" to
-    /// skip pointless prop-diffing work.
-    fn eq(&self, _other: &Self) -> bool {
-        true
+    /// Everything except `focused` is fixed for the lifetime of a mount
+    /// (`Workspace` builds a session's props once and never mutates them),
+    /// so only `focused` is compared: when the workspace moves focus, the
+    /// affected sessions must re-render so their `use_input` closures
+    /// recapture the new value. `input_gate` is deliberately not compared —
+    /// handlers read it through the shared `ntui::State` at event time, so a
+    /// gate flip needs no re-render here.
+    fn eq(&self, other: &Self) -> bool {
+        self.focused == other.focused
     }
 }
 
@@ -129,6 +153,28 @@ impl PartialEq for AppProps {
 /// extracted per code review after Task 11, which flagged the duplicated
 /// digit-matching boilerplate across what was then three (now four)
 /// near-identical blocks.
+/// Gate applied at the top of both of `App`'s `use_input` handlers. A session
+/// may only react to a key when its pane is focused, no `C-b` prefix chord is
+/// armed (`input_gate`), and the key isn't the prefix itself — in all other
+/// cases the handler returns without consuming, letting the event bubble up
+/// to `Workspace`'s root handler (dispatch is deepest-first).
+fn session_may_handle_input(
+    focused: bool,
+    input_gate: &Option<ntui::State<bool>>,
+    ev: &ntui::KeyEvent,
+) -> bool {
+    if !focused {
+        return false;
+    }
+    if input_gate.as_ref().is_some_and(|gate| gate.get()) {
+        return false;
+    }
+    !(ev.code == KeyCode::Char('b')
+        && ev
+            .modifiers
+            .contains(ntui::hooks::input::KeyModifiers::CONTROL))
+}
+
 fn digit_key_to_index(code: KeyCode, max: usize) -> Option<usize> {
     if let KeyCode::Char(c) = code
         && let Some(digit) = c.to_digit(10)
@@ -300,6 +346,22 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         }
     });
 
+    // Mirror this session's streaming state into the workspace-shared map so
+    // the tab bar can mark busy background windows. Keyed on the value so it
+    // re-runs exactly on transitions.
+    hooks.use_effect(streaming.get(), {
+        let streaming_flags = props.streaming_flags.clone();
+        let session_tag = props.session_tag;
+        let is_streaming = streaming.get();
+        move || {
+            if let Some(flags) = streaming_flags {
+                flags.update(|map| {
+                    map.insert(session_tag, is_streaming);
+                });
+            }
+        }
+    });
+
     hooks.use_effect(turn_id.get(), {
         let pending_turn_input = pending_turn_input.clone();
         let transcript = transcript.clone();
@@ -362,7 +424,12 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let current_model = current_model.clone();
         let connection_display = connection_display.clone();
         let model_display = model_display.clone();
+        let focused = props.focused;
+        let input_gate = props.input_gate.clone();
         move |ev, _ctx| {
+            if !session_may_handle_input(focused, &input_gate, &ev) {
+                return;
+            }
             if pending_permission.get().is_some() {
                 let decision = digit_key_to_index(ev.code, 3).map(|idx| match idx {
                     0 => PermissionDecision::Allow,
@@ -822,7 +889,8 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     tier.set(next);
                 }
                 KeyCode::Char('c') if ev.modifiers.contains(ntui::hooks::input::KeyModifiers::CONTROL) => {
-                    // Handled below via `hooks.use_app()`.
+                    // Exit is handled by `Workspace`'s root handler; this arm
+                    // only keeps the 'c' out of the input buffer.
                 }
                 KeyCode::Tab => {
                     transcript.update(|entries| toggle_last_tool_call_expanded(entries));
@@ -871,17 +939,6 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 }
                 _ => {}
             }
-        }
-    });
-
-    let app_handle = hooks.use_app();
-    hooks.use_input(move |ev, _ctx| {
-        if ev.code == KeyCode::Char('c')
-            && ev
-                .modifiers
-                .contains(ntui::hooks::input::KeyModifiers::CONTROL)
-        {
-            app_handle.exit();
         }
     });
 

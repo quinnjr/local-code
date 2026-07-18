@@ -1,11 +1,19 @@
 // src/tui/workspace/state.rs
 //
 // Pure state machine for the tmux-style workspace: windows (fullscreen tabs)
-// each holding a binary split tree of panes, every pane an agent session.
-// Follows the `mcp_wizard.rs` pattern — no side effects, no ntui state, fully
+// each holding a row or column of panes, every pane an agent session. Follows
+// the `mcp_wizard.rs` pattern — no side effects, no ntui state, fully
 // unit-testable. The `Workspace` component (`mod.rs`) owns one of these in an
 // `ntui::State`, feeds every key event through `on_key`, and reacts to the
 // returned `KeyAction` (create a session's props, drop them, or exit).
+//
+// Panes are deliberately a flat `Vec` per window rather than tmux's nested
+// binary split tree: ntui's reconciler matches keys among *siblings only*, so
+// nesting would reparent a session's component on every split — unmounting it
+// and losing its live transcript/agent state. A flat list keeps every pane a
+// sibling under one stable window wrapper forever. The cost is that a window
+// has a single split axis (its first split picks row vs column; later splits
+// extend along the same axis) — recorded as a v1 limitation in TODO.md.
 
 use ntui::hooks::input::{KeyCode, KeyModifiers};
 
@@ -14,106 +22,35 @@ use ntui::hooks::input::{KeyCode, KeyModifiers};
 /// across splits/closes.
 pub type SessionId = u64;
 
-/// How a split lays out its two children. Named by resulting layout rather
-/// than tmux's inverted vocabulary: `Row` is tmux `%` (panes side by side),
-/// `Column` is tmux `"` (panes stacked).
+/// The axis a window's panes are laid out along. Named by resulting layout
+/// rather than tmux's inverted vocabulary: `Row` is tmux `%` (panes side by
+/// side), `Column` is tmux `"` (panes stacked).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitDir {
     Row,
     Column,
 }
 
-/// The classic tmux pane model: a binary tree whose leaves are sessions.
-/// Splits are always 50/50 in v1 (no resize — see TODO.md).
-#[derive(Debug, Clone, PartialEq)]
-pub enum PaneNode {
-    Leaf(SessionId),
-    Split {
-        dir: SplitDir,
-        children: [Box<PaneNode>; 2],
-    },
-}
-
-impl PaneNode {
-    /// All leaf session ids, in tree (left-to-right) order.
-    pub fn leaves(&self) -> Vec<SessionId> {
-        match self {
-            PaneNode::Leaf(id) => vec![*id],
-            PaneNode::Split { children, .. } => {
-                let mut out = children[0].leaves();
-                out.extend(children[1].leaves());
-                out
-            }
-        }
-    }
-
-    /// Path of child indices from `self` down to the leaf holding `target`.
-    fn path_to(&self, target: SessionId) -> Option<Vec<usize>> {
-        match self {
-            PaneNode::Leaf(id) => (*id == target).then(Vec::new),
-            PaneNode::Split { children, .. } => {
-                for (i, child) in children.iter().enumerate() {
-                    if let Some(mut path) = child.path_to(target) {
-                        path.insert(0, i);
-                        return Some(path);
-                    }
-                }
-                None
-            }
-        }
-    }
-
-    /// Replaces the leaf holding `target` with a split of (`target`, `new_id`)
-    /// along `dir`. Returns false (tree unchanged) if `target` isn't present.
-    fn split_leaf(&mut self, target: SessionId, dir: SplitDir, new_id: SessionId) -> bool {
-        match self {
-            PaneNode::Leaf(id) if *id == target => {
-                *self = PaneNode::Split {
-                    dir,
-                    children: [
-                        Box::new(PaneNode::Leaf(target)),
-                        Box::new(PaneNode::Leaf(new_id)),
-                    ],
-                };
-                true
-            }
-            PaneNode::Leaf(_) => false,
-            PaneNode::Split { children, .. } => children
-                .iter_mut()
-                .any(|c| c.split_leaf(target, dir, new_id)),
-        }
-    }
-
-    /// Removes the leaf holding `target`, collapsing its parent split so the
-    /// sibling subtree takes the parent's slot. Returns the surviving tree,
-    /// or `None` if `target` was the only leaf.
-    fn remove_leaf(self, target: SessionId) -> Option<PaneNode> {
-        match self {
-            PaneNode::Leaf(id) if id == target => None,
-            leaf @ PaneNode::Leaf(_) => Some(leaf),
-            PaneNode::Split { dir, children } => {
-                let [a, b] = children;
-                match (a.remove_leaf(target), b.remove_leaf(target)) {
-                    (None, Some(survivor)) | (Some(survivor), None) => Some(survivor),
-                    (Some(a), Some(b)) => Some(PaneNode::Split {
-                        dir,
-                        children: [Box::new(a), Box::new(b)],
-                    }),
-                    // Both `None` is impossible: session ids are unique, so
-                    // `target` appears in at most one subtree; `remove_leaf`
-                    // on the subtree *not* holding it always returns `Some`.
-                    (None, None) => unreachable!("session id {target} present in both subtrees"),
-                }
-            }
-        }
-    }
-}
-
-/// One tmux-style window: a pane tree plus which pane has keyboard focus.
+/// One tmux-style window: equal-sized panes along one axis, plus which pane
+/// has keyboard focus. `dir` is `None` until the first split (a single pane
+/// has no axis) and never reverts — closing back down to one pane keeps the
+/// axis for the next split, which is invisible in practice.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Window {
-    pub root: PaneNode,
-    pub focused: SessionId,
+    /// Stable identity for ntui keys (windows have no other identity — their
+    /// index shifts when an earlier window closes, and their first pane can
+    /// be closed out from under them). Allocated monotonically, never reused.
+    pub id: u64,
+    pub dir: Option<SplitDir>,
+    pub panes: Vec<SessionId>,
+    /// Index into `panes`.
+    pub focused: usize,
+}
+
+impl Window {
+    pub fn focused_session(&self) -> SessionId {
+        self.panes[self.focused]
+    }
 }
 
 /// Where `C-b <arrow>` should move pane focus.
@@ -126,7 +63,7 @@ pub enum Direction {
 }
 
 /// What the `Workspace` component must do in response to a key event, beyond
-/// the tree/focus mutation `on_key` already applied internally.
+/// the window/pane mutation `on_key` already applied internally.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyAction {
     /// Not the workspace's key — let it fall through to the focused session.
@@ -155,6 +92,7 @@ pub struct WorkspaceState {
     /// `input_gate` state their guards check).
     pub prefix_pending: bool,
     next_session: SessionId,
+    next_window: u64,
 }
 
 impl WorkspaceState {
@@ -165,12 +103,15 @@ impl WorkspaceState {
         (
             WorkspaceState {
                 windows: vec![Window {
-                    root: PaneNode::Leaf(first),
-                    focused: first,
+                    id: 0,
+                    dir: None,
+                    panes: vec![first],
+                    focused: 0,
                 }],
                 active: 0,
                 prefix_pending: false,
                 next_session: first + 1,
+                next_window: 1,
             },
             first,
         )
@@ -182,10 +123,6 @@ impl WorkspaceState {
         id
     }
 
-    fn active_window_mut(&mut self) -> &mut Window {
-        &mut self.windows[self.active]
-    }
-
     pub fn active_window(&self) -> &Window {
         &self.windows[self.active]
     }
@@ -193,119 +130,81 @@ impl WorkspaceState {
     /// The session that currently has keyboard focus (focused pane of the
     /// active window).
     pub fn focused_session(&self) -> SessionId {
-        self.active_window().focused
+        self.active_window().focused_session()
     }
 
-    /// Every live session id across all windows, in window order then tree
+    /// Every live session id across all windows, in window order then pane
     /// order — the component renders (mounts) exactly this set.
     pub fn all_sessions(&self) -> Vec<SessionId> {
-        self.windows.iter().flat_map(|w| w.root.leaves()).collect()
+        self.windows.iter().flat_map(|w| w.panes.clone()).collect()
     }
 
     fn new_window(&mut self) -> SessionId {
         let id = self.alloc_session();
+        let window_id = self.next_window;
+        self.next_window += 1;
         self.windows.push(Window {
-            root: PaneNode::Leaf(id),
-            focused: id,
+            id: window_id,
+            dir: None,
+            panes: vec![id],
+            focused: 0,
         });
         self.active = self.windows.len() - 1;
         id
     }
 
-    fn split(&mut self, dir: SplitDir) -> SessionId {
+    /// Splits the focused pane: the new pane is inserted right after it and
+    /// takes focus. The window's first split fixes its axis; on an already
+    /// split window the requested direction is ignored in favor of the
+    /// window's axis (we don't nest mixed-direction splits — see module doc).
+    fn split(&mut self, requested: SplitDir) -> SessionId {
         let id = self.alloc_session();
         let window = &mut self.windows[self.active];
-        let focused = window.focused;
-        window.root.split_leaf(focused, dir, id);
-        window.focused = id;
+        if window.dir.is_none() {
+            window.dir = Some(requested);
+        }
+        window.panes.insert(window.focused + 1, id);
+        window.focused += 1;
         id
     }
 
     fn close_focused(&mut self) -> KeyAction {
-        let window = self.active_window_mut();
-        let closed = window.focused;
-        match std::mem::replace(&mut window.root, PaneNode::Leaf(closed)).remove_leaf(closed) {
-            Some(survivor) => {
-                // Focus the leaf nearest (in tree order) to where the closed
-                // pane was — tmux focuses the sibling; the first leaf of the
-                // surviving sibling subtree is exactly that.
-                let path = survivor.leaves();
-                window.root = survivor;
-                window.focused = path[0];
-                KeyAction::SessionClosed(closed)
+        let window = &mut self.windows[self.active];
+        let closed = window.panes.remove(window.focused);
+        if window.panes.is_empty() {
+            self.windows.remove(self.active);
+            if self.windows.is_empty() {
+                return KeyAction::ExitApp(closed);
             }
-            None => {
-                self.windows.remove(self.active);
-                if self.windows.is_empty() {
-                    return KeyAction::ExitApp(closed);
-                }
-                if self.active >= self.windows.len() {
-                    self.active = self.windows.len() - 1;
-                }
-                KeyAction::SessionClosed(closed)
+            if self.active >= self.windows.len() {
+                self.active = self.windows.len() - 1;
             }
+        } else if window.focused >= window.panes.len() {
+            window.focused = window.panes.len() - 1;
         }
+        KeyAction::SessionClosed(closed)
     }
 
+    /// `C-b o`: cycle pane focus within the active window.
     fn focus_next(&mut self) {
-        let window = self.active_window_mut();
-        let leaves = window.root.leaves();
-        let pos = leaves.iter().position(|&l| l == window.focused).unwrap_or(0);
-        window.focused = leaves[(pos + 1) % leaves.len()];
+        let window = &mut self.windows[self.active];
+        window.focused = (window.focused + 1) % window.panes.len();
     }
 
-    /// Moves pane focus directionally: walk up from the focused leaf to the
-    /// nearest ancestor split along the movement axis where the focused leaf
-    /// sits on the near side, cross into the sibling subtree, then descend
-    /// picking the child nearest the crossing edge. v1 ignores cross-axis
-    /// position (good enough for 50/50 trees).
+    /// `C-b <arrow>`: move pane focus along the window's axis. Arrows across
+    /// the axis (e.g. Up in a side-by-side window) are no-ops, like tmux with
+    /// no pane in that direction. No wraparound, also like tmux.
     fn focus_dir(&mut self, direction: Direction) {
-        let window = self.active_window_mut();
-        let Some(path) = window.root.path_to(window.focused) else {
-            return;
+        let window = &mut self.windows[self.active];
+        let Some(dir) = window.dir else { return };
+        let delta: isize = match (dir, direction) {
+            (SplitDir::Row, Direction::Left) | (SplitDir::Column, Direction::Up) => -1,
+            (SplitDir::Row, Direction::Right) | (SplitDir::Column, Direction::Down) => 1,
+            _ => 0,
         };
-        let (axis, forward) = match direction {
-            Direction::Left => (SplitDir::Row, false),
-            Direction::Right => (SplitDir::Row, true),
-            Direction::Up => (SplitDir::Column, false),
-            Direction::Down => (SplitDir::Column, true),
-        };
-        // Find the deepest ancestor split we can cross at.
-        let mut node = &window.root;
-        let mut ancestors: Vec<(&PaneNode, usize)> = Vec::new();
-        for &step in &path {
-            ancestors.push((node, step));
-            let PaneNode::Split { children, .. } = node else {
-                return;
-            };
-            node = &children[step];
-        }
-        for (ancestor, step) in ancestors.into_iter().rev() {
-            let PaneNode::Split { dir, children } = ancestor else {
-                continue;
-            };
-            let crossable = *dir == axis && ((forward && step == 0) || (!forward && step == 1));
-            if crossable {
-                let target_child = if forward { &children[1] } else { &children[0] };
-                let mut cursor: &PaneNode = target_child;
-                loop {
-                    match cursor {
-                        PaneNode::Leaf(id) => {
-                            window.focused = *id;
-                            return;
-                        }
-                        PaneNode::Split { dir, children } => {
-                            // Along the movement axis, enter from the near
-                            // edge; across it, default to the first child.
-                            cursor = if *dir == axis && !forward {
-                                &children[1]
-                            } else {
-                                &children[0]
-                            };
-                        }
-                    }
-                }
-            }
+        let target = window.focused as isize + delta;
+        if delta != 0 && target >= 0 && (target as usize) < window.panes.len() {
+            window.focused = target as usize;
         }
     }
 
@@ -388,6 +287,7 @@ mod tests {
         assert_eq!(state.windows.len(), 1);
         assert_eq!(state.focused_session(), 0);
         assert_eq!(state.all_sessions(), vec![0]);
+        assert_eq!(state.active_window().dir, None);
     }
 
     #[test]
@@ -462,70 +362,59 @@ mod tests {
         let action = prefixed(&mut state, KeyCode::Char('%'));
         assert_eq!(action, KeyAction::SessionCreated(1));
         assert_eq!(state.focused_session(), 1);
-        assert_eq!(
-            state.active_window().root,
-            PaneNode::Split {
-                dir: SplitDir::Row,
-                children: [
-                    Box::new(PaneNode::Leaf(0)),
-                    Box::new(PaneNode::Leaf(1)),
-                ],
-            }
-        );
+        let window = state.active_window();
+        assert_eq!(window.dir, Some(SplitDir::Row));
+        assert_eq!(window.panes, vec![0, 1]);
     }
 
     #[test]
     fn quote_splits_column() {
         let (mut state, _) = WorkspaceState::new();
         prefixed(&mut state, KeyCode::Char('"'));
-        let PaneNode::Split { dir, .. } = &state.active_window().root else {
-            panic!("expected split");
-        };
-        assert_eq!(*dir, SplitDir::Column);
+        assert_eq!(state.active_window().dir, Some(SplitDir::Column));
     }
 
     #[test]
-    fn nested_split_splits_only_the_focused_leaf() {
+    fn split_inserts_after_focused_pane() {
         let (mut state, _) = WorkspaceState::new();
-        prefixed(&mut state, KeyCode::Char('%')); // [0 | 1], focus 1
-        prefixed(&mut state, KeyCode::Char('"')); // 1 becomes [1 / 2]
-        assert_eq!(state.all_sessions(), vec![0, 1, 2]);
-        assert_eq!(
-            state.active_window().root,
-            PaneNode::Split {
-                dir: SplitDir::Row,
-                children: [
-                    Box::new(PaneNode::Leaf(0)),
-                    Box::new(PaneNode::Split {
-                        dir: SplitDir::Column,
-                        children: [
-                            Box::new(PaneNode::Leaf(1)),
-                            Box::new(PaneNode::Leaf(2)),
-                        ],
-                    }),
-                ],
-            }
-        );
+        prefixed(&mut state, KeyCode::Char('%')); // [0, 1], focus 1
+        prefixed(&mut state, KeyCode::Left); // focus 0
+        prefixed(&mut state, KeyCode::Char('%')); // insert after 0
+        let window = state.active_window();
+        assert_eq!(window.panes, vec![0, 2, 1]);
+        assert_eq!(state.focused_session(), 2);
     }
 
     #[test]
-    fn o_cycles_pane_focus_in_tree_order() {
+    fn second_split_keeps_the_windows_axis() {
+        let (mut state, _) = WorkspaceState::new();
+        prefixed(&mut state, KeyCode::Char('%')); // axis: Row
+        prefixed(&mut state, KeyCode::Char('"')); // requested Column, ignored
+        let window = state.active_window();
+        assert_eq!(window.dir, Some(SplitDir::Row), "axis fixed by first split");
+        assert_eq!(window.panes, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn o_cycles_pane_focus_with_wraparound() {
         let (mut state, _) = WorkspaceState::new();
         prefixed(&mut state, KeyCode::Char('%'));
-        prefixed(&mut state, KeyCode::Char('"'));
+        prefixed(&mut state, KeyCode::Char('%')); // [0, 1, 2], focus idx 2
         assert_eq!(state.focused_session(), 2);
         prefixed(&mut state, KeyCode::Char('o'));
-        assert_eq!(state.focused_session(), 0, "o wraps to first leaf");
+        assert_eq!(state.focused_session(), 0, "o wraps to first pane");
         prefixed(&mut state, KeyCode::Char('o'));
         assert_eq!(state.focused_session(), 1);
     }
 
     #[test]
-    fn arrow_focus_moves_across_a_row_split() {
+    fn arrow_focus_moves_along_a_row_window_without_wrap() {
         let (mut state, _) = WorkspaceState::new();
-        prefixed(&mut state, KeyCode::Char('%')); // [0 | 1], focus 1
+        prefixed(&mut state, KeyCode::Char('%')); // [0, 1], focus 1
         prefixed(&mut state, KeyCode::Left);
         assert_eq!(state.focused_session(), 0);
+        prefixed(&mut state, KeyCode::Left);
+        assert_eq!(state.focused_session(), 0, "no pane to the left: no-op");
         prefixed(&mut state, KeyCode::Right);
         assert_eq!(state.focused_session(), 1);
         prefixed(&mut state, KeyCode::Right);
@@ -533,36 +422,45 @@ mod tests {
     }
 
     #[test]
-    fn arrow_focus_ignores_wrong_axis() {
+    fn arrow_focus_ignores_the_cross_axis() {
         let (mut state, _) = WorkspaceState::new();
-        prefixed(&mut state, KeyCode::Char('%')); // row split
+        prefixed(&mut state, KeyCode::Char('%')); // Row window
         prefixed(&mut state, KeyCode::Up);
-        assert_eq!(state.focused_session(), 1, "no column split: up is a no-op");
-    }
-
-    #[test]
-    fn arrow_focus_descends_to_nearest_edge_in_nested_tree() {
-        let (mut state, _) = WorkspaceState::new();
-        prefixed(&mut state, KeyCode::Char('%')); // [0 | 1], focus 1
-        prefixed(&mut state, KeyCode::Char('"')); // [0 | [1 / 2]], focus 2
-        prefixed(&mut state, KeyCode::Left); // cross into left subtree
-        assert_eq!(state.focused_session(), 0);
-        prefixed(&mut state, KeyCode::Right); // back: nearest edge is leaf 1
-        assert_eq!(state.focused_session(), 1);
+        assert_eq!(state.focused_session(), 1, "Up in a Row window is a no-op");
         prefixed(&mut state, KeyCode::Down);
-        assert_eq!(state.focused_session(), 2);
-        prefixed(&mut state, KeyCode::Up);
         assert_eq!(state.focused_session(), 1);
     }
 
     #[test]
-    fn x_closes_pane_and_collapses_split_to_sibling() {
+    fn arrows_work_up_down_in_a_column_window() {
         let (mut state, _) = WorkspaceState::new();
-        prefixed(&mut state, KeyCode::Char('%')); // [0 | 1], focus 1
+        prefixed(&mut state, KeyCode::Char('"')); // [0 / 1], focus 1
+        prefixed(&mut state, KeyCode::Up);
+        assert_eq!(state.focused_session(), 0);
+        prefixed(&mut state, KeyCode::Down);
+        assert_eq!(state.focused_session(), 1);
+    }
+
+    #[test]
+    fn x_closes_pane_and_focuses_the_next_one() {
+        let (mut state, _) = WorkspaceState::new();
+        prefixed(&mut state, KeyCode::Char('%')); // [0, 1], focus 1
         let action = prefixed(&mut state, KeyCode::Char('x'));
         assert_eq!(action, KeyAction::SessionClosed(1));
-        assert_eq!(state.active_window().root, PaneNode::Leaf(0));
+        assert_eq!(state.active_window().panes, vec![0]);
         assert_eq!(state.focused_session(), 0);
+    }
+
+    #[test]
+    fn x_in_the_middle_keeps_focus_index_on_the_successor() {
+        let (mut state, _) = WorkspaceState::new();
+        prefixed(&mut state, KeyCode::Char('%'));
+        prefixed(&mut state, KeyCode::Char('%')); // [0, 1, 2], focus idx 2
+        prefixed(&mut state, KeyCode::Left); // focus idx 1 (session 1)
+        let action = prefixed(&mut state, KeyCode::Char('x'));
+        assert_eq!(action, KeyAction::SessionClosed(1));
+        assert_eq!(state.active_window().panes, vec![0, 2]);
+        assert_eq!(state.focused_session(), 2, "successor pane takes focus");
     }
 
     #[test]
@@ -584,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn closing_a_middle_window_keeps_active_index_valid() {
+    fn closing_the_last_window_clamps_active_index() {
         let (mut state, _) = WorkspaceState::new();
         prefixed(&mut state, KeyCode::Char('c')); // window 1
         prefixed(&mut state, KeyCode::Char('c')); // window 2, active = 2

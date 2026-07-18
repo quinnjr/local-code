@@ -12,6 +12,7 @@ pub mod state;
 pub mod workspace;
 
 pub use app::{App, AppProps};
+pub use workspace::{Workspace, WorkspaceProps};
 
 use std::path::Path;
 
@@ -214,7 +215,12 @@ pub async fn run_tui(
         }
     };
 
-    let props = AppProps {
+    // The initial session's props double as the template `Workspace` stamps
+    // new tabs/panes from (fresh transcript + fresh session file, everything
+    // else inherited). `focused`/`input_gate`/`session_tag`/`streaming_flags`
+    // keep their defaults here — `Workspace` overrides them per pane on every
+    // render.
+    let template = AppProps {
         model: Some(model),
         connection_name: connection.name.clone(),
         model_name: connection.default_model.clone(),
@@ -232,28 +238,10 @@ pub async fn run_tui(
         project_config_dir: paths.project_config_dir.clone(),
         project_root: project_root.to_path_buf(),
         created_at,
+        ..AppProps::default()
     };
 
-    ntui::render(ntui::element!(App(
-        model: props.model,
-        connection_name: props.connection_name,
-        model_name: props.model_name,
-        always_allow: props.always_allow,
-        always_deny: props.always_deny,
-        initial_tier: props.initial_tier,
-        initial_entries: props.initial_entries,
-        initial_messages: props.initial_messages,
-        system_context: props.system_context,
-        mcp_tools: props.mcp_tools,
-        skills: props.skills,
-        session_path: props.session_path,
-        user_state_dir: props.user_state_dir,
-        user_config_dir: props.user_config_dir,
-        project_config_dir: props.project_config_dir,
-        project_root: props.project_root,
-        created_at: props.created_at
-    )))
-    .await?;
+    ntui::render(ntui::element!(Workspace(template: template))).await?;
     Ok(())
 }
 
