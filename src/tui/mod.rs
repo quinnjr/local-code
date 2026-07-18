@@ -9,6 +9,7 @@ pub mod permission_prompter;
 pub mod rebuild;
 pub mod slash;
 pub mod state;
+pub mod workspace;
 
 pub use app::{App, AppProps};
 
