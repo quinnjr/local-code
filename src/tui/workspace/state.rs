@@ -307,7 +307,10 @@ mod tests {
     #[test]
     fn unknown_key_cancels_prefix_without_acting() {
         let (mut state, _) = WorkspaceState::new();
-        assert_eq!(prefixed(&mut state, KeyCode::Char('z')), KeyAction::Consumed);
+        assert_eq!(
+            prefixed(&mut state, KeyCode::Char('z')),
+            KeyAction::Consumed
+        );
         assert!(!state.prefix_pending);
         assert_eq!(state.windows.len(), 1);
     }

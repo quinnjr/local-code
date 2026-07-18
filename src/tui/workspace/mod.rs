@@ -222,3 +222,245 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use daimon::model::types::{ChatRequest, ChatResponse, Message, StopReason, Usage};
+    use daimon::stream::{ResponseStream, StreamEvent};
+    use ntui::testing::TestTerminal;
+    use ntui::{Element, KeyCode};
+
+    use crate::permissions::types::PermissionTier;
+
+    /// Same shape as `app::tests::StreamingEchoModel` (that one is private to
+    /// its test module): a trivial streamed reply, no tool calls.
+    struct EchoModel;
+    impl daimon::model::Model for EchoModel {
+        async fn generate(&self, _request: &ChatRequest) -> daimon::Result<ChatResponse> {
+            Ok(ChatResponse {
+                message: Message::assistant("unused"),
+                stop_reason: StopReason::EndTurn,
+                usage: Some(Usage::default()),
+            })
+        }
+        async fn generate_stream(&self, _request: &ChatRequest) -> daimon::Result<ResponseStream> {
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::Done),
+            ])))
+        }
+    }
+
+    /// Workspace props whose template writes session files into `dir` (new
+    /// tabs/panes create one on the spot, so it must be a real tempdir).
+    fn props_in(dir: &std::path::Path) -> WorkspaceProps {
+        WorkspaceProps {
+            template: AppProps {
+                model: Some(Arc::new(EchoModel)),
+                connection_name: "local-vllm".into(),
+                model_name: "qwen2.5-coder-32b".into(),
+                initial_tier: PermissionTier::FullAuto,
+                user_state_dir: dir.to_path_buf(),
+                project_root: dir.to_path_buf(),
+                ..AppProps::default()
+            },
+        }
+    }
+
+    fn prefix(t: &mut TestTerminal) {
+        t.send_key_event(ntui::KeyEvent::new(
+            KeyCode::Char('b'),
+            ntui::hooks::input::KeyModifiers::CONTROL,
+        ))
+        .unwrap();
+    }
+
+    async fn chord(t: &mut TestTerminal, code: KeyCode) {
+        prefix(t);
+        t.tick().await.unwrap();
+        t.send_key(code).unwrap();
+        t.tick().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn starts_with_one_window_marked_active_in_the_tab_bar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            90,
+            24,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("[local-code] 0:agent*"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prefix_shows_badge_and_is_not_typed_into_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            90,
+            24,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        prefix(&mut t);
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("C-b …"), "{text}");
+        assert!(
+            !text.contains("❯ b"),
+            "prefix key must not be typed: {text}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn c_b_c_opens_a_second_window_and_switches_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            90,
+            24,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        chord(&mut t, KeyCode::Char('c')).await;
+        let text = t.frame_text();
+        assert!(text.contains("0:agent "), "{text}");
+        assert!(text.contains("1:agent*"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn typing_lands_only_in_the_focused_window_and_survives_switching() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            90,
+            24,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        for c in "first".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("first"));
+
+        chord(&mut t, KeyCode::Char('c')).await; // window 1, empty input
+        let text = t.frame_text();
+        assert!(
+            !text.contains("first"),
+            "window 0 is hidden, its buffer must not paint: {text}"
+        );
+
+        for c in "second".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("second"));
+
+        chord(&mut t, KeyCode::Char('p')).await; // back to window 0
+        let text = t.frame_text();
+        assert!(
+            text.contains("first"),
+            "window 0's input buffer must survive being hidden: {text}"
+        );
+        assert!(!text.contains("second"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn digit_selects_a_window_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            90,
+            24,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        chord(&mut t, KeyCode::Char('c')).await;
+        chord(&mut t, KeyCode::Char('0')).await;
+        assert!(t.frame_text().contains("0:agent*"), "{}", t.frame_text());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn percent_splits_into_two_panes_with_independent_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            120,
+            30,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        chord(&mut t, KeyCode::Char('%')).await;
+        assert!(
+            t.frame_text().contains("0:agent[2]*"),
+            "tab bar shows the pane count: {}",
+            t.frame_text()
+        );
+        // New (right) pane has focus: type into it.
+        for c in "right".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("right"));
+        // Move focus left and type there — both stay visible (both panes are
+        // on screen), each in its own pane.
+        chord(&mut t, KeyCode::Left).await;
+        for c in "left".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("left"), "{text}");
+        assert!(text.contains("right"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn x_closes_the_focused_pane_and_returns_to_a_single_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            120,
+            30,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        chord(&mut t, KeyCode::Char('%')).await;
+        chord(&mut t, KeyCode::Char('x')).await;
+        let text = t.frame_text();
+        assert!(text.contains("0:agent*"), "{text}");
+        assert!(!text.contains("0:agent[2]*"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_pane_gets_its_own_session_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            120,
+            30,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        chord(&mut t, KeyCode::Char('c')).await;
+        // The template's own session file is created by `run_tui` before the
+        // workspace mounts (not by this test), so exactly the new tab's file
+        // exists under the state dir's sessions tree.
+        let sessions_root = dir.path().join("sessions");
+        let count = walk_files(&sessions_root);
+        assert_eq!(count, 1, "one session file for the new tab");
+    }
+
+    fn walk_files(root: &std::path::Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|e| {
+                let p = e.path();
+                if p.is_dir() { walk_files(&p) } else { 1 }
+            })
+            .sum()
+    }
+}

@@ -72,6 +72,12 @@ cargo test --test live_ollama -- --ignored --nocapture
   - `mcp_wizard.rs` is a pure state machine for the `/mcp add` in-TUI stepper (transport selection,
     prompts, `Advance` enum) — kept side-effect-free and unit-testable separately from `app.rs`'s
     wiring of it.
+  - `workspace/` — tmux-style tabbing: `Workspace` (the actual root component `run_tui` mounts;
+    `App` is mounted once per pane under it) keeps every window's sessions mounted at all times
+    (inactive windows collapse to a zero-height clipped `View` — never unmount, or their live
+    state/streams would be lost), `workspace/state.rs` is the pure `C-b`-prefix state machine
+    (same pattern as `mcp_wizard.rs`), `workspace/tab_bar.rs` the status line. Panes are a flat
+    list per window (single split axis) because ntui keys are sibling-scoped — see TODO.md.
 - `agent/` — wraps `daimon::agent::{Agent, AgentBuilder}` for this project's needs.
   - `build.rs::register_all_tools` is the **one and only tool-registration function** in the
     project — every built-in tool and every MCP-discovered tool passes through it, each wrapped in

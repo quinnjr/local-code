@@ -23,6 +23,11 @@ Ollama. No cloud calls, no API keys required.
 
 - Full-width terminal UI with a streaming transcript, tool-call cards, and
   inline permission prompts
+- tmux-style workspace tabbing: multiple concurrent agent sessions as
+  windows (tabs) and split panes, driven by `Ctrl+B` prefix chords —
+  `c` new window, `n`/`p`/`0-9` switch, `%`/`"` split, arrows/`o` move
+  pane focus, `x` close. Background windows keep streaming (the tab bar
+  marks them `✻`), and every pane is its own resumable session
 - Slash commands: `/model`, `/permissions`, `/connections`, `/init`,
   `/compact`, `/resume`, `/clear`, `/help`
 - Session persistence — every turn is saved, and sessions can be resumed

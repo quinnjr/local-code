@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Added tmux-style workspace tabbing: one TUI can now host several agent
+  sessions at once as **windows** (fullscreen tabs on a status bar) and
+  **panes** (side-by-side or stacked splits), each with its own transcript,
+  agent, permission state, and session file. `Ctrl+B` prefix chords, tmux
+  defaults: `c` new window, `n`/`p`/`0-9` switch windows, `%`/`"` split,
+  arrows/`o` move pane focus, `x` close pane (closing the last pane exits).
+  Hidden windows keep streaming in the background; the tab bar marks busy
+  windows with `✻`.
+
 - **Breaking**: the MCP server config file was renamed from
   `mcp-servers.toml` to `mcp.toml`. If you have an existing
   `mcp-servers.toml` (project- or user-level), it's still read as a
