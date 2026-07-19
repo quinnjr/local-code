@@ -14,9 +14,7 @@ use ntui::props::{Dimension, FlexDirection, Overflow};
 use ntui::style::{BorderStyle, Color};
 use ntui::{Element, KeyCode, component, element};
 
-use crate::session::paths::new_session_path;
-use crate::session::store::save_session;
-use crate::session::types::SessionFile;
+use crate::session::store::create_fresh_session;
 use crate::tui::app::{App, AppProps};
 use state::{KeyAction, SessionId, SplitDir, WorkspaceState};
 use tab_bar::{TabBar, TabBarProps, TabInfo};
@@ -40,20 +38,18 @@ impl PartialEq for WorkspaceProps {
 }
 
 /// Stamps a brand-new session's `AppProps` from the template: fresh session
-/// file on disk (same shape as `run_tui` creates at startup), empty
-/// transcript/history, everything else inherited.
+/// file on disk (via the same `create_fresh_session` recipe `run_tui` uses
+/// at startup), empty transcript/history, everything else inherited.
 fn new_session_props(template: &AppProps) -> Result<AppProps, String> {
-    let now = chrono::Utc::now();
-    let path = new_session_path(&template.user_state_dir, &template.project_root, now);
-    let created_at = now.to_rfc3339();
-    let session = SessionFile::new(
-        template.project_root.clone(),
-        template.connection_name.clone(),
-        template.model_name.clone(),
+    let (path, created_at) = create_fresh_session(
+        &template.user_state_dir,
+        &template.project_root,
+        &template.connection_name,
+        &template.model_name,
         template.initial_tier,
-        created_at.clone(),
-    );
-    save_session(&path, &session).map_err(|e| e.to_string())?;
+        chrono::Utc::now(),
+    )
+    .map_err(|e| e.to_string())?;
     Ok(AppProps {
         initial_entries: Vec::new(),
         initial_messages: Vec::new(),
@@ -73,6 +69,7 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
     });
     let notice = hooks.use_state(|| Option::<String>::None);
     let streaming_flags = hooks.use_state(HashMap::<u64, bool>::new);
+    let permission_flags = hooks.use_state(HashMap::<u64, bool>::new);
 
     let app_handle = hooks.use_app();
     hooks.use_input({
@@ -81,6 +78,7 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
         let sessions = sessions.clone();
         let notice = notice.clone();
         let streaming_flags = streaming_flags.clone();
+        let permission_flags = permission_flags.clone();
         let template = props.template.clone();
         let app_handle = app_handle.clone();
         move |ev, ctx| {
@@ -117,6 +115,9 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
                     streaming_flags.update(|map| {
                         map.remove(&id);
                     });
+                    permission_flags.update(|map| {
+                        map.remove(&id);
+                    });
                 }
                 KeyAction::ExitApp(_) => {
                     app_handle.exit();
@@ -132,6 +133,7 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
     let state = workspace.get();
     let session_props = sessions.get();
     let flags = streaming_flags.get();
+    let waiting = permission_flags.get();
     let focused_session = state.focused_session();
 
     let mut children: Vec<Element> = Vec::new();
@@ -150,6 +152,7 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
             app_props.input_gate = Some(input_gate.clone());
             app_props.session_tag = sid;
             app_props.streaming_flags = Some(streaming_flags.clone());
+            app_props.permission_flags = Some(permission_flags.clone());
             let border_style = if split {
                 BorderStyle::Single
             } else {
@@ -202,6 +205,10 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
                 .panes
                 .iter()
                 .any(|sid| flags.get(sid).copied().unwrap_or(false)),
+            awaiting_permission: window
+                .panes
+                .iter()
+                .any(|sid| waiting.get(sid).copied().unwrap_or(false)),
         })
         .collect::<Vec<_>>();
     children.push(
@@ -228,38 +235,24 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use daimon::model::types::{ChatRequest, ChatResponse, Message, StopReason, Usage};
-    use daimon::stream::{ResponseStream, StreamEvent};
+    use daimon::model::SharedModel;
+    use daimon::stream::StreamEvent;
     use ntui::testing::TestTerminal;
     use ntui::{Element, KeyCode};
 
     use crate::permissions::types::PermissionTier;
-
-    /// Same shape as `app::tests::StreamingEchoModel` (that one is private to
-    /// its test module): a trivial streamed reply, no tool calls.
-    struct EchoModel;
-    impl daimon::model::Model for EchoModel {
-        async fn generate(&self, _request: &ChatRequest) -> daimon::Result<ChatResponse> {
-            Ok(ChatResponse {
-                message: Message::assistant("unused"),
-                stop_reason: StopReason::EndTurn,
-                usage: Some(Usage::default()),
-            })
-        }
-        async fn generate_stream(&self, _request: &ChatRequest) -> daimon::Result<ResponseStream> {
-            Ok(Box::pin(futures::stream::iter(vec![
-                Ok(StreamEvent::TextDelta("ok".into())),
-                Ok(StreamEvent::Done),
-            ])))
-        }
-    }
+    use crate::tui::test_support::{ChannelModel, StreamingEchoModel};
 
     /// Workspace props whose template writes session files into `dir` (new
     /// tabs/panes create one on the spot, so it must be a real tempdir).
     fn props_in(dir: &std::path::Path) -> WorkspaceProps {
+        props_with_model(dir, Arc::new(StreamingEchoModel))
+    }
+
+    fn props_with_model(dir: &std::path::Path, model: SharedModel) -> WorkspaceProps {
         WorkspaceProps {
             template: AppProps {
-                model: Some(Arc::new(EchoModel)),
+                model: Some(model),
                 connection_name: "local-vllm".into(),
                 model_name: "qwen2.5-coder-32b".into(),
                 initial_tier: PermissionTier::FullAuto,
@@ -462,5 +455,155 @@ mod tests {
                 if p.is_dir() { walk_files(&p) } else { 1 }
             })
             .sum()
+    }
+
+    /// Regression test for the multi-mount input-dispatch bug: `Transcript`s
+    /// used to consume Up/Down unconditionally (deepest-first dispatch), so a
+    /// `C-b <Up>` never reached `Workspace` — pane focus didn't move and,
+    /// worse, the prefix stayed wedged armed, turning the next innocent
+    /// keystroke into a chord.
+    #[tokio::test(start_paused = true)]
+    async fn c_b_arrow_is_consumed_by_the_workspace_not_a_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            120,
+            30,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        chord(&mut t, KeyCode::Char('"')).await; // column split, focus bottom
+        chord(&mut t, KeyCode::Up).await; // move focus to the top pane
+        let text = t.frame_text();
+        assert!(
+            !text.contains("C-b …"),
+            "prefix must not stay wedged after C-b <Up>: {text}"
+        );
+        for c in "still typing".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("still typing"),
+            "keys after the chord must be plain input again: {}",
+            t.frame_text()
+        );
+    }
+
+    /// The flagship workspace claim: a window switched away from keeps its
+    /// turn streaming (the tab bar marks it `✻`), and the completed reply is
+    /// there when the user switches back.
+    #[tokio::test(start_paused = true)]
+    async fn hidden_window_keeps_streaming_and_shows_the_busy_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let (model, events) = ChannelModel::new();
+        let mut t = TestTerminal::new(
+            120,
+            30,
+            Element::component::<Workspace>(props_with_model(dir.path(), Arc::new(model))),
+        )
+        .unwrap();
+
+        for c in "go".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.send_key(KeyCode::Enter).unwrap();
+        t.tick().await.unwrap(); // turn effect spawns; stream opens
+        t.tick().await.unwrap();
+
+        chord(&mut t, KeyCode::Char('c')).await; // window 1 takes over the screen
+
+        events
+            .send(Ok(StreamEvent::TextDelta("hidden reply".into())))
+            .unwrap();
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(
+            !text.contains("hidden reply"),
+            "window 0 is collapsed; its stream must not paint: {text}"
+        );
+        assert!(
+            text.contains("0:agent✻"),
+            "tab bar must mark the hidden window busy: {text}"
+        );
+
+        events.send(Ok(StreamEvent::Done)).unwrap();
+        // The end-of-turn session save runs on the blocking pool (a real OS
+        // thread), which the paused test clock can't fast-forward — tick
+        // until the turn lands, bounded so a regression still fails loudly.
+        let mut turn_finished = false;
+        for _ in 0..100 {
+            t.tick().await.unwrap();
+            if !t.frame_text().contains('✻') {
+                turn_finished = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            turn_finished,
+            "busy marker clears once the turn finishes: {}",
+            t.frame_text()
+        );
+
+        chord(&mut t, KeyCode::Char('p')).await; // back to window 0
+        let text = t.frame_text();
+        assert!(
+            text.contains("hidden reply"),
+            "the reply streamed while hidden must be in the transcript: {text}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_creation_failure_rolls_back_and_shows_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        // `user_state_dir` is a regular FILE, so `create_fresh_session`'s
+        // `create_dir_all(<file>/sessions/…)` fails for every new pane.
+        let state_file = dir.path().join("not-a-dir");
+        std::fs::write(&state_file, "x").unwrap();
+        let mut props = props_in(dir.path());
+        props.template.user_state_dir = state_file;
+
+        let mut t = TestTerminal::new(120, 30, Element::component::<Workspace>(props)).unwrap();
+        chord(&mut t, KeyCode::Char('c')).await;
+        let text = t.frame_text();
+        assert!(
+            text.contains("couldn't create session"),
+            "the failure must be surfaced: {text}"
+        );
+        assert!(
+            text.contains("0:agent*") && !text.contains("1:agent"),
+            "the failed window must be rolled back: {text}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ctrl_c_exits_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            90,
+            24,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        t.send_key_event(ntui::KeyEvent::new(
+            KeyCode::Char('c'),
+            ntui::hooks::input::KeyModifiers::CONTROL,
+        ))
+        .unwrap();
+        t.tick().await.unwrap();
+        assert!(t.exited(), "Ctrl+C must exit now that Workspace owns it");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn c_b_x_on_the_last_pane_exits_the_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = TestTerminal::new(
+            90,
+            24,
+            Element::component::<Workspace>(props_in(dir.path())),
+        )
+        .unwrap();
+        chord(&mut t, KeyCode::Char('x')).await;
+        assert!(t.exited(), "closing the only pane of the only window exits");
     }
 }

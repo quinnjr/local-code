@@ -33,7 +33,14 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    Only the stdio transport has a live, fixture-server integration test proving positive
    end-to-end behavior. Inherited from Phase 5, not introduced here.
 
-8. **Workspace panes have one split axis per window and no resizing.** A window's first split
+8. **Per-token renders still deep-clone historical transcript entries.** Streamed text now
+   accumulates in a separate buffer (killing the old O(n²) copying of the in-flight reply), but
+   each re-render during streaming still clones the `Vec<TranscriptEntry>` of *completed*
+   entries — linear in transcript size per token. The full fix is `Arc<TranscriptEntry>` storage
+   (per-render clones become refcount bumps); deferred because it touches every transcript
+   mutation site plus session-file conversion for modest residual gain.
+
+9. **Workspace panes have one split axis per window and no resizing.** A window's first split
    (`C-b %` or `C-b "`) fixes its layout axis; later splits extend along that axis (the other
    direction's chord is honored but its direction is ignored), and all panes are equal-sized.
    Mixed-direction nesting is blocked by ntui's sibling-scoped keyed reconciliation — a nested
@@ -41,7 +48,7 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    ntui grows global keys/portals. Workspace layout also isn't persisted across restarts — each
    pane's *session* is individually resumable, but the window/pane arrangement resets.
 
-9. **The two live smoke tests (`live_compact`, `live_init`) only assert non-empty output.**
+10. **The two live smoke tests (`live_compact`, `live_init`) only assert non-empty output.**
    Neither checks structural correctness of the generated content (e.g., that `/init`'s output
    looks like real markdown, or that `/compact`'s summary is actually shorter than the input).
    They'd miss a regression where the model returns garbage-but-nonempty text. Intentionally thin

@@ -139,7 +139,7 @@ cargo test --test live_ollama -- --ignored --nocapture
   and user-level `AGENTS.md`/`CLAUDE.md` (in that order) into the system prompt. Both the TUI
   (`tui::run_tui`) and headless mode (`agent::headless::run_headless`) load this context.
 - `init/` — the `/init` slash command's survey + generation logic for producing a project
-  `CLAUDE.md`.
+  `AGENTS.md`.
 
 ### Cross-cutting conventions
 

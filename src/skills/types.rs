@@ -62,12 +62,13 @@ pub enum Scope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillSource {
     pub host: Host,
-    /// GitHub: `owner`. Bitbucket: `workspace`. GitLab: the project's
-    /// full namespace path (e.g. `group/subgroup/project`) — GitLab has no
-    /// separate "owner" concept once nested groups are involved, so this
-    /// field carries the whole project path and `repo` is left empty for
-    /// GitLab sources (all three host clients take the full pair as
-    /// constructed here; see `SkillClient` methods in `client.rs`).
+    /// GitHub: `owner`. Bitbucket: `workspace`. GitLab: left EMPTY —
+    /// GitLab has no separate "owner" concept once nested groups are
+    /// involved, so the project's full namespace path (e.g.
+    /// `group/subgroup/project`) lives in `repo` and this field is `""` for
+    /// GitLab sources (all three host clients take the pair as constructed
+    /// here; see `SkillClient`'s dispatch in `client.rs`, which passes
+    /// `repo` alone to the GitLab client).
     pub owner: String,
     pub repo: String,
     /// Empty string means "repo/project root".

@@ -8,40 +8,78 @@ use crate::permissions::types::PermissionRequest;
 use crate::tui::components::permission_card::render_permission_card;
 use crate::tui::state::TranscriptEntry;
 
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, Default)]
 pub struct TranscriptProps {
     pub entries: Vec<TranscriptEntry>,
     pub pending_permission: Option<PermissionRequest>,
+    /// The in-flight streamed assistant text for the current turn, rendered
+    /// as a trailing pseudo-entry. Kept out of `entries` so every `TextDelta`
+    /// re-render clones one small growing `String` instead of the whole
+    /// transcript (see `run_turn`'s stream loop) — the entry is folded into
+    /// `entries` once the streamed block completes.
+    pub streaming_text: String,
+    /// Whether this transcript's pane has keyboard focus. The workspace
+    /// mounts one `Transcript` per pane (including hidden windows) and ntui
+    /// dispatches each key to every handler in the tree, deepest-first, until
+    /// one stops propagation — so an unfocused transcript must not consume
+    /// scroll keys, or it steals them from the focused pane AND from
+    /// `Workspace`'s `C-b <arrow>` chords (leaving the prefix wedged armed).
+    pub focused: bool,
+    /// Mirror of the workspace's "a `C-b` chord is armed" flag (same handle
+    /// `App` checks in `session_may_handle_input`): while armed, even the
+    /// focused transcript lets arrow keys bubble up so `C-b <Up>/<Down>`
+    /// reach `Workspace` instead of scrolling.
+    pub input_gate: Option<ntui::State<bool>>,
+}
+
+impl PartialEq for TranscriptProps {
+    /// `input_gate` is excluded: handlers read it through the shared
+    /// `ntui::State` at event time, so a gate flip needs no re-render here
+    /// (mirrors `AppProps`'s treatment of the same handle).
+    fn eq(&self, other: &Self) -> bool {
+        self.entries == other.entries
+            && self.pending_permission == other.pending_permission
+            && self.streaming_text == other.streaming_text
+            && self.focused == other.focused
+    }
 }
 
 /// The scrollable, full-width transcript pane. Owns its own `Scroll` handle
 /// (created via `hooks.use_scroll()`) and a `use_input` that only intercepts
-/// Up/Down/PageUp/PageDown, calling `stop_propagation()` for those so they
-/// don't also reach `App`'s own handler, while every other key (typed
+/// Up/Down/PageUp/PageDown — and only while its pane is focused and no
+/// workspace prefix chord is armed — calling `stop_propagation()` for those
+/// so they don't also reach other handlers, while every other key (typed
 /// characters, Enter, digits for permission choices) bubbles up untouched.
 #[component]
 pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
     let scroll = hooks.use_scroll();
     hooks.use_input({
         let scroll = scroll.clone();
-        move |ev, ctx| match ev.code {
-            KeyCode::Up => {
-                scroll.scroll_by(-1);
-                ctx.stop_propagation();
+        let focused = props.focused;
+        let input_gate = props.input_gate.clone();
+        move |ev, ctx| {
+            if !focused || input_gate.as_ref().is_some_and(|gate| gate.get()) {
+                return;
             }
-            KeyCode::Down => {
-                scroll.scroll_by(1);
-                ctx.stop_propagation();
+            match ev.code {
+                KeyCode::Up => {
+                    scroll.scroll_by(-1);
+                    ctx.stop_propagation();
+                }
+                KeyCode::Down => {
+                    scroll.scroll_by(1);
+                    ctx.stop_propagation();
+                }
+                KeyCode::PageUp => {
+                    scroll.scroll_by(-10);
+                    ctx.stop_propagation();
+                }
+                KeyCode::PageDown => {
+                    scroll.scroll_by(10);
+                    ctx.stop_propagation();
+                }
+                _ => {}
             }
-            KeyCode::PageUp => {
-                scroll.scroll_by(-10);
-                ctx.stop_propagation();
-            }
-            KeyCode::PageDown => {
-                scroll.scroll_by(10);
-                ctx.stop_propagation();
-            }
-            _ => {}
         }
     });
 
@@ -66,6 +104,15 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
             .with_key(i.to_string())
         })
         .collect();
+
+    if !props.streaming_text.is_empty() {
+        children.push(
+            render_entry(&TranscriptEntry::AssistantText {
+                text: props.streaming_text.clone(),
+            })
+            .with_key("streaming-tail"),
+        );
+    }
 
     if let Some(request) = &props.pending_permission {
         children.push(render_permission_card(request).with_key("pending-permission"));
@@ -232,7 +279,7 @@ mod tests {
     async fn renders_user_turn_tool_card_and_assistant_text() {
         let props = TranscriptProps {
             entries: entries_fixture(),
-            pending_permission: None,
+            ..Default::default()
         };
         let t = TestTerminal::new(60, 20, Element::component::<Transcript>(props)).unwrap();
         let text = t.frame_text();
@@ -250,7 +297,7 @@ mod tests {
         }
         let props = TranscriptProps {
             entries,
-            pending_permission: None,
+            ..Default::default()
         };
         let t = TestTerminal::new(60, 20, Element::component::<Transcript>(props)).unwrap();
         assert!(!t.frame_text().contains("edited x.rs"));
@@ -260,11 +307,13 @@ mod tests {
     async fn renders_pending_permission_card_when_present() {
         let props = TranscriptProps {
             entries: vec![],
+            focused: true,
             pending_permission: Some(PermissionRequest {
                 tool_name: "bash".into(),
                 description: "run shell command: rm x".into(),
                 command_preview: Some("rm x".into()),
             }),
+            ..Default::default()
         };
         let t = TestTerminal::new(60, 10, Element::component::<Transcript>(props)).unwrap();
         assert!(
@@ -277,7 +326,8 @@ mod tests {
     async fn up_key_scrolls_without_panicking() {
         let props = TranscriptProps {
             entries: entries_fixture(),
-            pending_permission: None,
+            focused: true,
+            ..Default::default()
         };
         let mut t = TestTerminal::new(60, 3, Element::component::<Transcript>(props)).unwrap();
         t.send_key(ntui::KeyCode::Up).unwrap(); // must not panic even with no scroll headroom

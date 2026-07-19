@@ -85,22 +85,30 @@ pub struct AppProps {
     pub created_at: String,
     /// Whether this session's pane has keyboard focus. `Workspace` mounts
     /// many `App`s at once (tmux-style windows/panes); only the focused one
-    /// may react to input, so both `use_input` handlers below early-return
-    /// (without stopping propagation) when this is false.
+    /// may react to input, so the `use_input` handler below early-returns
+    /// (without stopping propagation) when this is false. Note `App` is a
+    /// pane child of `Workspace`, which owns app lifecycle (Ctrl+C exit) —
+    /// a bare `App` mount is a test-only configuration.
     pub focused: bool,
     /// Set to `true` by `Workspace` while a `C-b` prefix chord is armed —
     /// the next key is a workspace command, so even the focused session must
-    /// let it bubble up untouched. `None` (tests, standalone use) behaves as
-    /// "never armed".
+    /// let it bubble up untouched. `None` (tests only) behaves as "never
+    /// armed".
     pub input_gate: Option<ntui::State<bool>>,
     /// This session's workspace id, used only as the key it reports its
-    /// streaming status under in `streaming_flags`. 0 when standalone.
+    /// streaming status under in `streaming_flags`. 0 in tests.
     pub session_tag: u64,
     /// Shared map of session id → "a turn is streaming", written by every
     /// mounted session and read by the workspace tab bar so a background
-    /// window can show a busy indicator. `None` (tests, standalone use)
-    /// disables reporting.
+    /// window can show a busy indicator. `None` (tests only) disables
+    /// reporting.
     pub streaming_flags: Option<ntui::State<std::collections::HashMap<u64, bool>>>,
+    /// Shared map of session id → "a permission prompt is waiting for a
+    /// decision", mirrored like `streaming_flags`. The tab bar renders this
+    /// as a distinct `!` marker: a background pane blocked on a permission
+    /// prompt would otherwise be indistinguishable from one that is making
+    /// progress (`✻`), leaving its turn silently stuck until focused.
+    pub permission_flags: Option<ntui::State<std::collections::HashMap<u64, bool>>>,
 }
 
 impl Default for AppProps {
@@ -127,6 +135,7 @@ impl Default for AppProps {
             input_gate: None,
             session_tag: 0,
             streaming_flags: None,
+            permission_flags: None,
         }
     }
 }
@@ -144,20 +153,13 @@ impl PartialEq for AppProps {
     }
 }
 
-/// Maps a numeric key press to a validated 0-based index, bounded by `max`
-/// (the number of items in the pending numbered list/menu). Returns `None`
-/// for non-digit keys, `0`, or any digit beyond `max`. Shared by all four
-/// "show a numbered list, then intercept the next digit press" pending-choice
-/// blocks in `use_input` below (`pending_permission`, and `pending_menu`'s
-/// three variants `ModelChoice`, `PermissionsMenu`, `ResumeChoice`) —
-/// extracted per code review after Task 11, which flagged the duplicated
-/// digit-matching boilerplate across what was then three (now four)
-/// near-identical blocks.
-/// Gate applied at the top of both of `App`'s `use_input` handlers. A session
-/// may only react to a key when its pane is focused, no `C-b` prefix chord is
+/// Gate applied at the top of `App`'s `use_input` handler. A session may
+/// only react to a key when its pane is focused, no `C-b` prefix chord is
 /// armed (`input_gate`), and the key isn't the prefix itself — in all other
 /// cases the handler returns without consuming, letting the event bubble up
-/// to `Workspace`'s root handler (dispatch is deepest-first).
+/// to `Workspace`'s root handler (dispatch is deepest-first). The same
+/// predicate (minus the prefix-key clause) gates `Transcript`'s scroll
+/// handler via its own `focused`/`input_gate` props.
 fn session_may_handle_input(
     focused: bool,
     input_gate: &Option<ntui::State<bool>>,
@@ -175,6 +177,15 @@ fn session_may_handle_input(
             .contains(ntui::hooks::input::KeyModifiers::CONTROL))
 }
 
+/// Maps a numeric key press to a validated 0-based index, bounded by `max`
+/// (the number of items in the pending numbered list/menu). Returns `None`
+/// for non-digit keys, `0`, or any digit beyond `max`. Shared by all four
+/// "show a numbered list, then intercept the next digit press" pending-choice
+/// blocks in `use_input` below (`pending_permission`, and `pending_menu`'s
+/// three variants `ModelChoice`, `PermissionsMenu`, `ResumeChoice`) —
+/// extracted per code review after Task 11, which flagged the duplicated
+/// digit-matching boilerplate across what was then three (now four)
+/// near-identical blocks.
 fn digit_key_to_index(code: KeyCode, max: usize) -> Option<usize> {
     if let KeyCode::Char(c) = code
         && let Some(digit) = c.to_digit(10)
@@ -249,6 +260,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let turn_id = hooks.use_state(|| 0u64);
     let pending_turn_input = hooks.use_state(|| Option::<String>::None);
     let streaming = hooks.use_state(|| false);
+    // The current turn's in-flight streamed assistant text, kept OUT of
+    // `transcript` so each `TextDelta` re-render clones only this one growing
+    // `String` instead of the whole transcript Vec (streaming an N-byte reply
+    // through the transcript was O(N²) transient copying). `run_turn` folds
+    // it into `transcript` as a normal `AssistantText` entry whenever the
+    // streamed block completes (tool call, error, or end of turn).
+    let stream_text = hooks.use_state(String::new);
     let usage = hooks.use_state(UsageSummary::default);
     let tier = hooks.use_state(|| props.initial_tier);
     let session_path = hooks.use_state({
@@ -362,16 +380,40 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         }
     });
 
+    // Same mirror for "blocked on a permission decision" — the tab bar shows
+    // this as `!` so a hidden pane waiting on input is never mistaken for one
+    // that is streaming (its prompt only accepts digits while focused, so
+    // without this the turn would sit stuck behind a generic busy marker).
+    hooks.use_effect(pending_permission.get().is_some(), {
+        let permission_flags = props.permission_flags.clone();
+        let session_tag = props.session_tag;
+        let is_waiting = pending_permission.get().is_some();
+        move || {
+            if let Some(flags) = permission_flags {
+                flags.update(|map| {
+                    map.insert(session_tag, is_waiting);
+                });
+            }
+        }
+    });
+
     hooks.use_effect(turn_id.get(), {
         let pending_turn_input = pending_turn_input.clone();
         let transcript = transcript.clone();
+        let stream_text = stream_text.clone();
         let usage = usage.clone();
         let streaming = streaming.clone();
         let agent = agent.clone();
         let session_path = session_path.clone();
         let created_at = created_at.clone();
-        let connection_name = props.connection_name.clone();
-        let model_name = props.model_name.clone();
+        // The *states*, not `props` snapshots: `/model` and in-TUI `/resume`
+        // update `connection_display`/`model_display` when they switch, and
+        // `run_turn` persists whatever they hold at save time — a props
+        // snapshot here made every post-switch turn write the launch
+        // connection/model into the session file, so resuming it later
+        // rebuilt against the wrong provider.
+        let connection_name = connection_display.clone();
+        let model_name = model_display.clone();
         let tier = tier.clone();
         let project_root = props.project_root.clone();
         move || {
@@ -382,6 +424,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 agent,
                 input,
                 transcript,
+                stream_text,
                 usage,
                 streaming,
                 pending_turn_input,
@@ -408,8 +451,6 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let tier = tier.clone();
         let session_path = session_path.clone();
         let created_at = created_at.clone();
-        let connection_name = props.connection_name.clone();
-        let model_name = props.model_name.clone();
         let user_state_dir = props.user_state_dir.clone();
         let user_config_dir = props.user_config_dir.clone();
         let project_config_dir = props.project_config_dir.clone();
@@ -915,8 +956,12 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             tier: tier.clone(),
                             session_path: session_path.clone(),
                             created_at: created_at.clone(),
-                            connection_name: connection_name.clone(),
-                            model_name: model_name.clone(),
+                            // Live display states, not the launch-time props:
+                            // after `/model` or in-TUI `/resume`, `/clear`
+                            // must stamp the *active* connection/model into
+                            // the fresh session file.
+                            connection_name: connection_display.get(),
+                            model_name: model_display.get(),
                             project_root: project_root.clone(),
                             user_state_dir: user_state_dir.clone(),
                             user_config_dir: user_config_dir.clone(),
@@ -960,7 +1005,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     );
     body.push(
         element! {
-            Transcript(entries: transcript.get(), pending_permission: pending_permission.get())
+            Transcript(
+                entries: transcript.get(),
+                pending_permission: pending_permission.get(),
+                streaming_text: stream_text.get(),
+                focused: props.focused,
+                input_gate: props.input_gate.clone(),
+            )
         }
         .with_key("transcript"),
     );
@@ -1032,7 +1083,9 @@ const HELP_TEXT: &str = "\
 /compact                   summarize older turns to free up context
 /resume                    switch to a previous session for this project
 /clear                     clear the transcript and start a fresh session
-/help                      show this message";
+/help                      show this message
+workspace: Ctrl+B then     c new window · n/p/0-9 switch · % \" split
+                           arrows/o move pane focus · x close (last pane exits)";
 
 fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashContext) {
     use crate::tui::slash::SlashCommand;
@@ -1474,16 +1527,36 @@ async fn run_turn(
     agent: Arc<Agent>,
     input: String,
     transcript: ntui::State<Vec<TranscriptEntry>>,
+    stream_text: ntui::State<String>,
     usage: ntui::State<UsageSummary>,
     streaming: ntui::State<bool>,
     pending_turn_input: ntui::State<Option<String>>,
     session_path: ntui::State<std::path::PathBuf>,
     created_at: ntui::State<String>,
-    connection_name: String,
-    model_name: String,
+    connection_name: ntui::State<String>,
+    model_name: ntui::State<String>,
     tier: PermissionTier,
     project_root: std::path::PathBuf,
 ) {
+    // Folds the in-flight streamed text into the transcript as a finished
+    // `AssistantText` entry. Called whenever the current streamed block ends
+    // (a tool call starts, an error interrupts, or the turn completes) so
+    // `transcript` is only touched once per block instead of once per token
+    // — see `stream_text`'s declaration in `App` for the cost rationale.
+    let flush_stream_text = {
+        let transcript = transcript.clone();
+        let stream_text = stream_text.clone();
+        move || {
+            let text = stream_text.get();
+            if !text.is_empty() {
+                stream_text.set(String::new());
+                transcript.update(|entries| {
+                    entries.push(TranscriptEntry::AssistantText { text });
+                });
+            }
+        }
+    };
+
     let mut stream = match agent.prompt_stream(&input).await {
         Ok(s) => s,
         Err(e) => {
@@ -1501,12 +1574,10 @@ async fn run_turn(
     while let Some(event) = stream.next().await {
         match event {
             Ok(StreamEvent::TextDelta(delta)) => {
-                transcript.update(|entries| match entries.last_mut() {
-                    Some(TranscriptEntry::AssistantText { text }) => text.push_str(&delta),
-                    _ => entries.push(TranscriptEntry::AssistantText { text: delta }),
-                });
+                stream_text.update(|text| text.push_str(&delta));
             }
             Ok(StreamEvent::ToolCallStart { id, name }) => {
+                flush_stream_text();
                 transcript.update(|entries| {
                     entries.push(TranscriptEntry::ToolCall(ToolCallEntry {
                         id,
@@ -1551,6 +1622,7 @@ async fn run_turn(
                 usage.update(|u| u.add(input_tokens, output_tokens, estimated_cost));
             }
             Ok(StreamEvent::Error(message)) => {
+                flush_stream_text();
                 transcript.update(|entries| {
                     entries.push(TranscriptEntry::SystemNotice {
                         text: format!("error: {message}"),
@@ -1559,6 +1631,7 @@ async fn run_turn(
             }
             Ok(StreamEvent::Done) => break,
             Err(e) => {
+                flush_stream_text();
                 transcript.update(|entries| {
                     entries.push(TranscriptEntry::SystemNotice {
                         text: format_turn_error(e),
@@ -1568,24 +1641,44 @@ async fn run_turn(
             }
         }
     }
+    flush_stream_text();
 
     if let Ok(messages) = agent.memory().get_messages_erased().await {
         let now = chrono::Utc::now().to_rfc3339();
         let mut session = crate::session::types::SessionFile::new(
             project_root,
-            connection_name,
-            model_name,
+            connection_name.get(),
+            model_name.get(),
             tier,
             created_at.get(),
         );
         session.updated_at = now;
         session.entries = transcript.get();
         session.messages = messages;
-        if let Err(e) = crate::session::store::save_session(&session_path.get(), &session) {
-            eprintln!(
-                "warning: failed to persist session to {}: {e}",
-                session_path.get().display()
-            );
+        // Serialize + write on the blocking pool: the session grows with the
+        // conversation, and doing this inline stalled the single-threaded
+        // runtime (rendering AND every other pane's stream) for the duration
+        // of the write. A failure lands in the transcript — an `eprintln!`
+        // under the alternate screen was invisible.
+        let path = session_path.get();
+        let saved = tokio::task::spawn_blocking(move || {
+            crate::session::store::save_session(&path, &session)
+        })
+        .await;
+        let save_error = match saved {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(join_error) => Some(join_error.to_string()),
+        };
+        if let Some(e) = save_error {
+            transcript.update(|entries| {
+                entries.push(TranscriptEntry::SystemNotice {
+                    text: format!(
+                        "warning: failed to persist session to {}: {e}",
+                        session_path.get().display()
+                    ),
+                });
+            });
         }
     }
 
@@ -1596,37 +1689,12 @@ async fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daimon::model::types::{ChatRequest, ChatResponse, Message, Role, StopReason, Usage};
+    use daimon::model::types::{ChatRequest, ChatResponse, Role};
     use daimon::stream::ResponseStream;
     use ntui::testing::TestTerminal;
     use ntui::{Element, KeyCode};
 
-    /// Replies with a two-token streamed response and no tool calls.
-    ///
-    /// Deliberately emits no `StreamEvent::Usage` of its own: `Agent::prompt_stream`
-    /// (see `daimon`'s `agent/runner.rs`) always appends its *own* estimated
-    /// `Usage` event per ReAct iteration (character-count-based, `chars/4`) after
-    /// forwarding whatever the model's stream yields — so any `Usage` this mock
-    /// emitted would be forwarded too and summed with the agent's, on top of the
-    /// agent's own estimate. Omitting it keeps this test's usage assertions tied
-    /// to one authoritative source instead of an arbitrary double-count.
-    struct StreamingEchoModel;
-    impl daimon::model::Model for StreamingEchoModel {
-        async fn generate(&self, _request: &ChatRequest) -> daimon::Result<ChatResponse> {
-            Ok(ChatResponse {
-                message: Message::assistant("unused"),
-                stop_reason: StopReason::EndTurn,
-                usage: Some(Usage::default()),
-            })
-        }
-        async fn generate_stream(&self, _request: &ChatRequest) -> daimon::Result<ResponseStream> {
-            Ok(Box::pin(futures::stream::iter(vec![
-                Ok(StreamEvent::TextDelta("Hello".into())),
-                Ok(StreamEvent::TextDelta(", world".into())),
-                Ok(StreamEvent::Done),
-            ])))
-        }
-    }
+    use crate::tui::test_support::StreamingEchoModel;
 
     fn test_props() -> AppProps {
         AppProps {
@@ -1660,6 +1728,90 @@ mod tests {
         KEYRING_INIT.call_once(|| {
             keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
         });
+    }
+
+    fn plain_key(code: KeyCode) -> ntui::KeyEvent {
+        ntui::KeyEvent::new(code, ntui::hooks::input::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn guard_blocks_every_key_when_unfocused() {
+        assert!(!session_may_handle_input(
+            false,
+            &None,
+            &plain_key(KeyCode::Char('a'))
+        ));
+        assert!(!session_may_handle_input(
+            false,
+            &None,
+            &plain_key(KeyCode::Enter)
+        ));
+    }
+
+    #[test]
+    fn guard_passes_normal_keys_when_focused_and_ungated() {
+        assert!(session_may_handle_input(
+            true,
+            &None,
+            &plain_key(KeyCode::Char('a'))
+        ));
+        assert!(session_may_handle_input(
+            true,
+            &None,
+            &plain_key(KeyCode::Enter)
+        ));
+    }
+
+    #[test]
+    fn guard_lets_the_prefix_key_bubble_but_not_a_plain_b() {
+        let prefix = ntui::KeyEvent::new(
+            KeyCode::Char('b'),
+            ntui::hooks::input::KeyModifiers::CONTROL,
+        );
+        assert!(!session_may_handle_input(true, &None, &prefix));
+        assert!(session_may_handle_input(
+            true,
+            &None,
+            &plain_key(KeyCode::Char('b'))
+        ));
+    }
+
+    /// Throwaway component whose sole job is to hand its `use_state` handle
+    /// out to the test (states can't be constructed outside a component) —
+    /// same pattern as `src/tui/rebuild.rs`'s own tests.
+    #[derive(Clone, Default)]
+    struct GateHarnessProps {
+        slot: Arc<std::sync::Mutex<Option<ntui::State<bool>>>>,
+    }
+    impl PartialEq for GateHarnessProps {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+    #[component]
+    fn GateHarness(props: &GateHarnessProps, hooks: &mut Hooks) -> Element {
+        let gate = hooks.use_state(|| true);
+        *props.slot.lock().unwrap() = Some(gate.clone());
+        element! { View {} }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guard_blocks_the_focused_session_while_the_gate_is_armed() {
+        let slot: Arc<std::sync::Mutex<Option<ntui::State<bool>>>> = Default::default();
+        let _t = TestTerminal::new(
+            10,
+            1,
+            Element::component::<GateHarness>(GateHarnessProps { slot: slot.clone() }),
+        )
+        .unwrap();
+        let gate = slot.lock().unwrap().clone().unwrap();
+        let ev = plain_key(KeyCode::Char('1'));
+        assert!(
+            !session_may_handle_input(true, &Some(gate.clone()), &ev),
+            "an armed prefix gates even permission-prompt digits"
+        );
+        gate.set(false);
+        assert!(session_may_handle_input(true, &Some(gate), &ev));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2234,21 +2386,27 @@ mod tests {
     #[component]
     fn RunTurnHarness(props: &RunTurnHarnessProps, hooks: &mut Hooks) -> Element {
         let transcript = hooks.use_state(Vec::<TranscriptEntry>::new);
+        let stream_text = hooks.use_state(String::new);
         let usage_state = hooks.use_state(UsageSummary::default);
         let streaming = hooks.use_state(|| false);
         let pending_turn_input = hooks.use_state(|| Option::<String>::None);
         let session_path = hooks.use_state(std::path::PathBuf::new);
         let created_at = hooks.use_state(|| "2026-01-01T00:00:00Z".to_string());
+        let connection_name = hooks.use_state(|| "local-vllm".to_string());
+        let model_name = hooks.use_state(|| "qwen2.5-coder-32b".to_string());
 
         hooks.use_effect((), {
             let slot = props.slot.clone();
             let mode = props.mode;
             let transcript = transcript.clone();
+            let stream_text = stream_text.clone();
             let usage_state = usage_state.clone();
             let streaming = streaming.clone();
             let pending_turn_input = pending_turn_input.clone();
             let session_path = session_path.clone();
             let created_at = created_at.clone();
+            let connection_name = connection_name.clone();
+            let model_name = model_name.clone();
             move || {
                 let agent = Arc::new(match mode {
                     HarnessMode::ToolCall => Agent::builder()
@@ -2265,13 +2423,14 @@ mod tests {
                     agent,
                     "add 2 and 3".to_string(),
                     transcript,
+                    stream_text,
                     usage_state,
                     streaming,
                     pending_turn_input,
                     session_path,
                     created_at,
-                    "local-vllm".into(),
-                    "qwen2.5-coder-32b".into(),
+                    connection_name,
+                    model_name,
                     PermissionTier::FullAuto,
                     std::env::temp_dir(),
                 ));
@@ -2423,7 +2582,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn help_command_lists_every_slash_command() {
-        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        // 30 rows: HELP_TEXT grew a workspace-keybindings section and no
+        // longer fits a 24-row frame alongside the header.
+        let mut t = TestTerminal::new(80, 30, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/help").await;
         t.tick().await.unwrap();
         let text = t.frame_text();

@@ -13,6 +13,12 @@ pub struct TabInfo {
     pub panes: usize,
     /// Any pane in the window has a turn streaming.
     pub streaming: bool,
+    /// Any pane in the window has a permission prompt waiting for a
+    /// decision. Takes display priority over `streaming`: a blocked turn
+    /// only advances once the user focuses that window and answers, so
+    /// showing the generic busy marker would misrepresent a stuck turn as
+    /// progress.
+    pub awaiting_permission: bool,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -27,8 +33,9 @@ pub struct TabBarProps {
     pub notice: Option<String>,
 }
 
-/// One-line tmux-style status bar listing windows: `0:agent* 1:agent✻` —
-/// `*` marks the active window, `✻` a window with a streaming session.
+/// One-line tmux-style status bar listing windows: `0:agent* 1:agent✻ 2:agent!`
+/// — `*` marks the active window, `✻` a window with a streaming session, `!`
+/// a window whose session is blocked waiting for a permission decision.
 #[component]
 pub fn TabBar(props: &TabBarProps, _hooks: &mut ntui::Hooks) -> ntui::Element {
     let tabs = props
@@ -36,7 +43,13 @@ pub fn TabBar(props: &TabBarProps, _hooks: &mut ntui::Hooks) -> ntui::Element {
         .iter()
         .map(|tab| {
             let marker = if tab.index == props.active { "*" } else { "" };
-            let busy = if tab.streaming { "✻" } else { "" };
+            let busy = if tab.awaiting_permission {
+                "!"
+            } else if tab.streaming {
+                "✻"
+            } else {
+                ""
+            };
             let panes = if tab.panes > 1 {
                 format!("[{}]", tab.panes)
             } else {
@@ -80,6 +93,7 @@ mod tests {
                 index,
                 panes: 1,
                 streaming: false,
+                awaiting_permission: false,
             })
             .collect()
     }
@@ -114,6 +128,23 @@ mod tests {
         let text = t.frame_text();
         assert!(text.contains("0:agent*✻"), "{text}");
         assert!(text.contains("1:agent[3]"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn awaiting_permission_marker_outranks_streaming() {
+        let mut all = tabs(2);
+        all[1].streaming = true;
+        all[1].awaiting_permission = true;
+        let props = TabBarProps {
+            tabs: all,
+            active: 0,
+            prefix_pending: false,
+            notice: None,
+        };
+        let t = TestTerminal::new(80, 1, Element::component::<TabBar>(props)).unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("1:agent!"), "{text}");
+        assert!(!text.contains("1:agent✻"), "{text}");
     }
 
     #[tokio::test]

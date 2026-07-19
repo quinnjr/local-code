@@ -9,7 +9,24 @@
   defaults: `c` new window, `n`/`p`/`0-9` switch windows, `%`/`"` split,
   arrows/`o` move pane focus, `x` close pane (closing the last pane exits).
   Hidden windows keep streaming in the background; the tab bar marks busy
-  windows with `✻`.
+  windows with `✻`, and windows blocked on a permission decision with `!`
+  (a background pane's prompt only accepts input once focused, so it is
+  surfaced distinctly from ordinary streaming).
+- New windows/panes create their session file eagerly, so `/resume` and
+  `--resume` now hide sessions that never recorded a turn — a stack of
+  opened-but-untouched tabs no longer clutters the resume list (the files
+  themselves are kept and appear once they get their first turn).
+- MCP server connection attempts are now bounded at 15s each; a stdio
+  server that starts but never speaks the protocol previously blocked TUI
+  startup forever.
+- Perf: streamed assistant text no longer rewrites the whole transcript
+  per token (was O(n²) copying over a long reply); per-turn session saves
+  and `grep`/`glob` tree walks moved off the render thread; `grep` now
+  skips files over the same 2 MiB cap `read_file` enforces.
+- Session files now record the connection/model that is actually active
+  (after `/model` or in-TUI `/resume`) instead of the one the process
+  launched with, and save failures surface in the transcript instead of
+  an invisible stderr line.
 
 - **Breaking**: the MCP server config file was renamed from
   `mcp-servers.toml` to `mcp.toml`. If you have an existing

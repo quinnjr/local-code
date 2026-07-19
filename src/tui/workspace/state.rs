@@ -504,6 +504,28 @@ mod tests {
     }
 
     #[test]
+    fn arrow_on_an_unsplit_window_is_a_noop() {
+        let (mut state, _) = WorkspaceState::new();
+        prefixed(&mut state, KeyCode::Left); // dir is still None
+        assert_eq!(state.focused_session(), 0);
+        assert!(!state.prefix_pending, "the chord is still consumed");
+    }
+
+    #[test]
+    fn prefix_ignores_modifiers_on_the_command_key() {
+        // Like tmux: after `C-b`, the command key's modifiers are not
+        // inspected — `C-b Ctrl+x` closes the pane exactly like `C-b x`.
+        // Pinned so a future modifier-sensitive rebind is a deliberate
+        // decision, not an accident.
+        let (mut state, _) = WorkspaceState::new();
+        prefixed(&mut state, KeyCode::Char('%'));
+        assert!(!state.prefix_pending);
+        state.on_key(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        let action = state.on_key(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(action, KeyAction::SessionClosed(1));
+    }
+
+    #[test]
     fn prefix_key_itself_is_consumed_not_passed() {
         let (mut state, _) = WorkspaceState::new();
         assert_eq!(

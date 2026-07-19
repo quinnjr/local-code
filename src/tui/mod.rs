@@ -9,6 +9,8 @@ pub mod permission_prompter;
 pub mod rebuild;
 pub mod slash;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod workspace;
 
 pub use app::{App, AppProps};
@@ -25,8 +27,6 @@ use crate::context::load_project_context;
 use crate::mcp::connect::connect_all;
 use crate::permissions::settings::load_settings;
 use crate::permissions::types::PermissionTier;
-use crate::session::paths::new_session_path;
-use crate::session::types::SessionFile;
 use crate::skills::discovery::{discover_skills, render_skill_context, resolve_skill_context};
 use daimon::model::types::Message;
 
@@ -198,19 +198,16 @@ pub async fn run_tui(
             resumed.created_at,
         ),
         None => {
-            let now = chrono::Utc::now();
-            let path = new_session_path(&paths.user_state_dir, project_root, now);
             let tier = permission_mode_override.unwrap_or(PermissionTier::Ask);
-            let created_at = now.to_rfc3339();
-            let session = SessionFile::new(
-                project_root.to_path_buf(),
-                connection.name.clone(),
-                connection.default_model.clone(),
+            let (path, created_at) = crate::session::store::create_fresh_session(
+                &paths.user_state_dir,
+                project_root,
+                &connection.name,
+                &connection.default_model,
                 tier,
-                created_at.clone(),
-            );
-            crate::session::store::save_session(&path, &session)
-                .map_err(TuiSessionError::Session)?;
+                chrono::Utc::now(),
+            )
+            .map_err(TuiSessionError::Session)?;
             (tier, Vec::new(), Vec::new(), path, created_at)
         }
     };
