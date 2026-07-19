@@ -1,5 +1,3 @@
-// src/skills/install.rs
-
 use std::path::{Path, PathBuf};
 
 use crate::config::paths::Paths;
@@ -311,10 +309,17 @@ pub fn list_skills(paths: &Paths) -> Result<Vec<InstalledSkillSummary>, InstallE
             } else {
                 format!("/{}", manifest.path)
             };
-            let bare = format!(
-                "{}/{}{}@{}",
-                manifest.owner, manifest.repo, path_suffix, manifest.git_ref
-            );
+            // GitLab manifests carry an empty `owner` (the project path
+            // lives in `repo`), so join only the non-empty coordinates —
+            // otherwise the source renders with a stray leading slash
+            // (`gl:/acme/widgets/...`).
+            let coords = [manifest.owner.as_str(), manifest.repo.as_str()]
+                .iter()
+                .filter(|part| !part.is_empty())
+                .copied()
+                .collect::<Vec<_>>()
+                .join("/");
+            let bare = format!("{coords}{path_suffix}@{}", manifest.git_ref);
             let source = match manifest.host {
                 Host::GitHub => bare,
                 Host::GitLab => format!("gl:{bare}"),
@@ -988,6 +993,27 @@ mod tests {
         assert_eq!(manifest.host, Host::GitLab);
         assert_eq!(manifest.commit_sha, "abc123");
         assert_eq!(manifest.git_ref, "main");
+    }
+
+    #[tokio::test]
+    async fn list_renders_a_gitlab_source_without_a_stray_leading_slash() {
+        let root = tempdir().unwrap();
+        let paths = test_paths(root.path());
+        let server = gitlab_mock_server_with_one_file().await;
+        let client = SkillClient::GitLab(crate::skills::gitlab::GitlabClient::new_for_test(
+            None,
+            server.uri(),
+        ));
+        install_skill(&client, &paths, Scope::Project, &gitlab_source(), "pdf")
+            .await
+            .unwrap();
+
+        let summaries = list_skills(&paths).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(
+            summaries[0].source, "gl:acme/widgets/skills/pdf@main",
+            "empty GitLab owner must not leave a leading slash"
+        );
     }
 
     #[tokio::test]

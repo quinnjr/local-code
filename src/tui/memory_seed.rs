@@ -1,5 +1,3 @@
-// src/tui/memory_seed.rs
-
 use tokio::sync::Mutex;
 
 use daimon::memory::Memory;

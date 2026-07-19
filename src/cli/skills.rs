@@ -1,5 +1,3 @@
-// src/cli/skills.rs
-
 use std::io::Write;
 
 use crate::config::paths::Paths;

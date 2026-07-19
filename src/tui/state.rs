@@ -1,5 +1,3 @@
-// src/tui/state.rs
-
 use std::sync::Arc;
 
 /// One entry in the transcript, in display order. Cloned into `ntui::State` on
@@ -70,25 +68,52 @@ impl UsageSummary {
     }
 }
 
+/// The transcript's in-memory storage: entries behind `Arc` so the per-render
+/// clone (`ntui::State::get()` clones the whole Vec, once per keystroke and
+/// per streamed token) bumps refcounts instead of deep-copying every entry's
+/// `String`s. Mutation goes through `Arc::make_mut` (clone-on-write of the
+/// single entry being updated). The session-file format is unchanged —
+/// `SessionFile::entries` stays `Vec<TranscriptEntry>`, converted at the
+/// save/load boundary.
+pub type TranscriptEntries = Vec<Arc<TranscriptEntry>>;
+
+/// `entries.push_entry(TranscriptEntry::…)` — keeps the many transcript push
+/// sites free of `Arc::new` noise.
+pub trait PushEntry {
+    fn push_entry(&mut self, entry: TranscriptEntry);
+}
+
+impl PushEntry for TranscriptEntries {
+    fn push_entry(&mut self, entry: TranscriptEntry) {
+        self.push(Arc::new(entry));
+    }
+}
+
 /// Finds the most recently appended `ToolCall` entry with matching `id`, for
 /// in-place updates as further `StreamEvent`s for the same call arrive.
+/// Locates the entry immutably first so `Arc::make_mut`'s clone-on-write hits
+/// only the one entry being updated, never the entries scanned past.
 pub fn find_tool_call_mut<'a>(
-    entries: &'a mut [TranscriptEntry],
+    entries: &'a mut [Arc<TranscriptEntry>],
     id: &str,
 ) -> Option<&'a mut ToolCallEntry> {
-    entries.iter_mut().rev().find_map(|e| match e {
-        TranscriptEntry::ToolCall(call) if call.id == id => Some(call),
+    let idx = entries
+        .iter()
+        .rposition(|e| matches!(&**e, TranscriptEntry::ToolCall(call) if call.id == id))?;
+    match Arc::make_mut(&mut entries[idx]) {
+        TranscriptEntry::ToolCall(call) => Some(call),
         _ => None,
-    })
+    }
 }
 
 /// Toggles `expanded` on the most recently appended `ToolCall` entry, if any.
 /// Used by the Transcript component's Tab key handler.
-pub fn toggle_last_tool_call_expanded(entries: &mut [TranscriptEntry]) {
-    if let Some(TranscriptEntry::ToolCall(call)) = entries
-        .iter_mut()
-        .rev()
-        .find(|e| matches!(e, TranscriptEntry::ToolCall(_)))
+pub fn toggle_last_tool_call_expanded(entries: &mut [Arc<TranscriptEntry>]) {
+    let last_call = entries
+        .iter()
+        .rposition(|e| matches!(&**e, TranscriptEntry::ToolCall(_)));
+    if let Some(idx) = last_call
+        && let TranscriptEntry::ToolCall(call) = Arc::make_mut(&mut entries[idx])
     {
         call.expanded = !call.expanded;
     }
@@ -98,14 +123,14 @@ pub fn toggle_last_tool_call_expanded(entries: &mut [TranscriptEntry]) {
 mod tests {
     use super::*;
 
-    fn sample_call(id: &str) -> TranscriptEntry {
-        TranscriptEntry::ToolCall(ToolCallEntry {
+    fn sample_call(id: &str) -> Arc<TranscriptEntry> {
+        Arc::new(TranscriptEntry::ToolCall(ToolCallEntry {
             id: id.to_string(),
             name: "bash".into(),
             arguments_json: String::new(),
             result: None,
             expanded: true,
-        })
+        }))
     }
 
     #[test]
@@ -113,7 +138,7 @@ mod tests {
         let mut entries = vec![sample_call("a"), sample_call("b")];
         let found = find_tool_call_mut(&mut entries, "b").expect("should find call b");
         found.arguments_json = "{}".into();
-        let TranscriptEntry::ToolCall(call) = &entries[1] else {
+        let TranscriptEntry::ToolCall(call) = &*entries[1] else {
             panic!("expected ToolCall")
         };
         assert_eq!(call.id, "b"); // unchanged id/name
@@ -127,14 +152,63 @@ mod tests {
         assert!(find_tool_call_mut(&mut entries, "missing").is_none());
     }
 
+    /// The load-bearing Arc invariant: while streaming, a previous render
+    /// holds clones of every entry (refcount ≥ 2), so a mutation must
+    /// clone-on-write — landing in the live Vec while leaving the snapshot
+    /// the in-flight frame rendered untouched.
+    #[test]
+    fn find_tool_call_mut_under_a_shared_arc_writes_the_vec_not_the_snapshot() {
+        let mut entries = vec![sample_call("a"), sample_call("b")];
+        let snapshot = entries.clone(); // what a prior render would hold
+
+        find_tool_call_mut(&mut entries, "b")
+            .expect("call b exists")
+            .arguments_json = "{\"x\":1}".into();
+
+        let TranscriptEntry::ToolCall(live) = &*entries[1] else {
+            panic!()
+        };
+        let TranscriptEntry::ToolCall(snap) = &*snapshot[1] else {
+            panic!()
+        };
+        assert_eq!(
+            live.arguments_json, "{\"x\":1}",
+            "mutation lands in the vec"
+        );
+        assert_eq!(snap.arguments_json, "", "the shared snapshot is untouched");
+        assert!(
+            !Arc::ptr_eq(&entries[1], &snapshot[1]),
+            "the mutated entry was cloned-on-write"
+        );
+        assert!(
+            Arc::ptr_eq(&entries[0], &snapshot[0]),
+            "unmutated siblings still share their allocation"
+        );
+    }
+
+    #[test]
+    fn toggle_under_a_shared_arc_writes_the_vec_not_the_snapshot() {
+        let mut entries = vec![sample_call("a")];
+        let snapshot = entries.clone();
+        toggle_last_tool_call_expanded(&mut entries);
+        let TranscriptEntry::ToolCall(live) = &*entries[0] else {
+            panic!()
+        };
+        let TranscriptEntry::ToolCall(snap) = &*snapshot[0] else {
+            panic!()
+        };
+        assert!(!live.expanded);
+        assert!(snap.expanded, "snapshot keeps the pre-toggle state");
+    }
+
     #[test]
     fn toggle_last_tool_call_expanded_flips_only_the_most_recent_call() {
         let mut entries = vec![sample_call("a"), sample_call("b")];
         toggle_last_tool_call_expanded(&mut entries);
-        let TranscriptEntry::ToolCall(a) = &entries[0] else {
+        let TranscriptEntry::ToolCall(a) = &*entries[0] else {
             panic!()
         };
-        let TranscriptEntry::ToolCall(b) = &entries[1] else {
+        let TranscriptEntry::ToolCall(b) = &*entries[1] else {
             panic!()
         };
         assert!(a.expanded, "earlier call untouched");
@@ -143,7 +217,7 @@ mod tests {
 
     #[test]
     fn toggle_last_tool_call_expanded_is_a_no_op_when_no_tool_calls_exist() {
-        let mut entries = vec![TranscriptEntry::UserTurn { text: "hi".into() }];
+        let mut entries = vec![Arc::new(TranscriptEntry::UserTurn { text: "hi".into() })];
         toggle_last_tool_call_expanded(&mut entries); // must not panic
         assert_eq!(entries.len(), 1);
     }

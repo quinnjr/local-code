@@ -1,5 +1,3 @@
-// src/skills/client.rs
-
 use crate::skills::bitbucket::BitbucketClient;
 use crate::skills::github::GithubClient;
 use crate::skills::gitlab::GitlabClient;
@@ -21,6 +19,53 @@ pub enum SkillClient {
     GitHub(GithubClient),
     GitLab(GitlabClient),
     Bitbucket(BitbucketClient),
+}
+
+/// Escapes `/` in a git ref for use inside a URL path segment. Shared by all
+/// three host clients (each previously hand-copied a byte-identical version).
+pub(crate) fn urlencoding_ref(git_ref: &str) -> String {
+    git_ref.replace('/', "%2F")
+}
+
+/// Shared "send, check status, decode JSON" scaffolding for the three host
+/// clients: any non-2xx becomes `SkillHostError::Api` with the body preserved
+/// for diagnostics. Each client supplies its own authenticated
+/// `RequestBuilder` (auth headers are the only genuinely host-specific part
+/// of the HTTP layer). Extracted after review caught the three hand-copied
+/// versions drifting in their error mapping.
+pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    url: &str,
+) -> Result<T, SkillHostError> {
+    let response = request.send().await.map_err(SkillHostError::Request)?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = sanitize_body(response.text().await.unwrap_or_default());
+        return Err(SkillHostError::Api {
+            status: status.as_u16(),
+            url: url.to_string(),
+            body,
+        });
+    }
+    response.json::<T>().await.map_err(SkillHostError::Request)
+}
+
+/// Strips control bytes (keeping `\n`/`\t`) from an untrusted HTTP response
+/// body before it is embedded in a user-facing error: `SkillHostError::Api`'s
+/// Display prints the body to the terminal, and a malicious or MITM'd host
+/// could otherwise smuggle ANSI escape sequences into that output (cursor
+/// moves, line rewrites, fake banners).
+pub(crate) fn sanitize_body(body: String) -> String {
+    if body
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        body.chars()
+            .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+            .collect()
+    } else {
+        body
+    }
 }
 
 impl SkillClient {

@@ -1,5 +1,3 @@
-// src/memory/paths.rs
-
 use chrono::NaiveDate;
 use std::path::{Path, PathBuf};
 

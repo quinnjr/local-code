@@ -89,6 +89,12 @@ pub enum ConnectionsError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Loads and merges connections.toml from `user_config_dir` and `project_config_dir`.
@@ -131,7 +137,7 @@ fn load_one(path: &Path) -> Result<ConnectionsFile, ConnectionsError> {
 /// since that's the file this CLI writes to (user-level file is hand-edited or
 /// written by `connections add` when the user chooses to save it there).
 pub fn save_connections(dir: &Path, connections: &[Connection]) -> Result<(), ConnectionsError> {
-    fs::create_dir_all(dir).map_err(|source| ConnectionsError::Read {
+    fs::create_dir_all(dir).map_err(|source| ConnectionsError::Write {
         path: dir.to_path_buf(),
         source,
     })?;
@@ -139,7 +145,7 @@ pub fn save_connections(dir: &Path, connections: &[Connection]) -> Result<(), Co
         connections: connections.to_vec(),
     };
     let text = toml::to_string_pretty(&file).expect("Connection serializes without error");
-    fs::write(dir.join("connections.toml"), text).map_err(|source| ConnectionsError::Read {
+    fs::write(dir.join("connections.toml"), text).map_err(|source| ConnectionsError::Write {
         path: dir.to_path_buf(),
         source,
     })
@@ -225,6 +231,20 @@ default_model = "m2"
         let project_dir = tempdir().unwrap();
         let connections = load_connections(user_dir.path(), project_dir.path()).unwrap();
         assert!(connections.is_empty());
+    }
+
+    #[test]
+    fn save_connections_reports_a_write_error_when_the_target_is_unwritable() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the config DIRECTORY should be: create_dir_all fails.
+        let blocking_file = dir.path().join("not-a-dir");
+        std::fs::write(&blocking_file, "x").unwrap();
+        let target = blocking_file.join("nested");
+        let err = save_connections(&target, &[]).unwrap_err();
+        assert!(
+            matches!(err, ConnectionsError::Write { .. }),
+            "a save failure must be labeled Write, not Read: {err}"
+        );
     }
 
     #[test]

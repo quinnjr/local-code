@@ -1,5 +1,3 @@
-// src/tui/permission_prompter.rs
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};

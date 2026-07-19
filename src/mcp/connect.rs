@@ -1,5 +1,3 @@
-// src/mcp/connect.rs
-
 use daimon::mcp::{HttpTransport, McpClient, SseTransport, StdioTransport, WebSocketTransport};
 
 use crate::config::mcp_servers::{McpServerConfig, McpTransportConfig};
@@ -13,15 +11,45 @@ pub enum McpConnectError {
         #[source]
         source: daimon::DaimonError,
     },
+    #[error("mcp server '{server}' did not finish connecting within {seconds}s; skipping it")]
+    Timeout { server: String, seconds: u64 },
 }
+
+/// Upper bound on one server's spawn + handshake + `tools/list`. Without it a
+/// stdio server that starts but never speaks the protocol blocks forever —
+/// daimon's `StdioTransport` reads have no timeout of their own, and
+/// `connect_all` runs *before* the first TUI frame renders, so one hung
+/// server previously meant the UI never drew at all. HTTP/SSE/WS transports
+/// self-bound at 30s inside daimon; this tighter budget also caps their
+/// contribution to startup latency.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Connects to a single configured MCP server, performs the MCP handshake, and
 /// discovers its tools, wrapping each as a [`NamespacedMcpTool`] under
 /// `{config.name}__{tool_name}`. Returns [`McpConnectError`] (never panics) if
-/// the transport can't be established or the handshake fails — callers (see
-/// [`connect_all`]) are expected to treat this as "skip this one server," not a
-/// fatal condition.
+/// the transport can't be established, the handshake fails, or the whole
+/// attempt exceeds [`CONNECT_TIMEOUT`] — callers (see [`connect_all`]) are
+/// expected to treat this as "skip this one server," not a fatal condition.
 pub async fn connect_one(
+    config: &McpServerConfig,
+) -> Result<Vec<NamespacedMcpTool>, McpConnectError> {
+    connect_one_with_timeout(config, CONNECT_TIMEOUT).await
+}
+
+async fn connect_one_with_timeout(
+    config: &McpServerConfig,
+    timeout: std::time::Duration,
+) -> Result<Vec<NamespacedMcpTool>, McpConnectError> {
+    match tokio::time::timeout(timeout, connect_one_inner(config)).await {
+        Ok(result) => result,
+        Err(_) => Err(McpConnectError::Timeout {
+            server: config.name.clone(),
+            seconds: timeout.as_secs(),
+        }),
+    }
+}
+
+async fn connect_one_inner(
     config: &McpServerConfig,
 ) -> Result<Vec<NamespacedMcpTool>, McpConnectError> {
     let client = match &config.transport {
@@ -204,7 +232,8 @@ mod tests {
             .errors
             .iter()
             .map(|e| match e {
-                McpConnectError::Connect { server, .. } => server.as_str(),
+                McpConnectError::Connect { server, .. }
+                | McpConnectError::Timeout { server, .. } => server.as_str(),
             })
             .collect();
         assert!(failed_names.contains(&"broken-a"));
@@ -216,5 +245,24 @@ mod tests {
         let report = connect_all(&[]).await;
         assert!(report.tools.is_empty());
         assert!(report.errors.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_server_that_never_speaks_mcp_times_out_instead_of_hanging() {
+        // `sleep` starts fine but never answers the MCP handshake — exactly
+        // the shape that used to block `connect_all` (and thus TUI startup)
+        // forever.
+        let config = McpServerConfig {
+            name: "hung".into(),
+            transport: McpTransportConfig::Stdio {
+                command: "sleep".into(),
+                args: vec!["30".into()],
+            },
+        };
+        let result = connect_one_with_timeout(&config, std::time::Duration::from_millis(200)).await;
+        assert!(
+            matches!(result, Err(McpConnectError::Timeout { server, seconds: 0 }) if server == "hung")
+        );
     }
 }

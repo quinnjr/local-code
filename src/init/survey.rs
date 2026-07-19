@@ -1,5 +1,3 @@
-// src/init/survey.rs
-
 use std::path::Path;
 
 use ignore::WalkBuilder;

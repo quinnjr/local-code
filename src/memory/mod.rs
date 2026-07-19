@@ -1,5 +1,3 @@
-// src/memory/mod.rs
-
 pub mod buffer;
 pub mod core;
 pub mod paths;

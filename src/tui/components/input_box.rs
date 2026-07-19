@@ -1,5 +1,3 @@
-// src/tui/components/input_box.rs
-
 use ntui::props::FlexDirection;
 use ntui::style::{BorderStyle, Color};
 use ntui::{component, element};

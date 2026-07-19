@@ -1,47 +1,97 @@
-// src/tui/components/transcript.rs
-
 use ntui::props::{FlexDirection, Overflow};
 use ntui::style::{BorderStyle, Color};
 use ntui::{Element, KeyCode, component, element};
 
+use std::sync::Arc;
+
 use crate::permissions::types::PermissionRequest;
 use crate::tui::components::permission_card::render_permission_card;
-use crate::tui::state::TranscriptEntry;
+use crate::tui::state::{TranscriptEntries, TranscriptEntry};
 
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, Default)]
 pub struct TranscriptProps {
-    pub entries: Vec<TranscriptEntry>,
+    pub entries: TranscriptEntries,
     pub pending_permission: Option<PermissionRequest>,
+    /// The in-flight streamed assistant text for the current turn, rendered
+    /// as a trailing pseudo-entry. Kept out of `entries` so every `TextDelta`
+    /// re-render clones one small growing `String` instead of the whole
+    /// transcript (see `run_turn`'s stream loop) — the entry is folded into
+    /// `entries` once the streamed block completes.
+    pub streaming_text: String,
+    /// Whether this transcript's pane has keyboard focus. The workspace
+    /// mounts one `Transcript` per pane (including hidden windows) and ntui
+    /// dispatches each key to every handler in the tree, deepest-first, until
+    /// one stops propagation — so an unfocused transcript must not consume
+    /// scroll keys, or it steals them from the focused pane AND from
+    /// `Workspace`'s `C-b <arrow>` chords (leaving the prefix wedged armed).
+    pub focused: bool,
+    /// Mirror of the workspace's "a `C-b` chord is armed" flag (same handle
+    /// `App` checks in `session_may_handle_input`): while armed, even the
+    /// focused transcript lets arrow keys bubble up so `C-b <Up>/<Down>`
+    /// reach `Workspace` instead of scrolling.
+    pub input_gate: Option<ntui::State<bool>>,
+}
+
+impl PartialEq for TranscriptProps {
+    /// `input_gate` is excluded: handlers read it through the shared
+    /// `ntui::State` at event time, so a gate flip needs no re-render here
+    /// (mirrors `AppProps`'s treatment of the same handle). Field order
+    /// matters: while streaming, `streaming_text` differs on every token, so
+    /// comparing it FIRST short-circuits before the O(n) deep walk of
+    /// `entries` that would otherwise run per token for an always-false
+    /// answer.
+    fn eq(&self, other: &Self) -> bool {
+        self.streaming_text == other.streaming_text
+            && self.focused == other.focused
+            && self.pending_permission == other.pending_permission
+            && entries_eq(&self.entries, &other.entries)
+    }
+}
+
+/// Entry-list equality with an `Arc::ptr_eq` fast path: after the Arc
+/// migration, an unchanged transcript compares as n pointer checks instead of
+/// n deep `String` comparisons (only a genuinely-replaced entry falls back to
+/// a value compare).
+fn entries_eq(a: &[Arc<TranscriptEntry>], b: &[Arc<TranscriptEntry>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y) || x == y)
 }
 
 /// The scrollable, full-width transcript pane. Owns its own `Scroll` handle
 /// (created via `hooks.use_scroll()`) and a `use_input` that only intercepts
-/// Up/Down/PageUp/PageDown, calling `stop_propagation()` for those so they
-/// don't also reach `App`'s own handler, while every other key (typed
+/// Up/Down/PageUp/PageDown — and only while its pane is focused and no
+/// workspace prefix chord is armed — calling `stop_propagation()` for those
+/// so they don't also reach other handlers, while every other key (typed
 /// characters, Enter, digits for permission choices) bubbles up untouched.
 #[component]
 pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
     let scroll = hooks.use_scroll();
     hooks.use_input({
         let scroll = scroll.clone();
-        move |ev, ctx| match ev.code {
-            KeyCode::Up => {
-                scroll.scroll_by(-1);
-                ctx.stop_propagation();
+        let focused = props.focused;
+        let input_gate = props.input_gate.clone();
+        move |ev, ctx| {
+            if !focused || input_gate.as_ref().is_some_and(|gate| gate.get()) {
+                return;
             }
-            KeyCode::Down => {
-                scroll.scroll_by(1);
-                ctx.stop_propagation();
+            match ev.code {
+                KeyCode::Up => {
+                    scroll.scroll_by(-1);
+                    ctx.stop_propagation();
+                }
+                KeyCode::Down => {
+                    scroll.scroll_by(1);
+                    ctx.stop_propagation();
+                }
+                KeyCode::PageUp => {
+                    scroll.scroll_by(-10);
+                    ctx.stop_propagation();
+                }
+                KeyCode::PageDown => {
+                    scroll.scroll_by(10);
+                    ctx.stop_propagation();
+                }
+                _ => {}
             }
-            KeyCode::PageUp => {
-                scroll.scroll_by(-10);
-                ctx.stop_propagation();
-            }
-            KeyCode::PageDown => {
-                scroll.scroll_by(10);
-                ctx.stop_propagation();
-            }
-            _ => {}
         }
     });
 
@@ -67,6 +117,15 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
         })
         .collect();
 
+    if !props.streaming_text.is_empty() {
+        children.push(
+            render_entry(&TranscriptEntry::AssistantText {
+                text: props.streaming_text.clone(),
+            })
+            .with_key("streaming-tail"),
+        );
+    }
+
     if let Some(request) = &props.pending_permission {
         children.push(render_permission_card(request).with_key("pending-permission"));
     }
@@ -89,17 +148,25 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
 /// `children` construction above for why). `Default` is only ever exercised
 /// to satisfy `Component::Props`'s bound (this component is always mounted
 /// with a real entry via `element!`/`Element::component`, never defaulted).
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct EntryProps {
-    entry: TranscriptEntry,
+    entry: Arc<TranscriptEntry>,
+}
+
+impl PartialEq for EntryProps {
+    /// `Arc::ptr_eq` fast path first: while streaming, every entry except the
+    /// last is the same allocation render-to-render.
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.entry, &other.entry) || self.entry == other.entry
+    }
 }
 
 impl Default for EntryProps {
     fn default() -> Self {
         EntryProps {
-            entry: TranscriptEntry::SystemNotice {
+            entry: Arc::new(TranscriptEntry::SystemNotice {
                 text: String::new(),
-            },
+            }),
         }
     }
 }
@@ -207,12 +274,12 @@ mod tests {
     use crate::tui::state::{ToolCallEntry, ToolCallResult};
     use ntui::testing::TestTerminal;
 
-    fn entries_fixture() -> Vec<TranscriptEntry> {
+    fn entries_fixture() -> TranscriptEntries {
         vec![
-            TranscriptEntry::UserTurn {
+            Arc::new(TranscriptEntry::UserTurn {
                 text: "fix the bug".into(),
-            },
-            TranscriptEntry::ToolCall(ToolCallEntry {
+            }),
+            Arc::new(TranscriptEntry::ToolCall(ToolCallEntry {
                 id: "1".into(),
                 name: "edit_file".into(),
                 arguments_json: r#"{"path":"x.rs"}"#.into(),
@@ -221,10 +288,10 @@ mod tests {
                     is_error: false,
                 }),
                 expanded: true,
-            }),
-            TranscriptEntry::AssistantText {
+            })),
+            Arc::new(TranscriptEntry::AssistantText {
                 text: "Done, fixed it.".into(),
-            },
+            }),
         ]
     }
 
@@ -232,7 +299,7 @@ mod tests {
     async fn renders_user_turn_tool_card_and_assistant_text() {
         let props = TranscriptProps {
             entries: entries_fixture(),
-            pending_permission: None,
+            ..Default::default()
         };
         let t = TestTerminal::new(60, 20, Element::component::<Transcript>(props)).unwrap();
         let text = t.frame_text();
@@ -245,12 +312,12 @@ mod tests {
     #[tokio::test]
     async fn collapsed_tool_card_hides_its_body() {
         let mut entries = entries_fixture();
-        if let TranscriptEntry::ToolCall(call) = &mut entries[1] {
+        if let TranscriptEntry::ToolCall(call) = Arc::make_mut(&mut entries[1]) {
             call.expanded = false;
         }
         let props = TranscriptProps {
             entries,
-            pending_permission: None,
+            ..Default::default()
         };
         let t = TestTerminal::new(60, 20, Element::component::<Transcript>(props)).unwrap();
         assert!(!t.frame_text().contains("edited x.rs"));
@@ -260,11 +327,13 @@ mod tests {
     async fn renders_pending_permission_card_when_present() {
         let props = TranscriptProps {
             entries: vec![],
+            focused: true,
             pending_permission: Some(PermissionRequest {
                 tool_name: "bash".into(),
                 description: "run shell command: rm x".into(),
                 command_preview: Some("rm x".into()),
             }),
+            ..Default::default()
         };
         let t = TestTerminal::new(60, 10, Element::component::<Transcript>(props)).unwrap();
         assert!(
@@ -277,7 +346,8 @@ mod tests {
     async fn up_key_scrolls_without_panicking() {
         let props = TranscriptProps {
             entries: entries_fixture(),
-            pending_permission: None,
+            focused: true,
+            ..Default::default()
         };
         let mut t = TestTerminal::new(60, 3, Element::component::<Transcript>(props)).unwrap();
         t.send_key(ntui::KeyCode::Up).unwrap(); // must not panic even with no scroll headroom

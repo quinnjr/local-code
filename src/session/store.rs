@@ -1,9 +1,8 @@
-// src/session/store.rs
-
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::session::paths::session_dir_for_project;
+use crate::permissions::types::PermissionTier;
+use crate::session::paths::{new_session_path, session_dir_for_project};
 use crate::session::types::{SESSION_FILE_VERSION, SessionFile, SessionSummary};
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +52,32 @@ pub fn save_session(path: &Path, session: &SessionFile) -> Result<(), SessionErr
     })
 }
 
+/// Allocates a fresh session file on disk and returns `(path, created_at)`.
+/// The single shared "birth a session" recipe — used by `run_tui` for the
+/// startup session and by `Workspace` for every new tab/pane, so the two can
+/// never drift field-for-field (they previously open-coded identical
+/// `new_session_path` → `SessionFile::new` → `save_session` sequences).
+pub fn create_fresh_session(
+    user_state_dir: &Path,
+    project_root: &Path,
+    connection_name: &str,
+    model_name: &str,
+    tier: PermissionTier,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(PathBuf, String), SessionError> {
+    let path = new_session_path(user_state_dir, project_root, now);
+    let created_at = now.to_rfc3339();
+    let session = SessionFile::new(
+        project_root.to_path_buf(),
+        connection_name.to_string(),
+        model_name.to_string(),
+        tier,
+        created_at.clone(),
+    );
+    save_session(&path, &session)?;
+    Ok((path, created_at))
+}
+
 /// Loads and validates one session file.
 pub fn load_session(path: &Path) -> Result<SessionFile, SessionError> {
     let text = fs::read_to_string(path).map_err(|source| SessionError::Read {
@@ -100,6 +125,15 @@ pub fn list_sessions(
         let Ok(session) = load_session(&path) else {
             continue;
         };
+        // Sessions with no transcript at all are skipped: every launch and
+        // every new workspace tab/pane eagerly writes an (empty) session
+        // file, so without this filter a user who opens a few tabs and types
+        // in one would see the resume list fill up with permanently empty,
+        // previewless entries. The file itself is kept — it gains entries
+        // (and appears here) after its first turn.
+        if session.entries.is_empty() {
+            continue;
+        }
         let preview = session.entries.iter().find_map(|e| match e {
             crate::tui::state::TranscriptEntry::UserTurn { text } => {
                 Some(text.chars().take(60).collect::<String>())
@@ -133,6 +167,12 @@ mod tests {
             updated_at.into(),
         );
         s.updated_at = updated_at.into();
+        // A non-empty transcript so `list_sessions` (which skips
+        // never-used sessions) includes it.
+        s.entries
+            .push(crate::tui::state::TranscriptEntry::UserTurn {
+                text: "hello".into(),
+            });
         s
     }
 
@@ -193,6 +233,48 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_skips_sessions_with_no_entries() {
+        let user_state_dir = tempdir().unwrap();
+        let project_root = Path::new("/proj");
+        let dir = session_dir_for_project(user_state_dir.path(), project_root);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut empty = sample("untouched-tab", "2026-07-06T00:00:00Z");
+        empty.entries.clear();
+        save_session(&dir.join("empty.json"), &empty).unwrap();
+        save_session(
+            &dir.join("used.json"),
+            &sample("used", "2026-07-05T00:00:00Z"),
+        )
+        .unwrap();
+
+        let sessions = list_sessions(user_state_dir.path(), project_root).unwrap();
+        assert_eq!(sessions.len(), 1, "the never-used session is hidden");
+        assert_eq!(sessions[0].connection_name, "used");
+    }
+
+    #[test]
+    fn create_fresh_session_writes_the_file_and_returns_its_path() {
+        let user_state_dir = tempdir().unwrap();
+        let project_root = Path::new("/proj");
+        let now = chrono::Utc::now();
+        let (path, created_at) = create_fresh_session(
+            user_state_dir.path(),
+            project_root,
+            "conn",
+            "model",
+            PermissionTier::Ask,
+            now,
+        )
+        .unwrap();
+        assert_eq!(created_at, now.to_rfc3339());
+        let loaded = load_session(&path).unwrap();
+        assert_eq!(loaded.connection_name, "conn");
+        assert_eq!(loaded.model_name, "model");
+        assert!(loaded.entries.is_empty());
+    }
+
+    #[test]
     fn list_sessions_extracts_first_user_turn_preview() {
         let user_state_dir = tempdir().unwrap();
         let project_root = Path::new("/proj");
@@ -200,6 +282,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
 
         let mut session = sample("conn", "2026-07-06T00:00:00Z");
+        session.entries.clear();
         session
             .entries
             .push(crate::tui::state::TranscriptEntry::UserTurn {

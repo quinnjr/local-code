@@ -1,5 +1,3 @@
-// src/agent/build.rs
-
 use std::sync::Arc;
 
 use daimon::agent::{Agent, AgentBuilder};

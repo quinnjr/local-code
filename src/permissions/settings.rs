@@ -1,5 +1,3 @@
-// src/permissions/settings.rs
-
 use std::fs;
 use std::path::Path;
 

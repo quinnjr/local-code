@@ -1,7 +1,6 @@
-// src/skills/bitbucket.rs
-
 use std::path::PathBuf;
 
+use crate::skills::client::urlencoding_ref;
 use crate::skills::types::{FetchedFile, SkillHostError};
 
 /// A minimal Bitbucket Cloud REST (2.0) API client. `api_base` defaults to
@@ -94,17 +93,7 @@ impl BitbucketClient {
         &self,
         url: &str,
     ) -> Result<T, SkillHostError> {
-        let response = self.request(url).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(SkillHostError::Api {
-                status: status.as_u16(),
-                url: url.to_string(),
-                body,
-            });
-        }
-        response.json::<T>().await.map_err(SkillHostError::Request)
+        crate::skills::client::get_json(self.request(url), url).await
     }
 
     pub async fn resolve_default_branch(
@@ -194,7 +183,9 @@ impl BitbucketClient {
                     let response = self.request(&entry.links.self_link.href).send().await?;
                     let status = response.status();
                     if !status.is_success() {
-                        let body = response.text().await.unwrap_or_default();
+                        let body = crate::skills::client::sanitize_body(
+                            response.text().await.unwrap_or_default(),
+                        );
                         return Err(SkillHostError::Api {
                             status: status.as_u16(),
                             url: entry.links.self_link.href.clone(),
@@ -224,10 +215,6 @@ impl BitbucketClient {
             Ok(())
         })
     }
-}
-
-fn urlencoding_ref(revision: &str) -> String {
-    revision.replace('/', "%2F")
 }
 
 #[cfg(test)]

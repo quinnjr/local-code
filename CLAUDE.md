@@ -72,6 +72,12 @@ cargo test --test live_ollama -- --ignored --nocapture
   - `mcp_wizard.rs` is a pure state machine for the `/mcp add` in-TUI stepper (transport selection,
     prompts, `Advance` enum) — kept side-effect-free and unit-testable separately from `app.rs`'s
     wiring of it.
+  - `workspace/` — tmux-style tabbing: `Workspace` (the actual root component `run_tui` mounts;
+    `App` is mounted once per pane under it) keeps every window's sessions mounted at all times
+    (inactive windows collapse to a zero-height clipped `View` — never unmount, or their live
+    state/streams would be lost), `workspace/state.rs` is the pure `C-b`-prefix state machine
+    (same pattern as `mcp_wizard.rs`), `workspace/tab_bar.rs` the status line. Panes are a flat
+    list per window (single split axis) because ntui keys are sibling-scoped — see TODO.md.
 - `agent/` — wraps `daimon::agent::{Agent, AgentBuilder}` for this project's needs.
   - `build.rs::register_all_tools` is the **one and only tool-registration function** in the
     project — every built-in tool and every MCP-discovered tool passes through it, each wrapped in
@@ -124,7 +130,7 @@ cargo test --test live_ollama -- --ignored --nocapture
   - `discovery.rs`/`frontmatter.rs`/`agent/skill_tool.rs` operate purely on already-downloaded
     local files and know nothing about hosts — everything upstream of "skill is on disk" is
     host-agnostic by design.
-- `memory/` — flat-file, cross-session memory (`memory search`/`memory core`/`memory add`):
+- `memory/` — flat-file, cross-session memory (`memory search`/`memory core`/`memory core add`/`memory add`):
   `buffer.rs` (short-term), `rollup.rs` (daily/recent/archive rollup), `search.rs` (keyword search
   across all of it).
 - `session/` — session persistence (`store.rs` load/save, `types.rs::SessionFile`); every TUI turn
@@ -133,7 +139,7 @@ cargo test --test live_ollama -- --ignored --nocapture
   and user-level `AGENTS.md`/`CLAUDE.md` (in that order) into the system prompt. Both the TUI
   (`tui::run_tui`) and headless mode (`agent::headless::run_headless`) load this context.
 - `init/` — the `/init` slash command's survey + generation logic for producing a project
-  `CLAUDE.md`.
+  `AGENTS.md`.
 
 ### Cross-cutting conventions
 

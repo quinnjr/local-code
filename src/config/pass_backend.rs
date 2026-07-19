@@ -1,5 +1,3 @@
-// src/config/pass_backend.rs
-
 //! A `pass` (password-store) backed credential store for the `keyring`
 //! crate, installed by `config::secrets` as the process-wide fallback when
 //! no Secret Service daemon is reachable (headless boxes, minimal WMs).

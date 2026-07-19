@@ -1,5 +1,3 @@
-// src/tui/app.rs
-
 use std::sync::Arc;
 
 use daimon::agent::Agent;
@@ -17,11 +15,12 @@ use crate::tui::components::{
 };
 use crate::tui::permission_prompter::NtuiPermissionPrompter;
 use crate::tui::state::{
-    ToolCallEntry, ToolCallResult, TranscriptEntry, UsageSummary, find_tool_call_mut,
-    toggle_last_tool_call_expanded,
+    PushEntry as _, ToolCallEntry, ToolCallResult, TranscriptEntries, TranscriptEntry,
+    UsageSummary, find_tool_call_mut, toggle_last_tool_call_expanded,
 };
 
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AppProps {
     /// Wrapped in `Option` only so `AppProps: Default` (required by
     /// `ntui::Component::Props`) is satisfiable — `daimon::model::SharedModel`
@@ -83,6 +82,32 @@ pub struct AppProps {
     /// full session-file read+parse on every turn just to recover this one
     /// already-known field (see `run_turn`'s `created_at` state).
     pub created_at: String,
+    /// Whether this session's pane has keyboard focus. `Workspace` mounts
+    /// many `App`s at once (tmux-style windows/panes); only the focused one
+    /// may react to input, so the `use_input` handler below early-returns
+    /// (without stopping propagation) when this is false. Note `App` is a
+    /// pane child of `Workspace`, which owns app lifecycle (Ctrl+C exit) —
+    /// a bare `App` mount is a test-only configuration.
+    pub focused: bool,
+    /// Set to `true` by `Workspace` while a `C-b` prefix chord is armed —
+    /// the next key is a workspace command, so even the focused session must
+    /// let it bubble up untouched. `None` (tests only) behaves as "never
+    /// armed".
+    pub input_gate: Option<ntui::State<bool>>,
+    /// This session's workspace id, used only as the key it reports its
+    /// streaming status under in `streaming_flags`. 0 in tests.
+    pub session_tag: u64,
+    /// Shared map of session id → "a turn is streaming", written by every
+    /// mounted session and read by the workspace tab bar so a background
+    /// window can show a busy indicator. `None` (tests only) disables
+    /// reporting.
+    pub streaming_flags: Option<ntui::State<std::collections::HashMap<u64, bool>>>,
+    /// Shared map of session id → "a permission prompt is waiting for a
+    /// decision", mirrored like `streaming_flags`. The tab bar renders this
+    /// as a distinct `!` marker: a background pane blocked on a permission
+    /// prompt would otherwise be indistinguishable from one that is making
+    /// progress (`✻`), leaving its turn silently stuck until focused.
+    pub permission_flags: Option<ntui::State<std::collections::HashMap<u64, bool>>>,
 }
 
 impl Default for AppProps {
@@ -105,19 +130,50 @@ impl Default for AppProps {
             project_config_dir: std::path::PathBuf::new(),
             project_root: std::path::PathBuf::new(),
             created_at: String::new(),
+            focused: true,
+            input_gate: None,
+            session_tag: 0,
+            streaming_flags: None,
+            permission_flags: None,
         }
     }
 }
 
 impl PartialEq for AppProps {
-    /// `App` is mounted exactly once, at the TUI's root (`run_tui` calls
-    /// `ntui::render(element!(App(...)))` a single time), so its props never
-    /// actually change between renders — this impl exists only to satisfy the
-    /// `Component::Props: PartialEq` bound, and always reports "unchanged" to
-    /// skip pointless prop-diffing work.
-    fn eq(&self, _other: &Self) -> bool {
-        true
+    /// Everything except `focused` is fixed for the lifetime of a mount
+    /// (`Workspace` builds a session's props once and never mutates them),
+    /// so only `focused` is compared: when the workspace moves focus, the
+    /// affected sessions must re-render so their `use_input` closures
+    /// recapture the new value. `input_gate` is deliberately not compared —
+    /// handlers read it through the shared `ntui::State` at event time, so a
+    /// gate flip needs no re-render here.
+    fn eq(&self, other: &Self) -> bool {
+        self.focused == other.focused
     }
+}
+
+/// Gate applied at the top of `App`'s `use_input` handler. A session may
+/// only react to a key when its pane is focused, no `C-b` prefix chord is
+/// armed (`input_gate`), and the key isn't the prefix itself — in all other
+/// cases the handler returns without consuming, letting the event bubble up
+/// to `Workspace`'s root handler (dispatch is deepest-first). The same
+/// predicate (minus the prefix-key clause) gates `Transcript`'s scroll
+/// handler via its own `focused`/`input_gate` props.
+fn session_may_handle_input(
+    focused: bool,
+    input_gate: &Option<ntui::State<bool>>,
+    ev: &ntui::KeyEvent,
+) -> bool {
+    if !focused {
+        return false;
+    }
+    if input_gate.as_ref().is_some_and(|gate| gate.get()) {
+        return false;
+    }
+    !(ev.code == KeyCode::Char('b')
+        && ev
+            .modifiers
+            .contains(ntui::hooks::input::KeyModifiers::CONTROL))
 }
 
 /// Maps a numeric key press to a validated 0-based index, bounded by `max`
@@ -182,7 +238,7 @@ enum PendingMenu {
     McpAddWizard(crate::tui::mcp_wizard::McpAddWizard),
     /// The wizard finished (`Advance::Finalize`) and its `connect_one` +
     /// save + agent-rebuild is running in a spawned task, bounded by its own
-    /// 30s timeout. `Esc` here frees the input loop immediately without
+    /// connect timeout. `Esc` here frees the input loop immediately without
     /// waiting for the timeout (the background task keeps running and posts
     /// its own notice when it finishes either way). All input is otherwise
     /// blocked (like `streaming`) until the task resolves and resets this to
@@ -197,12 +253,24 @@ enum PendingMenu {
 pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let transcript = hooks.use_state({
         let initial_entries = props.initial_entries.clone();
-        move || initial_entries
+        move || {
+            initial_entries
+                .into_iter()
+                .map(Arc::new)
+                .collect::<TranscriptEntries>()
+        }
     });
     let input_buffer = hooks.use_state(String::new);
     let turn_id = hooks.use_state(|| 0u64);
     let pending_turn_input = hooks.use_state(|| Option::<String>::None);
     let streaming = hooks.use_state(|| false);
+    // The current turn's in-flight streamed assistant text, kept OUT of
+    // `transcript` so each `TextDelta` re-render clones only this one growing
+    // `String` instead of the whole transcript Vec (streaming an N-byte reply
+    // through the transcript was O(N²) transient copying). `run_turn` folds
+    // it into `transcript` as a normal `AssistantText` entry whenever the
+    // streamed block completes (tool call, error, or end of turn).
+    let stream_text = hooks.use_state(String::new);
     let usage = hooks.use_state(UsageSummary::default);
     let tier = hooks.use_state(|| props.initial_tier);
     let session_path = hooks.use_state({
@@ -286,6 +354,12 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 skills,
                 pending_permission,
             )
+            // A `use_state` initializer has no error channel; mount-time
+            // construction uses the startup-validated tool set, so a failure
+            // here means the process couldn't have run a single turn anyway.
+            // The switch sites (`/model`, `/resume`, `/mcp add`) handle the
+            // `Err` gracefully instead.
+            .expect("initial agent construction failed")
         }
     });
     let (agent, gate, responder) = agent_and_responder.get();
@@ -300,16 +374,56 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         }
     });
 
+    // Mirror this session's streaming state into the workspace-shared map so
+    // the tab bar can mark busy background windows. Keyed on the value so it
+    // re-runs exactly on transitions.
+    hooks.use_effect(streaming.get(), {
+        let streaming_flags = props.streaming_flags.clone();
+        let session_tag = props.session_tag;
+        let is_streaming = streaming.get();
+        move || {
+            if let Some(flags) = streaming_flags {
+                flags.update(|map| {
+                    map.insert(session_tag, is_streaming);
+                });
+            }
+        }
+    });
+
+    // Same mirror for "blocked on a permission decision" — the tab bar shows
+    // this as `!` so a hidden pane waiting on input is never mistaken for one
+    // that is streaming (its prompt only accepts digits while focused, so
+    // without this the turn would sit stuck behind a generic busy marker).
+    hooks.use_effect(pending_permission.get().is_some(), {
+        let permission_flags = props.permission_flags.clone();
+        let session_tag = props.session_tag;
+        let is_waiting = pending_permission.get().is_some();
+        move || {
+            if let Some(flags) = permission_flags {
+                flags.update(|map| {
+                    map.insert(session_tag, is_waiting);
+                });
+            }
+        }
+    });
+
     hooks.use_effect(turn_id.get(), {
         let pending_turn_input = pending_turn_input.clone();
         let transcript = transcript.clone();
+        let stream_text = stream_text.clone();
         let usage = usage.clone();
         let streaming = streaming.clone();
         let agent = agent.clone();
         let session_path = session_path.clone();
         let created_at = created_at.clone();
-        let connection_name = props.connection_name.clone();
-        let model_name = props.model_name.clone();
+        // The *states*, not `props` snapshots: `/model` and in-TUI `/resume`
+        // update `connection_display`/`model_display` when they switch, and
+        // `run_turn` persists whatever they hold at save time — a props
+        // snapshot here made every post-switch turn write the launch
+        // connection/model into the session file, so resuming it later
+        // rebuilt against the wrong provider.
+        let connection_name = connection_display.clone();
+        let model_name = model_display.clone();
         let tier = tier.clone();
         let project_root = props.project_root.clone();
         move || {
@@ -320,6 +434,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 agent,
                 input,
                 transcript,
+                stream_text,
                 usage,
                 streaming,
                 pending_turn_input,
@@ -346,8 +461,6 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let tier = tier.clone();
         let session_path = session_path.clone();
         let created_at = created_at.clone();
-        let connection_name = props.connection_name.clone();
-        let model_name = props.model_name.clone();
         let user_state_dir = props.user_state_dir.clone();
         let user_config_dir = props.user_config_dir.clone();
         let project_config_dir = props.project_config_dir.clone();
@@ -362,7 +475,12 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let current_model = current_model.clone();
         let connection_display = connection_display.clone();
         let model_display = model_display.clone();
+        let focused = props.focused;
+        let input_gate = props.input_gate.clone();
         move |ev, _ctx| {
+            if !session_may_handle_input(focused, &input_gate, &ev) {
+                return;
+            }
             if pending_permission.get().is_some() {
                 let decision = digit_key_to_index(ev.code, 3).map(|idx| match idx {
                     0 => PermissionDecision::Allow,
@@ -375,7 +493,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     let allowed = !matches!(decision, PermissionDecision::Deny { .. });
                     if let Some(request) = pending_permission.get() {
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::PermissionResolved {
+                            entries.push_entry(TranscriptEntry::PermissionResolved {
                                 description: request.description.clone(),
                                 allowed,
                             });
@@ -418,7 +536,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         always_allow,
                                         always_deny,
                                     };
-                                    let rebuilt = crate::tui::rebuild::rebuild_agent_from_history(
+                                    let rebuilt = match crate::tui::rebuild::rebuild_agent_from_history(
                                         &agent_for_history,
                                         new_model,
                                         tier_value,
@@ -428,7 +546,20 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         skills,
                                         pending_permission_for_rebuild,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        Ok(rebuilt) => rebuilt,
+                                        Err(e) => {
+                                            // Keep the old agent live; a failed
+                                            // switch must not panic the TUI.
+                                            transcript_for_notice.update(|entries| {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                                    text: format!("failed to switch model: {e}"),
+                                                });
+                                            });
+                                            return;
+                                        }
+                                    };
                                     // Last-write-wins: if multiple `/model` selections somehow
                                     // overlap in flight, whichever `set` call completes last
                                     // wins regardless of submission order. Narrow window today
@@ -446,7 +577,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     connection_display.set(connection_name_for_display);
                                     model_display.set(model_name_for_display);
                                     transcript_for_notice.update(|entries| {
-                                        entries.push(TranscriptEntry::SystemNotice {
+                                        entries.push_entry(TranscriptEntry::SystemNotice {
                                             text: format!(
                                                 "switched to {} · {}",
                                                 connection.name, model_name
@@ -457,7 +588,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             }
                             Err(e) => {
                                 transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice {
+                                    entries.push_entry(TranscriptEntry::SystemNotice {
                                         text: format!("failed to switch model: {e}"),
                                     });
                                 });
@@ -476,7 +607,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         tier.set(new_tier);
                         pending_menu.set(PendingMenu::None);
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("permission tier set to {new_tier:?}"),
                             });
                         });
@@ -510,7 +641,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                     always_allow: always_allow_snapshot.clone(),
                                                     always_deny: always_deny_snapshot.clone(),
                                                 };
-                                                let rebuilt = crate::tui::rebuild::rebuild_agent(
+                                                let rebuilt = match crate::tui::rebuild::rebuild_agent(
                                                     new_model,
                                                     session.tier,
                                                     permission_settings,
@@ -519,7 +650,17 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                     mcp_tools_state.get(),
                                                     skills_snapshot.clone(),
                                                     pending_permission.clone(),
-                                                );
+                                                ) {
+                                                    Ok(rebuilt) => rebuilt,
+                                                    Err(e) => {
+                                                        transcript.update(|entries| {
+                                                            entries.push_entry(TranscriptEntry::SystemNotice {
+                                                                text: format!("failed to resume: could not rebuild agent: {e}"),
+                                                            });
+                                                        });
+                                                        return;
+                                                    }
+                                                };
                                                 agent_and_responder.set(rebuilt);
                                                 // Kept in lockstep with `agent_and_responder`, mirroring
                                                 // the `/model` fix for Bug 2 above — without this,
@@ -534,13 +675,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                 connection_display.set(connection.name.clone());
                                                 model_display.set(session.model_name.clone());
                                                 tier.set(session.tier);
-                                                transcript.set(session.entries.clone());
+                                                transcript.set(session.entries.iter().cloned().map(Arc::new).collect());
                                                 session_path.set(summary.path.clone());
                                                 created_at.set(session.created_at.clone());
                                             }
                                             Err(e) => {
                                                 transcript.update(|entries| {
-                                                    entries.push(TranscriptEntry::SystemNotice {
+                                                    entries.push_entry(TranscriptEntry::SystemNotice {
                                                         text: format!("failed to resume: could not build model: {e}"),
                                                     });
                                                 });
@@ -549,7 +690,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     }
                                     None => {
                                         transcript.update(|entries| {
-                                            entries.push(TranscriptEntry::SystemNotice {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
                                                 text: format!(
                                                     "failed to resume: connection '{}' no longer exists; run `local-code connections list`",
                                                     session.connection_name
@@ -561,7 +702,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             }
                             Err(e) => {
                                 transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice {
+                                    entries.push_entry(TranscriptEntry::SystemNotice {
                                         text: format!("failed to load session: {e}"),
                                     });
                                 });
@@ -575,7 +716,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         pending_menu.set(PendingMenu::None);
                         input_buffer.set(String::new());
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: "cancelled /mcp add.".to_string(),
                             });
                         });
@@ -598,13 +739,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             crate::tui::mcp_wizard::Advance::Continue(next_wizard, prompt) => {
                                 pending_menu.set(PendingMenu::McpAddWizard(next_wizard));
                                 transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice { text: prompt });
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text: prompt });
                                 });
                             }
                             crate::tui::mcp_wizard::Advance::Invalid(same_wizard, message) => {
                                 pending_menu.set(PendingMenu::McpAddWizard(same_wizard));
                                 transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice { text: message });
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text: message });
                                 });
                             }
                             crate::tui::mcp_wizard::Advance::Finalize(output) => {
@@ -615,7 +756,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 pending_menu.set(PendingMenu::McpAddConnecting);
                                 let server_name = config.name.clone();
                                 transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice {
+                                    entries.push_entry(TranscriptEntry::SystemNotice {
                                         text: format!("connecting to '{server_name}'…"),
                                     });
                                 });
@@ -648,7 +789,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         .is_ok_and(|names| names.contains(&secret.name))
                                     {
                                         transcript_for_task.update(|entries| {
-                                            entries.push(TranscriptEntry::SystemNotice {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
                                                 text: format!(
                                                     "overwriting existing keyring secret '{}'",
                                                     secret.name
@@ -664,7 +805,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         )
                                     {
                                         transcript_for_task.update(|entries| {
-                                            entries.push(TranscriptEntry::SystemNotice {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
                                                 text: format!(
                                                     "failed to store the bearer token in the OS keyring: {e}. Server '{}' was NOT saved.",
                                                     config.name
@@ -692,7 +833,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     );
                                     if let Err(e) = &saved {
                                         transcript_for_task.update(|entries| {
-                                            entries.push(TranscriptEntry::SystemNotice {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
                                                 text: format!(
                                                     "MCP server '{}' failed to save to mcp.toml: {e}",
                                                     config.name
@@ -706,14 +847,19 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     // wizard's config is raw user input, never passed
                                     // through interpolation the way a disk-loaded config is.
                                     let resolved_config = crate::config::mcp_servers::resolve_server_refs(config.clone());
-                                    let connect_result = tokio::time::timeout(
-                                        std::time::Duration::from_secs(30),
-                                        crate::mcp::connect::connect_one(&resolved_config),
-                                    )
-                                    .await;
+                                    // No outer timeout wrapper: `connect_one`
+                                    // self-bounds every transport (and the
+                                    // tools/list handshake) at its own
+                                    // CONNECT_TIMEOUT, surfacing elapsed time
+                                    // as `McpConnectError::Timeout` through
+                                    // the normal Err arm below. (An older 30s
+                                    // outer wrapper became dead code once the
+                                    // inner bound landed.)
+                                    let connect_result =
+                                        crate::mcp::connect::connect_one(&resolved_config).await;
 
                                     match connect_result {
-                                        Ok(Ok(new_tools)) => {
+                                        Ok(new_tools) => {
                                             let tool_count = new_tools.len();
                                             let mut tools = mcp_tools_state_for_task.get();
                                             // Drop any tools from a prior connection of a
@@ -742,42 +888,48 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                 pending_permission_for_task,
                                             )
                                             .await;
-                                            agent_and_responder_for_task.set(rebuilt);
-
-                                            transcript_for_task.update(|entries| {
-                                                entries.push(TranscriptEntry::SystemNotice {
-                                                    text: format!(
-                                                        "MCP server '{}' connected — {tool_count} tools added.",
-                                                        config.name
-                                                    ),
-                                                });
-                                            });
+                                            match rebuilt {
+                                                Ok(rebuilt) => {
+                                                    agent_and_responder_for_task.set(rebuilt);
+                                                    transcript_for_task.update(|entries| {
+                                                        entries.push_entry(TranscriptEntry::SystemNotice {
+                                                            text: format!(
+                                                                "MCP server '{}' connected — {tool_count} tools added.",
+                                                                config.name
+                                                            ),
+                                                        });
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    // The old agent stays live; the merged
+                                                    // tool list is already in
+                                                    // `mcp_tools_state`, so the next
+                                                    // successful rebuild picks it up.
+                                                    transcript_for_task.update(|entries| {
+                                                        entries.push_entry(TranscriptEntry::SystemNotice {
+                                                            text: format!(
+                                                                "MCP server '{}' connected, but the agent rebuild failed: {e}. \
+                                                                 Its tools will apply after the next successful /model or /resume.",
+                                                                config.name
+                                                            ),
+                                                        });
+                                                    });
+                                                }
+                                            }
                                         }
-                                        Ok(Err(e)) => {
+                                        Err(e) => {
                                             let retry_note = if saved {
                                                 "It will be retried on next launch.".to_string()
                                             } else {
                                                 "It was NOT saved, so it won't be retried — run /mcp add again.".to_string()
                                             };
+                                            // `e` covers both connect failures and
+                                            // `McpConnectError::Timeout` (whose Display names
+                                            // the actual bound), so no separate timeout arm.
                                             transcript_for_task.update(|entries| {
-                                                entries.push(TranscriptEntry::SystemNotice {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
                                                     text: format!(
                                                         "MCP server '{}' failed to connect now: {e}. {retry_note}",
-                                                        config.name
-                                                    ),
-                                                });
-                                            });
-                                        }
-                                        Err(_elapsed) => {
-                                            let retry_note = if saved {
-                                                "It will be retried on next launch.".to_string()
-                                            } else {
-                                                "It was NOT saved, so it won't be retried — run /mcp add again.".to_string()
-                                            };
-                                            transcript_for_task.update(|entries| {
-                                                entries.push(TranscriptEntry::SystemNotice {
-                                                    text: format!(
-                                                        "MCP server '{}' timed out while connecting (30s). {retry_note}",
                                                         config.name
                                                     ),
                                                 });
@@ -794,13 +946,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 PendingMenu::McpAddConnecting => {
                     if ev.code == KeyCode::Esc {
                         // The spawned connect+save+rebuild task keeps running in the
-                        // background (it's bounded by its own 30s timeout above and
+                        // background (it's bounded by connect_one's own timeout and
                         // always finishes by resetting pending_menu to None again) —
                         // this just frees up the input loop immediately instead of
                         // making the user wait out the full timeout.
                         pending_menu.set(PendingMenu::None);
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: "still connecting in the background — you can keep typing; \
                                        a notice will appear here when it finishes."
                                     .to_string(),
@@ -822,7 +974,8 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     tier.set(next);
                 }
                 KeyCode::Char('c') if ev.modifiers.contains(ntui::hooks::input::KeyModifiers::CONTROL) => {
-                    // Handled below via `hooks.use_app()`.
+                    // Exit is handled by `Workspace`'s root handler; this arm
+                    // only keeps the 'c' out of the input buffer.
                 }
                 KeyCode::Tab => {
                     transcript.update(|entries| toggle_last_tool_call_expanded(entries));
@@ -847,8 +1000,12 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             tier: tier.clone(),
                             session_path: session_path.clone(),
                             created_at: created_at.clone(),
-                            connection_name: connection_name.clone(),
-                            model_name: model_name.clone(),
+                            // Live display states, not the launch-time props:
+                            // after `/model` or in-TUI `/resume`, `/clear`
+                            // must stamp the *active* connection/model into
+                            // the fresh session file.
+                            connection_name: connection_display.get(),
+                            model_name: model_display.get(),
                             project_root: project_root.clone(),
                             user_state_dir: user_state_dir.clone(),
                             user_config_dir: user_config_dir.clone(),
@@ -862,7 +1019,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         return;
                     }
                     transcript.update(|entries| {
-                        entries.push(TranscriptEntry::UserTurn { text: text.clone() });
+                        entries.push_entry(TranscriptEntry::UserTurn { text: text.clone() });
                     });
                     input_buffer.set(String::new());
                     streaming.set(true);
@@ -871,17 +1028,6 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 }
                 _ => {}
             }
-        }
-    });
-
-    let app_handle = hooks.use_app();
-    hooks.use_input(move |ev, _ctx| {
-        if ev.code == KeyCode::Char('c')
-            && ev
-                .modifiers
-                .contains(ntui::hooks::input::KeyModifiers::CONTROL)
-        {
-            app_handle.exit();
         }
     });
 
@@ -903,7 +1049,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     );
     body.push(
         element! {
-            Transcript(entries: transcript.get(), pending_permission: pending_permission.get())
+            Transcript(
+                entries: transcript.get(),
+                pending_permission: pending_permission.get(),
+                streaming_text: stream_text.get(),
+                focused: props.focused,
+                input_gate: props.input_gate.clone(),
+            )
         }
         .with_key("transcript"),
     );
@@ -945,7 +1097,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
 /// more state; every field added there is threaded through from the same
 /// `App` render this struct is built in.
 struct SlashContext {
-    transcript: ntui::State<Vec<TranscriptEntry>>,
+    transcript: ntui::State<TranscriptEntries>,
     tier: ntui::State<PermissionTier>,
     session_path: ntui::State<std::path::PathBuf>,
     created_at: ntui::State<String>,
@@ -975,7 +1127,9 @@ const HELP_TEXT: &str = "\
 /compact                   summarize older turns to free up context
 /resume                    switch to a previous session for this project
 /clear                     clear the transcript and start a fresh session
-/help                      show this message";
+/help                      show this message
+workspace: Ctrl+B then     c new window · n/p/0-9 switch · % \" split
+                           arrows/o move pane focus · x close (last pane exits)";
 
 fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashContext) {
     use crate::tui::slash::SlashCommand;
@@ -983,14 +1137,14 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
     match command {
         SlashCommand::Help => {
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: HELP_TEXT.to_string(),
                 });
             });
         }
         SlashCommand::Unknown { raw } => {
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: format!(
                         "'{raw}' is not a recognized command. Type /help to see the list."
                     ),
@@ -1015,7 +1169,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             );
             if let Err(e) = crate::session::store::save_session(&new_path, &fresh) {
                 ctx.transcript.update(|entries| {
-                    entries.push(TranscriptEntry::SystemNotice {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
                         text: format!(
                             "cleared transcript, but failed to start a new session file: {e}"
                         ),
@@ -1032,7 +1186,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             ) {
                 Ok(connections) if connections.is_empty() => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: "no connections configured; run `local-code connections add`"
                                 .to_string(),
                         });
@@ -1056,7 +1210,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                         .map(|(i, (conn, model))| format!("{}) {} · {}", i + 1, conn.name, model))
                         .collect();
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!(
                                 "Select a connection/model (press the digit key):\n{}",
                                 listing.join("\n")
@@ -1069,7 +1223,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 }
                 Err(e) => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("failed to load connections: {e}"),
                         });
                     });
@@ -1096,7 +1250,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 },
             );
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
             ctx.pending_menu.set(PendingMenu::PermissionsMenu);
         }
@@ -1112,7 +1266,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 Err(e) => format!("failed to list connections: {e}"),
             };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
         SlashCommand::ConnectionsRemove { name } => {
@@ -1127,12 +1281,12 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 Err(e) => format!("failed to remove connection: {e}"),
             };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
         SlashCommand::ConnectionsAddUnsupported => {
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: "adding a connection interactively isn't supported inside the TUI\n\
                            (the wizard needs multi-step line-by-line stdin, which the raw-mode\n\
                            TUI input loop doesn't support). Exit and run\n\
@@ -1154,7 +1308,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 Err(e) => format!("failed to list MCP servers: {e}"),
             };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
         SlashCommand::McpRemove { name } => {
@@ -1169,13 +1323,13 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 Err(e) => format!("failed to remove MCP server: {e}"),
             };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
         SlashCommand::McpAdd => {
             let (wizard, prompt) = crate::tui::mcp_wizard::start();
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text: prompt });
+                entries.push_entry(TranscriptEntry::SystemNotice { text: prompt });
             });
             ctx.pending_menu.set(PendingMenu::McpAddWizard(wizard));
         }
@@ -1190,7 +1344,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                     Ok(h) => h,
                     Err(e) => {
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("compact failed: could not read history: {e}"),
                             });
                         });
@@ -1200,7 +1354,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
 
                 if history.len() <= COMPACT_THRESHOLD {
                     transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!(
                                 "nothing to compact yet ({} messages, threshold is {COMPACT_THRESHOLD})",
                                 history.len()
@@ -1213,11 +1367,15 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 let split_at = history.len().saturating_sub(RETAIN_RECENT);
                 let (older, recent) = history.split_at(split_at);
 
-                let mut conversation_text = String::new();
+                let capacity: usize = older
+                    .iter()
+                    .filter_map(|m| m.content.as_ref().map(|c| c.len() + 16))
+                    .sum();
+                let mut conversation_text = String::with_capacity(capacity);
                 for msg in older {
-                    let role = format!("{:?}", msg.role);
                     if let Some(content) = &msg.content {
-                        conversation_text.push_str(&format!("{role}: {content}\n"));
+                        use std::fmt::Write as _;
+                        let _ = writeln!(conversation_text, "{:?}: {content}", msg.role);
                     }
                 }
 
@@ -1241,7 +1399,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                     Ok(response) => response.text().to_string(),
                     Err(e) => {
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("compact failed: summarization call errored: {e}"),
                             });
                         });
@@ -1251,20 +1409,42 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
 
                 if let Err(e) = agent.memory().clear_erased().await {
                     transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("compact failed: could not clear memory: {e}"),
                         });
                     });
                     return;
                 }
-                let _ = agent
+                // The clear already succeeded, so a failed re-injection would
+                // silently lose the summary/recent context — surface it like
+                // the `clear_erased` failure above instead of discarding the
+                // error (the memory is degraded either way, but the user must
+                // know).
+                let mut reinject_error: Option<String> = None;
+                if let Err(e) = agent
                     .memory()
                     .add_message_erased(&daimon::model::types::Message::system(format!(
                         "Previous conversation summary: {summary_text}"
                     )))
-                    .await;
+                    .await
+                {
+                    reinject_error = Some(e.to_string());
+                }
                 for msg in recent {
-                    let _ = agent.memory().add_message_erased(msg).await;
+                    if let Err(e) = agent.memory().add_message_erased(msg).await {
+                        reinject_error.get_or_insert_with(|| e.to_string());
+                        break;
+                    }
+                }
+                if let Some(e) = reinject_error {
+                    transcript.update(|entries| {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
+                            text: format!(
+                                "compact warning: memory was cleared but re-seeding it failed: {e} \
+                                 — the agent may be missing the summary or recent turns"
+                            ),
+                        });
+                    });
                 }
 
                 // The display transcript has no 1:1 correspondence to the
@@ -1278,9 +1458,10 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 // approach Phase 3 used for diff coloring.
                 transcript.update(|entries| {
                     let keep_from = entries.len().saturating_sub(RETAIN_RECENT);
-                    let mut compacted = vec![TranscriptEntry::SystemNotice {
+                    let mut compacted: TranscriptEntries = Vec::new();
+                    compacted.push_entry(TranscriptEntry::SystemNotice {
                         text: format!("compacted {} older messages into a summary", older.len()),
-                    }];
+                    });
                     compacted.extend(entries.split_off(keep_from));
                     *entries = compacted;
                 });
@@ -1291,7 +1472,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             let project_root = ctx.project_root.clone();
             let transcript = ctx.transcript.clone();
             transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: "surveying the project and generating AGENTS.md…".to_string(),
                 });
             });
@@ -1300,18 +1481,18 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 match crate::init::generate_agents_md(&model, &survey).await {
                     Ok(content) => match crate::init::write_agents_md(&project_root, &content) {
                         Ok(()) => transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: "wrote AGENTS.md".to_string(),
                             });
                         }),
                         Err(e) => transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("/init failed to write AGENTS.md: {e}"),
                             });
                         }),
                     },
                     Err(e) => transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("/init failed: {e}"),
                         });
                     }),
@@ -1322,7 +1503,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             match crate::session::store::list_sessions(&ctx.user_state_dir, &ctx.project_root) {
                 Ok(sessions) if sessions.is_empty() => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: "no previous sessions found for this project".to_string(),
                         });
                     });
@@ -1347,7 +1528,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                         })
                         .collect();
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!(
                                 "Select a session to resume (press the digit key):\n{}",
                                 listing.join("\n")
@@ -1360,7 +1541,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 }
                 Err(e) => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("failed to list sessions: {e}"),
                         });
                     });
@@ -1416,22 +1597,42 @@ fn format_turn_error(e: impl std::fmt::Display) -> String {
 async fn run_turn(
     agent: Arc<Agent>,
     input: String,
-    transcript: ntui::State<Vec<TranscriptEntry>>,
+    transcript: ntui::State<TranscriptEntries>,
+    stream_text: ntui::State<String>,
     usage: ntui::State<UsageSummary>,
     streaming: ntui::State<bool>,
     pending_turn_input: ntui::State<Option<String>>,
     session_path: ntui::State<std::path::PathBuf>,
     created_at: ntui::State<String>,
-    connection_name: String,
-    model_name: String,
+    connection_name: ntui::State<String>,
+    model_name: ntui::State<String>,
     tier: PermissionTier,
     project_root: std::path::PathBuf,
 ) {
+    // Folds the in-flight streamed text into the transcript as a finished
+    // `AssistantText` entry. Called whenever the current streamed block ends
+    // (a tool call starts, an error interrupts, or the turn completes) so
+    // `transcript` is only touched once per block instead of once per token
+    // — see `stream_text`'s declaration in `App` for the cost rationale.
+    let flush_stream_text = {
+        let transcript = transcript.clone();
+        let stream_text = stream_text.clone();
+        move || {
+            let text = stream_text.get();
+            if !text.is_empty() {
+                stream_text.set(String::new());
+                transcript.update(|entries| {
+                    entries.push_entry(TranscriptEntry::AssistantText { text });
+                });
+            }
+        }
+    };
+
     let mut stream = match agent.prompt_stream(&input).await {
         Ok(s) => s,
         Err(e) => {
             transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: format_turn_error(e),
                 });
             });
@@ -1444,14 +1645,12 @@ async fn run_turn(
     while let Some(event) = stream.next().await {
         match event {
             Ok(StreamEvent::TextDelta(delta)) => {
-                transcript.update(|entries| match entries.last_mut() {
-                    Some(TranscriptEntry::AssistantText { text }) => text.push_str(&delta),
-                    _ => entries.push(TranscriptEntry::AssistantText { text: delta }),
-                });
+                stream_text.update(|text| text.push_str(&delta));
             }
             Ok(StreamEvent::ToolCallStart { id, name }) => {
+                flush_stream_text();
                 transcript.update(|entries| {
-                    entries.push(TranscriptEntry::ToolCall(ToolCallEntry {
+                    entries.push_entry(TranscriptEntry::ToolCall(ToolCallEntry {
                         id,
                         name,
                         arguments_json: String::new(),
@@ -1494,16 +1693,18 @@ async fn run_turn(
                 usage.update(|u| u.add(input_tokens, output_tokens, estimated_cost));
             }
             Ok(StreamEvent::Error(message)) => {
+                flush_stream_text();
                 transcript.update(|entries| {
-                    entries.push(TranscriptEntry::SystemNotice {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
                         text: format!("error: {message}"),
                     });
                 });
             }
             Ok(StreamEvent::Done) => break,
             Err(e) => {
+                flush_stream_text();
                 transcript.update(|entries| {
-                    entries.push(TranscriptEntry::SystemNotice {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
                         text: format_turn_error(e),
                     });
                 });
@@ -1511,24 +1712,44 @@ async fn run_turn(
             }
         }
     }
+    flush_stream_text();
 
     if let Ok(messages) = agent.memory().get_messages_erased().await {
         let now = chrono::Utc::now().to_rfc3339();
         let mut session = crate::session::types::SessionFile::new(
             project_root,
-            connection_name,
-            model_name,
+            connection_name.get(),
+            model_name.get(),
             tier,
             created_at.get(),
         );
         session.updated_at = now;
-        session.entries = transcript.get();
+        session.entries = transcript.get().iter().map(|e| (**e).clone()).collect();
         session.messages = messages;
-        if let Err(e) = crate::session::store::save_session(&session_path.get(), &session) {
-            eprintln!(
-                "warning: failed to persist session to {}: {e}",
-                session_path.get().display()
-            );
+        // Serialize + write on the blocking pool: the session grows with the
+        // conversation, and doing this inline stalled the single-threaded
+        // runtime (rendering AND every other pane's stream) for the duration
+        // of the write. A failure lands in the transcript — an `eprintln!`
+        // under the alternate screen was invisible.
+        let path = session_path.get();
+        let saved = tokio::task::spawn_blocking(move || {
+            crate::session::store::save_session(&path, &session)
+        })
+        .await;
+        let save_error = match saved {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(join_error) => Some(join_error.to_string()),
+        };
+        if let Some(e) = save_error {
+            transcript.update(|entries| {
+                entries.push_entry(TranscriptEntry::SystemNotice {
+                    text: format!(
+                        "warning: failed to persist session to {}: {e}",
+                        session_path.get().display()
+                    ),
+                });
+            });
         }
     }
 
@@ -1539,37 +1760,12 @@ async fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daimon::model::types::{ChatRequest, ChatResponse, Message, Role, StopReason, Usage};
+    use daimon::model::types::{ChatRequest, ChatResponse, Role};
     use daimon::stream::ResponseStream;
     use ntui::testing::TestTerminal;
     use ntui::{Element, KeyCode};
 
-    /// Replies with a two-token streamed response and no tool calls.
-    ///
-    /// Deliberately emits no `StreamEvent::Usage` of its own: `Agent::prompt_stream`
-    /// (see `daimon`'s `agent/runner.rs`) always appends its *own* estimated
-    /// `Usage` event per ReAct iteration (character-count-based, `chars/4`) after
-    /// forwarding whatever the model's stream yields — so any `Usage` this mock
-    /// emitted would be forwarded too and summed with the agent's, on top of the
-    /// agent's own estimate. Omitting it keeps this test's usage assertions tied
-    /// to one authoritative source instead of an arbitrary double-count.
-    struct StreamingEchoModel;
-    impl daimon::model::Model for StreamingEchoModel {
-        async fn generate(&self, _request: &ChatRequest) -> daimon::Result<ChatResponse> {
-            Ok(ChatResponse {
-                message: Message::assistant("unused"),
-                stop_reason: StopReason::EndTurn,
-                usage: Some(Usage::default()),
-            })
-        }
-        async fn generate_stream(&self, _request: &ChatRequest) -> daimon::Result<ResponseStream> {
-            Ok(Box::pin(futures::stream::iter(vec![
-                Ok(StreamEvent::TextDelta("Hello".into())),
-                Ok(StreamEvent::TextDelta(", world".into())),
-                Ok(StreamEvent::Done),
-            ])))
-        }
-    }
+    use crate::tui::test_support::StreamingEchoModel;
 
     fn test_props() -> AppProps {
         AppProps {
@@ -1603,6 +1799,90 @@ mod tests {
         KEYRING_INIT.call_once(|| {
             keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
         });
+    }
+
+    fn plain_key(code: KeyCode) -> ntui::KeyEvent {
+        ntui::KeyEvent::new(code, ntui::hooks::input::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn guard_blocks_every_key_when_unfocused() {
+        assert!(!session_may_handle_input(
+            false,
+            &None,
+            &plain_key(KeyCode::Char('a'))
+        ));
+        assert!(!session_may_handle_input(
+            false,
+            &None,
+            &plain_key(KeyCode::Enter)
+        ));
+    }
+
+    #[test]
+    fn guard_passes_normal_keys_when_focused_and_ungated() {
+        assert!(session_may_handle_input(
+            true,
+            &None,
+            &plain_key(KeyCode::Char('a'))
+        ));
+        assert!(session_may_handle_input(
+            true,
+            &None,
+            &plain_key(KeyCode::Enter)
+        ));
+    }
+
+    #[test]
+    fn guard_lets_the_prefix_key_bubble_but_not_a_plain_b() {
+        let prefix = ntui::KeyEvent::new(
+            KeyCode::Char('b'),
+            ntui::hooks::input::KeyModifiers::CONTROL,
+        );
+        assert!(!session_may_handle_input(true, &None, &prefix));
+        assert!(session_may_handle_input(
+            true,
+            &None,
+            &plain_key(KeyCode::Char('b'))
+        ));
+    }
+
+    /// Throwaway component whose sole job is to hand its `use_state` handle
+    /// out to the test (states can't be constructed outside a component) —
+    /// same pattern as `src/tui/rebuild.rs`'s own tests.
+    #[derive(Clone, Default)]
+    struct GateHarnessProps {
+        slot: Arc<std::sync::Mutex<Option<ntui::State<bool>>>>,
+    }
+    impl PartialEq for GateHarnessProps {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+    #[component]
+    fn GateHarness(props: &GateHarnessProps, hooks: &mut Hooks) -> Element {
+        let gate = hooks.use_state(|| true);
+        *props.slot.lock().unwrap() = Some(gate.clone());
+        element! { View {} }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guard_blocks_the_focused_session_while_the_gate_is_armed() {
+        let slot: Arc<std::sync::Mutex<Option<ntui::State<bool>>>> = Default::default();
+        let _t = TestTerminal::new(
+            10,
+            1,
+            Element::component::<GateHarness>(GateHarnessProps { slot: slot.clone() }),
+        )
+        .unwrap();
+        let gate = slot.lock().unwrap().clone().unwrap();
+        let ev = plain_key(KeyCode::Char('1'));
+        assert!(
+            !session_may_handle_input(true, &Some(gate.clone()), &ev),
+            "an armed prefix gates even permission-prompt digits"
+        );
+        gate.set(false);
+        assert!(session_may_handle_input(true, &Some(gate), &ev));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2176,22 +2456,28 @@ mod tests {
 
     #[component]
     fn RunTurnHarness(props: &RunTurnHarnessProps, hooks: &mut Hooks) -> Element {
-        let transcript = hooks.use_state(Vec::<TranscriptEntry>::new);
+        let transcript = hooks.use_state(TranscriptEntries::new);
+        let stream_text = hooks.use_state(String::new);
         let usage_state = hooks.use_state(UsageSummary::default);
         let streaming = hooks.use_state(|| false);
         let pending_turn_input = hooks.use_state(|| Option::<String>::None);
         let session_path = hooks.use_state(std::path::PathBuf::new);
         let created_at = hooks.use_state(|| "2026-01-01T00:00:00Z".to_string());
+        let connection_name = hooks.use_state(|| "local-vllm".to_string());
+        let model_name = hooks.use_state(|| "qwen2.5-coder-32b".to_string());
 
         hooks.use_effect((), {
             let slot = props.slot.clone();
             let mode = props.mode;
             let transcript = transcript.clone();
+            let stream_text = stream_text.clone();
             let usage_state = usage_state.clone();
             let streaming = streaming.clone();
             let pending_turn_input = pending_turn_input.clone();
             let session_path = session_path.clone();
             let created_at = created_at.clone();
+            let connection_name = connection_name.clone();
+            let model_name = model_name.clone();
             move || {
                 let agent = Arc::new(match mode {
                     HarnessMode::ToolCall => Agent::builder()
@@ -2208,13 +2494,14 @@ mod tests {
                     agent,
                     "add 2 and 3".to_string(),
                     transcript,
+                    stream_text,
                     usage_state,
                     streaming,
                     pending_turn_input,
                     session_path,
                     created_at,
-                    "local-vllm".into(),
-                    "qwen2.5-coder-32b".into(),
+                    connection_name,
+                    model_name,
                     PermissionTier::FullAuto,
                     std::env::temp_dir(),
                 ));
@@ -2366,7 +2653,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn help_command_lists_every_slash_command() {
-        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        // 30 rows: HELP_TEXT grew a workspace-keybindings section and no
+        // longer fits a 24-row frame alongside the header.
+        let mut t = TestTerminal::new(80, 30, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/help").await;
         t.tick().await.unwrap();
         let text = t.frame_text();
@@ -2699,7 +2988,25 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             t.tick().await.unwrap();
         }
-        assert!(t.frame_text().contains("compacted"), "{}", t.frame_text());
+        let text = t.frame_text();
+        assert!(text.contains("compacted"), "{text}");
+        // The last RETAIN_RECENT (10) display entries survive — with 2 entries
+        // per turn that is the last ~5 turns — while early turns are gone and
+        // the summary notice sits ABOVE the retained tail, not appended.
+        assert!(
+            text.contains("turn 24"),
+            "recent turns must survive: {text}"
+        );
+        assert!(
+            !text.contains("turn 0\n") && !text.contains("turn 1\n"),
+            "old turns must be compacted away: {text}"
+        );
+        let notice_at = text.find("compacted").expect("asserted above");
+        let recent_at = text.find("turn 24").expect("asserted above");
+        assert!(
+            notice_at < recent_at,
+            "the summary notice must precede the retained turns: {text}"
+        );
         let _ = props; // props is cloned above only to keep it available for potential future assertions
     }
 

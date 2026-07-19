@@ -1,5 +1,3 @@
-// src/skills/discovery.rs
-
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 

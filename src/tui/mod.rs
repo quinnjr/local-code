@@ -1,5 +1,3 @@
-// src/tui/mod.rs
-
 pub mod app;
 pub mod components;
 pub mod gated_tool;
@@ -9,8 +7,12 @@ pub mod permission_prompter;
 pub mod rebuild;
 pub mod slash;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub mod workspace;
 
 pub use app::{App, AppProps};
+pub use workspace::{Workspace, WorkspaceProps};
 
 use std::path::Path;
 
@@ -23,8 +25,6 @@ use crate::context::load_project_context;
 use crate::mcp::connect::connect_all;
 use crate::permissions::settings::load_settings;
 use crate::permissions::types::PermissionTier;
-use crate::session::paths::new_session_path;
-use crate::session::types::SessionFile;
 use crate::skills::discovery::{discover_skills, render_skill_context, resolve_skill_context};
 use daimon::model::types::Message;
 
@@ -158,7 +158,15 @@ pub async fn run_tui(
         None => select_connection(&connections, connection_name)?,
     };
 
-    let api_key = SecretStore::get_api_key(&connection.name)?;
+    // The keyring read is a blocking Secret Service/DBus round trip; run it
+    // on the blocking pool so a slow or locked keyring backend doesn't stall
+    // the async runtime before the first frame.
+    let api_key = {
+        let connection_name = connection.name.clone();
+        tokio::task::spawn_blocking(move || SecretStore::get_api_key(&connection_name))
+            .await
+            .expect("keyring lookup task panicked")?
+    };
     let model = build_model(&connection, api_key)?;
 
     let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;
@@ -196,24 +204,26 @@ pub async fn run_tui(
             resumed.created_at,
         ),
         None => {
-            let now = chrono::Utc::now();
-            let path = new_session_path(&paths.user_state_dir, project_root, now);
             let tier = permission_mode_override.unwrap_or(PermissionTier::Ask);
-            let created_at = now.to_rfc3339();
-            let session = SessionFile::new(
-                project_root.to_path_buf(),
-                connection.name.clone(),
-                connection.default_model.clone(),
+            let (path, created_at) = crate::session::store::create_fresh_session(
+                &paths.user_state_dir,
+                project_root,
+                &connection.name,
+                &connection.default_model,
                 tier,
-                created_at.clone(),
-            );
-            crate::session::store::save_session(&path, &session)
-                .map_err(TuiSessionError::Session)?;
+                chrono::Utc::now(),
+            )
+            .map_err(TuiSessionError::Session)?;
             (tier, Vec::new(), Vec::new(), path, created_at)
         }
     };
 
-    let props = AppProps {
+    // The initial session's props double as the template `Workspace` stamps
+    // new tabs/panes from (fresh transcript + fresh session file, everything
+    // else inherited). `focused`/`input_gate`/`session_tag`/`streaming_flags`
+    // keep their defaults here — `Workspace` overrides them per pane on every
+    // render.
+    let template = AppProps {
         model: Some(model),
         connection_name: connection.name.clone(),
         model_name: connection.default_model.clone(),
@@ -231,28 +241,10 @@ pub async fn run_tui(
         project_config_dir: paths.project_config_dir.clone(),
         project_root: project_root.to_path_buf(),
         created_at,
+        ..AppProps::default()
     };
 
-    ntui::render(ntui::element!(App(
-        model: props.model,
-        connection_name: props.connection_name,
-        model_name: props.model_name,
-        always_allow: props.always_allow,
-        always_deny: props.always_deny,
-        initial_tier: props.initial_tier,
-        initial_entries: props.initial_entries,
-        initial_messages: props.initial_messages,
-        system_context: props.system_context,
-        mcp_tools: props.mcp_tools,
-        skills: props.skills,
-        session_path: props.session_path,
-        user_state_dir: props.user_state_dir,
-        user_config_dir: props.user_config_dir,
-        project_config_dir: props.project_config_dir,
-        project_root: props.project_root,
-        created_at: props.created_at
-    )))
-    .await?;
+    ntui::render(ntui::element!(Workspace(template: template))).await?;
     Ok(())
 }
 

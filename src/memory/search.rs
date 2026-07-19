@@ -1,5 +1,3 @@
-// src/memory/search.rs
-
 use crate::memory::{MemoryError, MemoryPaths};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,7 +15,15 @@ pub fn search(memory_dir: &Path, query: &str) -> Result<Vec<MemoryHit>, MemoryEr
         return Ok(hits);
     }
 
-    let query_lower = query.to_lowercase();
+    // A case-insensitive matcher compiled once, instead of allocating a
+    // lowercased copy of every scanned line (the previous
+    // `line.to_lowercase().contains(...)` paid one heap allocation per line
+    // across every memory file). `(?i)` uses Unicode simple case folding,
+    // matching the old `to_lowercase` semantics for practical inputs.
+    let matcher = regex::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .build()
+        .expect("escaped literal query always compiles");
     let paths = MemoryPaths::new(memory_dir);
 
     let mut files: Vec<PathBuf> = Vec::new();
@@ -61,7 +67,7 @@ pub fn search(memory_dir: &Path, query: &str) -> Result<Vec<MemoryHit>, MemoryEr
             source,
         })?;
         for (idx, line) in contents.lines().enumerate() {
-            if line.to_lowercase().contains(&query_lower) {
+            if matcher.is_match(line) {
                 hits.push(MemoryHit {
                     file: file.clone(),
                     line_number: idx + 1,
@@ -159,5 +165,20 @@ mod tests {
         let hits = search(&memory_dir, "here").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].line_number, 2);
+    }
+
+    #[test]
+    fn search_treats_regex_metacharacters_as_literals() {
+        let dir = tempdir().unwrap();
+        let memory_dir = dir.path().join("memory");
+        write(&memory_dir, "recent.md", "config: a.b\nother: axb\n");
+        let hits = search(&memory_dir, "a.b").unwrap();
+        assert_eq!(hits.len(), 1, "the dot must not match 'axb': {hits:?}");
+        assert!(hits[0].line.contains("a.b"));
+        let paren_hits = search(&memory_dir, "(config").unwrap();
+        assert!(
+            paren_hits.is_empty(),
+            "an unbalanced paren query must not panic or match"
+        );
     }
 }

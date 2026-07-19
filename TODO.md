@@ -33,7 +33,26 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    Only the stdio transport has a live, fixture-server integration test proving positive
    end-to-end behavior. Inherited from Phase 5, not introduced here.
 
-8. **The two live smoke tests (`live_compact`, `live_init`) only assert non-empty output.**
+8. **`list_sessions` fully parses every session file, including eagerly-created empty ones.**
+   Every launch and every new tab/pane writes its (empty) session file up front — deliberate,
+   because the timestamped path allocation doubles as filename reservation (two panes created in
+   the same second would otherwise collide) and because pane creation surfaces disk errors
+   immediately. The cost is that `/resume` reads and JSON-parses each empty file just to skip it.
+   A byte-length pre-filter was rejected as fragile (empty-file size varies with connection/model
+   name lengths). The write side of the same loan: pane creation performs that small session-file
+   write synchronously inside the workspace's key handler (sub-millisecond on a local FS; would
+   stall the render thread on a slow/networked mount). Revisit only if a resume listing ever gets
+   slow or pane creation is ever observed to hitch.
+
+9. **Workspace panes have one split axis per window and no resizing.** A window's first split
+   (`C-b %` or `C-b "`) fixes its layout axis; later splits extend along that axis (the other
+   direction's chord is honored but its direction is ignored), and all panes are equal-sized.
+   Mixed-direction nesting is blocked by ntui's sibling-scoped keyed reconciliation — a nested
+   split tree would reparent (and thus unmount/reset) live sessions on every split. Revisit if
+   ntui grows global keys/portals. Workspace layout also isn't persisted across restarts — each
+   pane's *session* is individually resumable, but the window/pane arrangement resets.
+
+10. **The two live smoke tests (`live_compact`, `live_init`) only assert non-empty output.**
    Neither checks structural correctness of the generated content (e.g., that `/init`'s output
    looks like real markdown, or that `/compact`'s summary is actually shorter than the input).
    They'd miss a regression where the model returns garbage-but-nonempty text. Intentionally thin

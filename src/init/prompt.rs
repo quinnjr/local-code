@@ -1,5 +1,3 @@
-// src/init/prompt.rs
-
 use crate::init::survey::ProjectSurvey;
 
 /// Builds the user-message text for the `/init` generation call from a

@@ -144,34 +144,55 @@ async fn grep(
         Err(e) => return Ok(ToolOutput::error(format!("invalid regex '{pattern}': {e}"))),
     };
 
-    let mut matches = Vec::new();
-    for entry in walkdir::WalkDir::new(&root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        for (line_no, line) in content.lines().enumerate() {
-            if regex.is_match(line) {
-                matches.push(format!(
-                    "{}:{}: {}",
-                    entry.path().display(),
-                    line_no + 1,
-                    line
-                ));
-                if matches.len() >= 200 {
-                    break;
+    // The walk + reads are synchronous filesystem work; run them on the
+    // blocking pool so a large tree doesn't stall the single-threaded tokio
+    // runtime (which would freeze rendering and every other pane's stream
+    // for the duration of the search).
+    let walked = tokio::task::spawn_blocking(move || {
+        let mut matches = Vec::new();
+        for entry in walkdir::WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            // Same cap `read_file` enforces: reading a multi-GB file whole
+            // just to line-scan it is the OOM hazard that limit exists for.
+            if entry
+                .metadata()
+                .map(|m| m.len() > MAX_READ_FILE_BYTES)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            for (line_no, line) in content.lines().enumerate() {
+                if regex.is_match(line) {
+                    matches.push(format!(
+                        "{}:{}: {}",
+                        entry.path().display(),
+                        line_no + 1,
+                        line
+                    ));
+                    if matches.len() >= 200 {
+                        break;
+                    }
                 }
             }
+            if matches.len() >= 200 {
+                break;
+            }
         }
-        if matches.len() >= 200 {
-            break;
-        }
-    }
+        matches
+    })
+    .await;
+    let matches = match walked {
+        Ok(matches) => matches,
+        Err(e) => return Ok(ToolOutput::error(format!("grep failed: {e}"))),
+    };
 
     if matches.is_empty() {
         Ok(ToolOutput::text("no matches found"))
@@ -201,13 +222,23 @@ async fn glob(
         }
     };
 
-    let mut matches = Vec::new();
-    for p in paths.flatten() {
-        matches.push(p.display().to_string());
-        if matches.len() >= 200 {
-            break;
+    // Iterating the glob walks the filesystem; blocking pool for the same
+    // single-threaded-runtime reason as `grep` above.
+    let walked = tokio::task::spawn_blocking(move || {
+        let mut matches = Vec::new();
+        for p in paths.flatten() {
+            matches.push(p.display().to_string());
+            if matches.len() >= 200 {
+                break;
+            }
         }
-    }
+        matches
+    })
+    .await;
+    let matches = match walked {
+        Ok(matches) => matches,
+        Err(e) => return Ok(ToolOutput::error(format!("glob failed: {e}"))),
+    };
 
     if matches.is_empty() {
         Ok(ToolOutput::text("no matches found"))

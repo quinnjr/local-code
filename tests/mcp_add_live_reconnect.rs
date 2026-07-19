@@ -37,17 +37,17 @@ impl daimon::model::Model for StreamingEchoModel {
 }
 
 fn test_props(dir: &std::path::Path) -> AppProps {
-    AppProps {
-        model: Some(Arc::new(StreamingEchoModel)),
-        connection_name: "local-vllm".into(),
-        model_name: "qwen2.5-coder-32b".into(),
-        always_allow: vec![],
-        always_deny: vec![],
-        initial_tier: PermissionTier::FullAuto,
-        project_config_dir: dir.to_path_buf(),
-        user_config_dir: dir.join("user-config-unused"),
-        ..AppProps::default()
-    }
+    // Mutate-after-default rather than a struct literal: `AppProps` is
+    // `#[non_exhaustive]`, which forbids literal construction (including
+    // `..Default::default()` functional update) outside its defining crate.
+    let mut props = AppProps::default();
+    props.model = Some(Arc::new(StreamingEchoModel));
+    props.connection_name = "local-vllm".into();
+    props.model_name = "qwen2.5-coder-32b".into();
+    props.initial_tier = PermissionTier::FullAuto;
+    props.project_config_dir = dir.to_path_buf();
+    props.user_config_dir = dir.join("user-config-unused");
+    props
 }
 
 async fn type_and_submit(t: &mut TestTerminal, text: &str) {

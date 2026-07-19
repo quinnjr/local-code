@@ -1,5 +1,3 @@
-// src/skills/frontmatter.rs
-
 use crate::skills::types::LoadMode;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
