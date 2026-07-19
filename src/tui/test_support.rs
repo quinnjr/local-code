@@ -1,5 +1,3 @@
-// src/tui/test_support.rs
-//
 // Shared test doubles for the TUI test modules — one home instead of each
 // `#[cfg(test)]` module hand-copying its own near-identical mock model (the
 // workspace tests' `EchoModel` was a drifted copy of `app`'s

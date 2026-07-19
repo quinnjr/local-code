@@ -1,5 +1,4 @@
-// src/skills/github.rs
-
+use crate::skills::client::urlencoding_ref;
 use crate::skills::types::{FetchedFile, Host, SkillHostError, SkillSource};
 
 /// Parses an `owner/repo[/path][@ref]` skill source spec. The ref, if
@@ -183,21 +182,7 @@ impl GithubClient {
         &self,
         url: &str,
     ) -> Result<T, SkillHostError> {
-        let response = self
-            .request(url)
-            .send()
-            .await
-            .map_err(SkillHostError::Request)?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(SkillHostError::Api {
-                status: status.as_u16(),
-                url: url.to_string(),
-                body,
-            });
-        }
-        response.json::<T>().await.map_err(SkillHostError::Request)
+        crate::skills::client::get_json(self.request(url), url).await
     }
 
     /// Resolves the repo's default branch name (used when the user didn't
@@ -340,10 +325,6 @@ impl GithubClient {
 
 /// GitHub ref names can contain `/` (e.g. `feature/x`); percent-encode just
 /// that character so the commits-endpoint path segment stays well-formed.
-fn urlencoding_ref(git_ref: &str) -> String {
-    git_ref.replace('/', "%2F")
-}
-
 #[cfg(test)]
 mod github_client_tests {
     use super::*;

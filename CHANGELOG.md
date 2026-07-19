@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- The flat-file memory pipeline now actually runs: `memory add` rolls a
+  previous day's buffer into its daily file and ages old daily files into
+  `recent.md`/`archive.md`, and the new `memory core add <text>` records
+  permanent core memories (all three functions existed but were never
+  wired to a command).
+- `C-b x` on a pane that is mid-turn now asks for a confirming second
+  `C-b x` instead of silently discarding the in-flight turn.
+- Transcript entries are stored behind `Arc`, so the per-keystroke and
+  per-token renders bump refcounts instead of deep-copying the whole
+  transcript; several smaller allocation/latency fixes (memory search,
+  `/compact`, startup keyring read, workspace key handling).
+- A failed agent rebuild during `/model`, `/resume`, or `/mcp add` now
+  keeps the previous agent and reports the error instead of panicking.
+- GitLab skill errors are no longer masked: an auth/rate-limit failure
+  during `gl:` spec resolution reports the real HTTP error instead of
+  "invalid skill source", and `skills list` renders GitLab sources
+  without a stray leading slash.
+
 - Added tmux-style workspace tabbing: one TUI can now host several agent
   sessions at once as **windows** (fullscreen tabs on a status bar) and
   **panes** (side-by-side or stacked splits), each with its own transcript,

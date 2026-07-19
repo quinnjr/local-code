@@ -1,5 +1,3 @@
-// src/agent/gated_tool.rs
-
 use std::sync::Arc;
 
 use daimon::tool::{Tool, ToolOutput};

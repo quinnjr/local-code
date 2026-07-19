@@ -1,5 +1,3 @@
-// src/tui/components/footer.rs
-
 use ntui::props::{FlexDirection, JustifyContent};
 use ntui::style::Color;
 use ntui::{component, element};

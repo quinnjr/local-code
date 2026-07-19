@@ -1,5 +1,3 @@
-// src/session/types.rs
-
 use serde::{Deserialize, Serialize};
 
 use crate::permissions::types::PermissionTier;

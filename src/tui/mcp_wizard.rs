@@ -1,5 +1,3 @@
-// src/tui/mcp_wizard.rs
-
 use std::collections::HashMap;
 
 use crate::config::mcp_servers::{McpServerConfig, McpTransportConfig};

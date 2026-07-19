@@ -1,5 +1,3 @@
-// src/init/generate.rs
-
 use std::path::Path;
 
 use daimon::model::SharedModel;

@@ -1,5 +1,3 @@
-// src/agent/provider.rs
-
 use daimon::model::SharedModel;
 use daimon::model::local::{Ollama, OpenAiCompatible};
 

@@ -1,5 +1,3 @@
-// src/tui/components/dashboard.rs
-
 use ntui::props::{Dimension, FlexDirection, JustifyContent, TextWrap};
 use ntui::style::{BorderStyle, Color};
 use ntui::{component, element};

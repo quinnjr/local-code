@@ -1,5 +1,3 @@
-// src/mcp/tool.rs
-
 use std::sync::Arc;
 
 use daimon::mcp::McpToolBridge;

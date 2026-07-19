@@ -33,12 +33,13 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    Only the stdio transport has a live, fixture-server integration test proving positive
    end-to-end behavior. Inherited from Phase 5, not introduced here.
 
-8. **Per-token renders still deep-clone historical transcript entries.** Streamed text now
-   accumulates in a separate buffer (killing the old O(n²) copying of the in-flight reply), but
-   each re-render during streaming still clones the `Vec<TranscriptEntry>` of *completed*
-   entries — linear in transcript size per token. The full fix is `Arc<TranscriptEntry>` storage
-   (per-render clones become refcount bumps); deferred because it touches every transcript
-   mutation site plus session-file conversion for modest residual gain.
+8. **`list_sessions` fully parses every session file, including eagerly-created empty ones.**
+   Every launch and every new tab/pane writes its (empty) session file up front — deliberate,
+   because the timestamped path allocation doubles as filename reservation (two panes created in
+   the same second would otherwise collide) and because pane creation surfaces disk errors
+   immediately. The cost is that `/resume` reads and JSON-parses each empty file just to skip it.
+   A byte-length pre-filter was rejected as fragile (empty-file size varies with connection/model
+   name lengths). Revisit only if a resume listing ever gets slow.
 
 9. **Workspace panes have one split axis per window and no resizing.** A window's first split
    (`C-b %` or `C-b "`) fixes its layout axis; later splits extend along that axis (the other

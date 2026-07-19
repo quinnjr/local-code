@@ -1,7 +1,6 @@
-// src/skills/gitlab.rs
-
 use std::path::PathBuf;
 
+use crate::skills::client::urlencoding_ref;
 use crate::skills::types::{FetchedFile, SkillHostError};
 
 /// A minimal GitLab REST (v4) API client. `api_base` defaults to
@@ -70,17 +69,7 @@ impl GitlabClient {
         &self,
         url: &str,
     ) -> Result<T, SkillHostError> {
-        let response = self.request(url).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(SkillHostError::Api {
-                status: status.as_u16(),
-                url: url.to_string(),
-                body,
-            });
-        }
-        response.json::<T>().await.map_err(SkillHostError::Request)
+        crate::skills::client::get_json(self.request(url), url).await
     }
 
     /// URL-encodes a GitLab project path (`group/subgroup/project`) for use
@@ -230,9 +219,22 @@ impl GitlabClient {
                 Self::encoded_id(&candidate)
             );
             let response = self.request(&url).send().await?;
-            if response.status().is_success() {
+            let status = response.status();
+            if status.is_success() {
                 let in_repo_path = segments[split_at..].join("/");
                 return Ok((candidate, in_repo_path));
+            }
+            // Only 404 means "not this prefix, keep walking". An auth or
+            // rate-limit failure (401/403/429) or a server error would
+            // previously be swallowed and misreported as an invalid spec,
+            // sending the user to fix a spec that was fine all along.
+            if status != reqwest::StatusCode::NOT_FOUND {
+                let body = response.text().await.unwrap_or_default();
+                return Err(SkillHostError::Api {
+                    status: status.as_u16(),
+                    url,
+                    body,
+                });
             }
         }
         Err(SkillHostError::InvalidSpec(raw_path.to_string()))
@@ -261,10 +263,6 @@ fn percent_encode_segment(segment: &str) -> String {
         }
     }
     out
-}
-
-fn urlencoding_ref(git_ref: &str) -> String {
-    git_ref.replace('/', "%2F")
 }
 
 /// Parses the `rel="next"` URL out of GitLab's `Link` response header, if
@@ -559,6 +557,21 @@ mod gitlab_client_tests {
         let client = GitlabClient::new_for_test(None, server.uri());
         let result = client.resolve_project_path("a/b/c").await;
         assert!(matches!(result, Err(SkillHostError::InvalidSpec(_))));
+    }
+
+    #[tokio::test]
+    async fn resolve_project_path_surfaces_auth_failures_instead_of_invalid_spec() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&server)
+            .await;
+        let client = GitlabClient::new_for_test(None, server.uri());
+        let result = client.resolve_project_path("acme/widgets").await;
+        assert!(
+            matches!(result, Err(SkillHostError::Api { status: 403, .. })),
+            "a 403 must not be misreported as an invalid spec: {result:?}"
+        );
     }
 
     #[tokio::test]

@@ -1,5 +1,3 @@
-// src/config/mcp_servers.rs
-
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};

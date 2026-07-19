@@ -1,5 +1,3 @@
-// src/context/mod.rs
-
 use std::path::Path;
 
 use crate::config::paths::Paths;

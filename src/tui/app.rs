@@ -1,5 +1,3 @@
-// src/tui/app.rs
-
 use std::sync::Arc;
 
 use daimon::agent::Agent;
@@ -17,11 +15,12 @@ use crate::tui::components::{
 };
 use crate::tui::permission_prompter::NtuiPermissionPrompter;
 use crate::tui::state::{
-    ToolCallEntry, ToolCallResult, TranscriptEntry, UsageSummary, find_tool_call_mut,
-    toggle_last_tool_call_expanded,
+    PushEntry as _, ToolCallEntry, ToolCallResult, TranscriptEntries, TranscriptEntry,
+    UsageSummary, find_tool_call_mut, toggle_last_tool_call_expanded,
 };
 
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AppProps {
     /// Wrapped in `Option` only so `AppProps: Default` (required by
     /// `ntui::Component::Props`) is satisfiable — `daimon::model::SharedModel`
@@ -254,7 +253,12 @@ enum PendingMenu {
 pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let transcript = hooks.use_state({
         let initial_entries = props.initial_entries.clone();
-        move || initial_entries
+        move || {
+            initial_entries
+                .into_iter()
+                .map(Arc::new)
+                .collect::<TranscriptEntries>()
+        }
     });
     let input_buffer = hooks.use_state(String::new);
     let turn_id = hooks.use_state(|| 0u64);
@@ -350,6 +354,12 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 skills,
                 pending_permission,
             )
+            // A `use_state` initializer has no error channel; mount-time
+            // construction uses the startup-validated tool set, so a failure
+            // here means the process couldn't have run a single turn anyway.
+            // The switch sites (`/model`, `/resume`, `/mcp add`) handle the
+            // `Err` gracefully instead.
+            .expect("initial agent construction failed")
         }
     });
     let (agent, gate, responder) = agent_and_responder.get();
@@ -483,7 +493,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     let allowed = !matches!(decision, PermissionDecision::Deny { .. });
                     if let Some(request) = pending_permission.get() {
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::PermissionResolved {
+                            entries.push_entry(TranscriptEntry::PermissionResolved {
                                 description: request.description.clone(),
                                 allowed,
                             });
@@ -526,7 +536,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         always_allow,
                                         always_deny,
                                     };
-                                    let rebuilt = crate::tui::rebuild::rebuild_agent_from_history(
+                                    let rebuilt = match crate::tui::rebuild::rebuild_agent_from_history(
                                         &agent_for_history,
                                         new_model,
                                         tier_value,
@@ -536,7 +546,20 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         skills,
                                         pending_permission_for_rebuild,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        Ok(rebuilt) => rebuilt,
+                                        Err(e) => {
+                                            // Keep the old agent live; a failed
+                                            // switch must not panic the TUI.
+                                            transcript_for_notice.update(|entries| {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                                    text: format!("failed to switch model: {e}"),
+                                                });
+                                            });
+                                            return;
+                                        }
+                                    };
                                     // Last-write-wins: if multiple `/model` selections somehow
                                     // overlap in flight, whichever `set` call completes last
                                     // wins regardless of submission order. Narrow window today
@@ -554,7 +577,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     connection_display.set(connection_name_for_display);
                                     model_display.set(model_name_for_display);
                                     transcript_for_notice.update(|entries| {
-                                        entries.push(TranscriptEntry::SystemNotice {
+                                        entries.push_entry(TranscriptEntry::SystemNotice {
                                             text: format!(
                                                 "switched to {} · {}",
                                                 connection.name, model_name
@@ -565,7 +588,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             }
                             Err(e) => {
                                 transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice {
+                                    entries.push_entry(TranscriptEntry::SystemNotice {
                                         text: format!("failed to switch model: {e}"),
                                     });
                                 });
@@ -584,7 +607,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         tier.set(new_tier);
                         pending_menu.set(PendingMenu::None);
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("permission tier set to {new_tier:?}"),
                             });
                         });
@@ -618,7 +641,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                     always_allow: always_allow_snapshot.clone(),
                                                     always_deny: always_deny_snapshot.clone(),
                                                 };
-                                                let rebuilt = crate::tui::rebuild::rebuild_agent(
+                                                let rebuilt = match crate::tui::rebuild::rebuild_agent(
                                                     new_model,
                                                     session.tier,
                                                     permission_settings,
@@ -627,7 +650,17 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                     mcp_tools_state.get(),
                                                     skills_snapshot.clone(),
                                                     pending_permission.clone(),
-                                                );
+                                                ) {
+                                                    Ok(rebuilt) => rebuilt,
+                                                    Err(e) => {
+                                                        transcript.update(|entries| {
+                                                            entries.push_entry(TranscriptEntry::SystemNotice {
+                                                                text: format!("failed to resume: could not rebuild agent: {e}"),
+                                                            });
+                                                        });
+                                                        return;
+                                                    }
+                                                };
                                                 agent_and_responder.set(rebuilt);
                                                 // Kept in lockstep with `agent_and_responder`, mirroring
                                                 // the `/model` fix for Bug 2 above — without this,
@@ -642,13 +675,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                 connection_display.set(connection.name.clone());
                                                 model_display.set(session.model_name.clone());
                                                 tier.set(session.tier);
-                                                transcript.set(session.entries.clone());
+                                                transcript.set(session.entries.iter().cloned().map(Arc::new).collect());
                                                 session_path.set(summary.path.clone());
                                                 created_at.set(session.created_at.clone());
                                             }
                                             Err(e) => {
                                                 transcript.update(|entries| {
-                                                    entries.push(TranscriptEntry::SystemNotice {
+                                                    entries.push_entry(TranscriptEntry::SystemNotice {
                                                         text: format!("failed to resume: could not build model: {e}"),
                                                     });
                                                 });
@@ -657,7 +690,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     }
                                     None => {
                                         transcript.update(|entries| {
-                                            entries.push(TranscriptEntry::SystemNotice {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
                                                 text: format!(
                                                     "failed to resume: connection '{}' no longer exists; run `local-code connections list`",
                                                     session.connection_name
@@ -669,7 +702,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             }
                             Err(e) => {
                                 transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice {
+                                    entries.push_entry(TranscriptEntry::SystemNotice {
                                         text: format!("failed to load session: {e}"),
                                     });
                                 });
@@ -683,7 +716,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         pending_menu.set(PendingMenu::None);
                         input_buffer.set(String::new());
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: "cancelled /mcp add.".to_string(),
                             });
                         });
@@ -706,13 +739,13 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             crate::tui::mcp_wizard::Advance::Continue(next_wizard, prompt) => {
                                 pending_menu.set(PendingMenu::McpAddWizard(next_wizard));
                                 transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice { text: prompt });
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text: prompt });
                                 });
                             }
                             crate::tui::mcp_wizard::Advance::Invalid(same_wizard, message) => {
                                 pending_menu.set(PendingMenu::McpAddWizard(same_wizard));
                                 transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice { text: message });
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text: message });
                                 });
                             }
                             crate::tui::mcp_wizard::Advance::Finalize(output) => {
@@ -723,7 +756,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 pending_menu.set(PendingMenu::McpAddConnecting);
                                 let server_name = config.name.clone();
                                 transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice {
+                                    entries.push_entry(TranscriptEntry::SystemNotice {
                                         text: format!("connecting to '{server_name}'…"),
                                     });
                                 });
@@ -756,7 +789,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         .is_ok_and(|names| names.contains(&secret.name))
                                     {
                                         transcript_for_task.update(|entries| {
-                                            entries.push(TranscriptEntry::SystemNotice {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
                                                 text: format!(
                                                     "overwriting existing keyring secret '{}'",
                                                     secret.name
@@ -772,7 +805,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                         )
                                     {
                                         transcript_for_task.update(|entries| {
-                                            entries.push(TranscriptEntry::SystemNotice {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
                                                 text: format!(
                                                     "failed to store the bearer token in the OS keyring: {e}. Server '{}' was NOT saved.",
                                                     config.name
@@ -800,7 +833,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     );
                                     if let Err(e) = &saved {
                                         transcript_for_task.update(|entries| {
-                                            entries.push(TranscriptEntry::SystemNotice {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
                                                 text: format!(
                                                     "MCP server '{}' failed to save to mcp.toml: {e}",
                                                     config.name
@@ -850,16 +883,34 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                 pending_permission_for_task,
                                             )
                                             .await;
-                                            agent_and_responder_for_task.set(rebuilt);
-
-                                            transcript_for_task.update(|entries| {
-                                                entries.push(TranscriptEntry::SystemNotice {
-                                                    text: format!(
-                                                        "MCP server '{}' connected — {tool_count} tools added.",
-                                                        config.name
-                                                    ),
-                                                });
-                                            });
+                                            match rebuilt {
+                                                Ok(rebuilt) => {
+                                                    agent_and_responder_for_task.set(rebuilt);
+                                                    transcript_for_task.update(|entries| {
+                                                        entries.push_entry(TranscriptEntry::SystemNotice {
+                                                            text: format!(
+                                                                "MCP server '{}' connected — {tool_count} tools added.",
+                                                                config.name
+                                                            ),
+                                                        });
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    // The old agent stays live; the merged
+                                                    // tool list is already in
+                                                    // `mcp_tools_state`, so the next
+                                                    // successful rebuild picks it up.
+                                                    transcript_for_task.update(|entries| {
+                                                        entries.push_entry(TranscriptEntry::SystemNotice {
+                                                            text: format!(
+                                                                "MCP server '{}' connected, but the agent rebuild failed: {e}. \
+                                                                 Its tools will apply after the next successful /model or /resume.",
+                                                                config.name
+                                                            ),
+                                                        });
+                                                    });
+                                                }
+                                            }
                                         }
                                         Ok(Err(e)) => {
                                             let retry_note = if saved {
@@ -868,7 +919,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                 "It was NOT saved, so it won't be retried — run /mcp add again.".to_string()
                                             };
                                             transcript_for_task.update(|entries| {
-                                                entries.push(TranscriptEntry::SystemNotice {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
                                                     text: format!(
                                                         "MCP server '{}' failed to connect now: {e}. {retry_note}",
                                                         config.name
@@ -883,7 +934,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                 "It was NOT saved, so it won't be retried — run /mcp add again.".to_string()
                                             };
                                             transcript_for_task.update(|entries| {
-                                                entries.push(TranscriptEntry::SystemNotice {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
                                                     text: format!(
                                                         "MCP server '{}' timed out while connecting (30s). {retry_note}",
                                                         config.name
@@ -908,7 +959,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         // making the user wait out the full timeout.
                         pending_menu.set(PendingMenu::None);
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: "still connecting in the background — you can keep typing; \
                                        a notice will appear here when it finishes."
                                     .to_string(),
@@ -975,7 +1026,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         return;
                     }
                     transcript.update(|entries| {
-                        entries.push(TranscriptEntry::UserTurn { text: text.clone() });
+                        entries.push_entry(TranscriptEntry::UserTurn { text: text.clone() });
                     });
                     input_buffer.set(String::new());
                     streaming.set(true);
@@ -1053,7 +1104,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
 /// more state; every field added there is threaded through from the same
 /// `App` render this struct is built in.
 struct SlashContext {
-    transcript: ntui::State<Vec<TranscriptEntry>>,
+    transcript: ntui::State<TranscriptEntries>,
     tier: ntui::State<PermissionTier>,
     session_path: ntui::State<std::path::PathBuf>,
     created_at: ntui::State<String>,
@@ -1093,14 +1144,14 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
     match command {
         SlashCommand::Help => {
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: HELP_TEXT.to_string(),
                 });
             });
         }
         SlashCommand::Unknown { raw } => {
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: format!(
                         "'{raw}' is not a recognized command. Type /help to see the list."
                     ),
@@ -1125,7 +1176,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             );
             if let Err(e) = crate::session::store::save_session(&new_path, &fresh) {
                 ctx.transcript.update(|entries| {
-                    entries.push(TranscriptEntry::SystemNotice {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
                         text: format!(
                             "cleared transcript, but failed to start a new session file: {e}"
                         ),
@@ -1142,7 +1193,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             ) {
                 Ok(connections) if connections.is_empty() => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: "no connections configured; run `local-code connections add`"
                                 .to_string(),
                         });
@@ -1166,7 +1217,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                         .map(|(i, (conn, model))| format!("{}) {} · {}", i + 1, conn.name, model))
                         .collect();
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!(
                                 "Select a connection/model (press the digit key):\n{}",
                                 listing.join("\n")
@@ -1179,7 +1230,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 }
                 Err(e) => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("failed to load connections: {e}"),
                         });
                     });
@@ -1206,7 +1257,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 },
             );
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
             ctx.pending_menu.set(PendingMenu::PermissionsMenu);
         }
@@ -1222,7 +1273,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 Err(e) => format!("failed to list connections: {e}"),
             };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
         SlashCommand::ConnectionsRemove { name } => {
@@ -1237,12 +1288,12 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 Err(e) => format!("failed to remove connection: {e}"),
             };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
         SlashCommand::ConnectionsAddUnsupported => {
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: "adding a connection interactively isn't supported inside the TUI\n\
                            (the wizard needs multi-step line-by-line stdin, which the raw-mode\n\
                            TUI input loop doesn't support). Exit and run\n\
@@ -1264,7 +1315,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 Err(e) => format!("failed to list MCP servers: {e}"),
             };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
         SlashCommand::McpRemove { name } => {
@@ -1279,13 +1330,13 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 Err(e) => format!("failed to remove MCP server: {e}"),
             };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
         SlashCommand::McpAdd => {
             let (wizard, prompt) = crate::tui::mcp_wizard::start();
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text: prompt });
+                entries.push_entry(TranscriptEntry::SystemNotice { text: prompt });
             });
             ctx.pending_menu.set(PendingMenu::McpAddWizard(wizard));
         }
@@ -1300,7 +1351,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                     Ok(h) => h,
                     Err(e) => {
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("compact failed: could not read history: {e}"),
                             });
                         });
@@ -1310,7 +1361,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
 
                 if history.len() <= COMPACT_THRESHOLD {
                     transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!(
                                 "nothing to compact yet ({} messages, threshold is {COMPACT_THRESHOLD})",
                                 history.len()
@@ -1323,11 +1374,15 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 let split_at = history.len().saturating_sub(RETAIN_RECENT);
                 let (older, recent) = history.split_at(split_at);
 
-                let mut conversation_text = String::new();
+                let capacity: usize = older
+                    .iter()
+                    .filter_map(|m| m.content.as_ref().map(|c| c.len() + 16))
+                    .sum();
+                let mut conversation_text = String::with_capacity(capacity);
                 for msg in older {
-                    let role = format!("{:?}", msg.role);
                     if let Some(content) = &msg.content {
-                        conversation_text.push_str(&format!("{role}: {content}\n"));
+                        use std::fmt::Write as _;
+                        let _ = writeln!(conversation_text, "{:?}: {content}", msg.role);
                     }
                 }
 
@@ -1351,7 +1406,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                     Ok(response) => response.text().to_string(),
                     Err(e) => {
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("compact failed: summarization call errored: {e}"),
                             });
                         });
@@ -1361,20 +1416,42 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
 
                 if let Err(e) = agent.memory().clear_erased().await {
                     transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("compact failed: could not clear memory: {e}"),
                         });
                     });
                     return;
                 }
-                let _ = agent
+                // The clear already succeeded, so a failed re-injection would
+                // silently lose the summary/recent context — surface it like
+                // the `clear_erased` failure above instead of discarding the
+                // error (the memory is degraded either way, but the user must
+                // know).
+                let mut reinject_error: Option<String> = None;
+                if let Err(e) = agent
                     .memory()
                     .add_message_erased(&daimon::model::types::Message::system(format!(
                         "Previous conversation summary: {summary_text}"
                     )))
-                    .await;
+                    .await
+                {
+                    reinject_error = Some(e.to_string());
+                }
                 for msg in recent {
-                    let _ = agent.memory().add_message_erased(msg).await;
+                    if let Err(e) = agent.memory().add_message_erased(msg).await {
+                        reinject_error.get_or_insert_with(|| e.to_string());
+                        break;
+                    }
+                }
+                if let Some(e) = reinject_error {
+                    transcript.update(|entries| {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
+                            text: format!(
+                                "compact warning: memory was cleared but re-seeding it failed: {e} \
+                                 — the agent may be missing the summary or recent turns"
+                            ),
+                        });
+                    });
                 }
 
                 // The display transcript has no 1:1 correspondence to the
@@ -1388,9 +1465,10 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 // approach Phase 3 used for diff coloring.
                 transcript.update(|entries| {
                     let keep_from = entries.len().saturating_sub(RETAIN_RECENT);
-                    let mut compacted = vec![TranscriptEntry::SystemNotice {
+                    let mut compacted: TranscriptEntries = Vec::new();
+                    compacted.push_entry(TranscriptEntry::SystemNotice {
                         text: format!("compacted {} older messages into a summary", older.len()),
-                    }];
+                    });
                     compacted.extend(entries.split_off(keep_from));
                     *entries = compacted;
                 });
@@ -1401,7 +1479,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             let project_root = ctx.project_root.clone();
             let transcript = ctx.transcript.clone();
             transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: "surveying the project and generating AGENTS.md…".to_string(),
                 });
             });
@@ -1410,18 +1488,18 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 match crate::init::generate_agents_md(&model, &survey).await {
                     Ok(content) => match crate::init::write_agents_md(&project_root, &content) {
                         Ok(()) => transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: "wrote AGENTS.md".to_string(),
                             });
                         }),
                         Err(e) => transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("/init failed to write AGENTS.md: {e}"),
                             });
                         }),
                     },
                     Err(e) => transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("/init failed: {e}"),
                         });
                     }),
@@ -1432,7 +1510,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             match crate::session::store::list_sessions(&ctx.user_state_dir, &ctx.project_root) {
                 Ok(sessions) if sessions.is_empty() => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: "no previous sessions found for this project".to_string(),
                         });
                     });
@@ -1457,7 +1535,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                         })
                         .collect();
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!(
                                 "Select a session to resume (press the digit key):\n{}",
                                 listing.join("\n")
@@ -1470,7 +1548,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 }
                 Err(e) => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("failed to list sessions: {e}"),
                         });
                     });
@@ -1526,7 +1604,7 @@ fn format_turn_error(e: impl std::fmt::Display) -> String {
 async fn run_turn(
     agent: Arc<Agent>,
     input: String,
-    transcript: ntui::State<Vec<TranscriptEntry>>,
+    transcript: ntui::State<TranscriptEntries>,
     stream_text: ntui::State<String>,
     usage: ntui::State<UsageSummary>,
     streaming: ntui::State<bool>,
@@ -1551,7 +1629,7 @@ async fn run_turn(
             if !text.is_empty() {
                 stream_text.set(String::new());
                 transcript.update(|entries| {
-                    entries.push(TranscriptEntry::AssistantText { text });
+                    entries.push_entry(TranscriptEntry::AssistantText { text });
                 });
             }
         }
@@ -1561,7 +1639,7 @@ async fn run_turn(
         Ok(s) => s,
         Err(e) => {
             transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: format_turn_error(e),
                 });
             });
@@ -1579,7 +1657,7 @@ async fn run_turn(
             Ok(StreamEvent::ToolCallStart { id, name }) => {
                 flush_stream_text();
                 transcript.update(|entries| {
-                    entries.push(TranscriptEntry::ToolCall(ToolCallEntry {
+                    entries.push_entry(TranscriptEntry::ToolCall(ToolCallEntry {
                         id,
                         name,
                         arguments_json: String::new(),
@@ -1624,7 +1702,7 @@ async fn run_turn(
             Ok(StreamEvent::Error(message)) => {
                 flush_stream_text();
                 transcript.update(|entries| {
-                    entries.push(TranscriptEntry::SystemNotice {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
                         text: format!("error: {message}"),
                     });
                 });
@@ -1633,7 +1711,7 @@ async fn run_turn(
             Err(e) => {
                 flush_stream_text();
                 transcript.update(|entries| {
-                    entries.push(TranscriptEntry::SystemNotice {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
                         text: format_turn_error(e),
                     });
                 });
@@ -1653,7 +1731,7 @@ async fn run_turn(
             created_at.get(),
         );
         session.updated_at = now;
-        session.entries = transcript.get();
+        session.entries = transcript.get().iter().map(|e| (**e).clone()).collect();
         session.messages = messages;
         // Serialize + write on the blocking pool: the session grows with the
         // conversation, and doing this inline stalled the single-threaded
@@ -1672,7 +1750,7 @@ async fn run_turn(
         };
         if let Some(e) = save_error {
             transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: format!(
                         "warning: failed to persist session to {}: {e}",
                         session_path.get().display()
@@ -2385,7 +2463,7 @@ mod tests {
 
     #[component]
     fn RunTurnHarness(props: &RunTurnHarnessProps, hooks: &mut Hooks) -> Element {
-        let transcript = hooks.use_state(Vec::<TranscriptEntry>::new);
+        let transcript = hooks.use_state(TranscriptEntries::new);
         let stream_text = hooks.use_state(String::new);
         let usage_state = hooks.use_state(UsageSummary::default);
         let streaming = hooks.use_state(|| false);

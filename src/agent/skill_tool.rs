@@ -1,5 +1,3 @@
-// src/agent/skill_tool.rs
-
 use daimon::tool::{Tool, ToolOutput};
 
 use crate::skills::types::Skill;

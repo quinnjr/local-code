@@ -1,5 +1,3 @@
-// src/cli/secret.rs
-
 use crate::config::paths::Paths;
 use crate::config::secrets;
 use std::io::{BufRead, Write};

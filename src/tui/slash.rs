@@ -1,5 +1,3 @@
-// src/tui/slash.rs
-
 /// One recognized slash command, already split into its command word and
 /// remaining argument text. `parse_slash_command` is the single place that
 /// knows the full v1 command list (spec section 6); `App`'s `Enter` handler

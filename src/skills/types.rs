@@ -1,5 +1,3 @@
-// src/skills/types.rs
-
 use std::path::PathBuf;
 
 /// Which git-hosting provider a skill source spec refers to. Determined by

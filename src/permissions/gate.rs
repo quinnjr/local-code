@@ -1,5 +1,3 @@
-// src/permissions/gate.rs
-
 use std::collections::HashSet;
 use std::sync::Arc;
 

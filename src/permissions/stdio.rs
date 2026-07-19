@@ -1,5 +1,3 @@
-// src/permissions/stdio.rs
-
 use std::future::Future;
 use std::pin::Pin;
 

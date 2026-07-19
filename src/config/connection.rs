@@ -89,6 +89,12 @@ pub enum ConnectionsError {
         #[source]
         source: toml::de::Error,
     },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Loads and merges connections.toml from `user_config_dir` and `project_config_dir`.
@@ -131,7 +137,7 @@ fn load_one(path: &Path) -> Result<ConnectionsFile, ConnectionsError> {
 /// since that's the file this CLI writes to (user-level file is hand-edited or
 /// written by `connections add` when the user chooses to save it there).
 pub fn save_connections(dir: &Path, connections: &[Connection]) -> Result<(), ConnectionsError> {
-    fs::create_dir_all(dir).map_err(|source| ConnectionsError::Read {
+    fs::create_dir_all(dir).map_err(|source| ConnectionsError::Write {
         path: dir.to_path_buf(),
         source,
     })?;
@@ -139,7 +145,7 @@ pub fn save_connections(dir: &Path, connections: &[Connection]) -> Result<(), Co
         connections: connections.to_vec(),
     };
     let text = toml::to_string_pretty(&file).expect("Connection serializes without error");
-    fs::write(dir.join("connections.toml"), text).map_err(|source| ConnectionsError::Read {
+    fs::write(dir.join("connections.toml"), text).map_err(|source| ConnectionsError::Write {
         path: dir.to_path_buf(),
         source,
     })

@@ -1,5 +1,3 @@
-// src/tui/mod.rs
-
 pub mod app;
 pub mod components;
 pub mod gated_tool;
@@ -160,7 +158,15 @@ pub async fn run_tui(
         None => select_connection(&connections, connection_name)?,
     };
 
-    let api_key = SecretStore::get_api_key(&connection.name)?;
+    // The keyring read is a blocking Secret Service/DBus round trip; run it
+    // on the blocking pool so a slow or locked keyring backend doesn't stall
+    // the async runtime before the first frame.
+    let api_key = {
+        let connection_name = connection.name.clone();
+        tokio::task::spawn_blocking(move || SecretStore::get_api_key(&connection_name))
+            .await
+            .expect("keyring lookup task panicked")?
+    };
     let model = build_model(&connection, api_key)?;
 
     let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;

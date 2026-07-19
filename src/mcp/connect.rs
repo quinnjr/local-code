@@ -1,5 +1,3 @@
-// src/mcp/connect.rs
-
 use daimon::mcp::{HttpTransport, McpClient, SseTransport, StdioTransport, WebSocketTransport};
 
 use crate::config::mcp_servers::{McpServerConfig, McpTransportConfig};

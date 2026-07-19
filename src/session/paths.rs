@@ -1,5 +1,3 @@
-// src/session/paths.rs
-
 use std::path::{Path, PathBuf};
 
 /// Derives a filesystem-safe, human-recognizable directory name for a

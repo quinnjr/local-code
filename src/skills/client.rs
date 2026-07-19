@@ -1,5 +1,3 @@
-// src/skills/client.rs
-
 use crate::skills::bitbucket::BitbucketClient;
 use crate::skills::github::GithubClient;
 use crate::skills::gitlab::GitlabClient;
@@ -21,6 +19,35 @@ pub enum SkillClient {
     GitHub(GithubClient),
     GitLab(GitlabClient),
     Bitbucket(BitbucketClient),
+}
+
+/// Escapes `/` in a git ref for use inside a URL path segment. Shared by all
+/// three host clients (each previously hand-copied a byte-identical version).
+pub(crate) fn urlencoding_ref(git_ref: &str) -> String {
+    git_ref.replace('/', "%2F")
+}
+
+/// Shared "send, check status, decode JSON" scaffolding for the three host
+/// clients: any non-2xx becomes `SkillHostError::Api` with the body preserved
+/// for diagnostics. Each client supplies its own authenticated
+/// `RequestBuilder` (auth headers are the only genuinely host-specific part
+/// of the HTTP layer). Extracted after review caught the three hand-copied
+/// versions drifting in their error mapping.
+pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    url: &str,
+) -> Result<T, SkillHostError> {
+    let response = request.send().await.map_err(SkillHostError::Request)?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(SkillHostError::Api {
+            status: status.as_u16(),
+            url: url.to_string(),
+            body,
+        });
+    }
+    response.json::<T>().await.map_err(SkillHostError::Request)
 }
 
 impl SkillClient {

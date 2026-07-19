@@ -1,12 +1,15 @@
-// src/tui/workspace/mod.rs
-//
 // The tmux-style root component: mounts every window's sessions at once
 // (inactive windows are collapsed to zero height, never unmounted, so their
 // agents keep streaming and their transcript state survives), routes `C-b`
 // prefix chords via the pure `WorkspaceState` machine, and draws the tab bar.
 
-pub mod state;
-pub mod tab_bar;
+// Crate-internal: the state machine and status line are implementation
+// details of `Workspace`; only `Workspace`/`WorkspaceProps` are public
+// surface (re-exported from `tui`). Narrowed after the branch's API review
+// flagged the fully-pub mutable state-machine fields as inviting external
+// coupling to internal layout state.
+pub(crate) mod state;
+pub(crate) mod tab_bar;
 
 use std::collections::HashMap;
 
@@ -70,6 +73,9 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
     let notice = hooks.use_state(|| Option::<String>::None);
     let streaming_flags = hooks.use_state(HashMap::<u64, bool>::new);
     let permission_flags = hooks.use_state(HashMap::<u64, bool>::new);
+    // `C-b x` on a streaming pane arms this instead of killing; a second
+    // `C-b x` on the same pane confirms. Cleared by any other completed chord.
+    let pending_kill = hooks.use_state(|| Option::<state::SessionId>::None);
 
     let app_handle = hooks.use_app();
     hooks.use_input({
@@ -81,22 +87,53 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
         let permission_flags = permission_flags.clone();
         let template = props.template.clone();
         let app_handle = app_handle.clone();
+        let pending_kill = pending_kill.clone();
         move |ev, ctx| {
-            if ev.code == KeyCode::Char('c')
-                && ev
-                    .modifiers
-                    .contains(ntui::hooks::input::KeyModifiers::CONTROL)
-            {
+            let ctrl = ev
+                .modifiers
+                .contains(ntui::hooks::input::KeyModifiers::CONTROL);
+            if ev.code == KeyCode::Char('c') && ctrl {
                 app_handle.exit();
                 return;
             }
-            let snapshot = workspace.get();
-            let mut state = snapshot.clone();
+            // One clone per keystroke: `workspace.get()` is already owned.
+            // The rollback path below re-fetches instead of keeping a second
+            // eager snapshot that the common `Pass` case would waste.
+            let mut state = workspace.get();
+
+            // `C-b x` on a pane that is mid-turn needs a second confirmation
+            // chord: aborting the stream discards the turn even though tool
+            // side effects it already ran (edits, commands) are on disk.
+            if state.prefix_pending && ev.code == KeyCode::Char('x') {
+                let target = state.focused_session();
+                let busy = streaming_flags.get().get(&target).copied().unwrap_or(false);
+                if busy && pending_kill.get() != Some(target) {
+                    pending_kill.set(Some(target));
+                    notice.set(Some(
+                        "pane is mid-turn — press C-b x again to kill it".to_string(),
+                    ));
+                    state.prefix_pending = false;
+                    input_gate.set(false);
+                    workspace.set(state);
+                    ctx.stop_propagation();
+                    return;
+                }
+            }
+
+            // Was this event the arming `C-b` itself (as opposed to a command
+            // key)? A pending notice — e.g. a session-creation failure or the
+            // kill-confirm prompt — must survive the arming press of the NEXT
+            // chord, or the user can never read it before retrying.
+            let arming = !state.prefix_pending && ev.code == KeyCode::Char('b') && ctrl;
+
             let action = state.on_key(ev.code, ev.modifiers);
             if action == KeyAction::Pass {
                 return;
             }
-            notice.set(None);
+            if !arming {
+                notice.set(None);
+                pending_kill.set(None);
+            }
             match action {
                 KeyAction::Pass => unreachable!("handled above"),
                 KeyAction::Consumed => {}
@@ -104,9 +141,12 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
                     Ok(new_props) => sessions.update(|list| list.push((id, new_props))),
                     Err(err) => {
                         // Roll the pane/window back out — the workspace must
-                        // never render a session it has no props for.
+                        // never render a session it has no props for. The
+                        // pre-key state is still what `workspace` holds (the
+                        // write-back below hasn't happened yet), so re-fetch
+                        // instead of keeping an always-paid snapshot clone.
                         notice.set(Some(format!("couldn't create session: {err}")));
-                        state = snapshot;
+                        state = workspace.get();
                         state.prefix_pending = false;
                     }
                 },

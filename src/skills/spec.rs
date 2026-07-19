@@ -1,5 +1,3 @@
-// src/skills/spec.rs
-
 use crate::skills::types::{Host, SkillHostError, SkillSource};
 
 /// A spec, parsed as far as it can be parsed *synchronously*. Fully resolved

@@ -1,5 +1,3 @@
-// src/tui/rebuild.rs
-
 use std::sync::{Arc, Mutex};
 
 use daimon::agent::Agent;
@@ -44,7 +42,7 @@ pub fn rebuild_agent(
     mcp_tools: Vec<NamespacedMcpTool>,
     skills: Vec<Skill>,
     pending_permission: ntui::State<Option<PermissionRequest>>,
-) -> (Arc<Agent>, Arc<PermissionGate>, ResponderHandle) {
+) -> daimon::Result<(Arc<Agent>, Arc<PermissionGate>, ResponderHandle)> {
     let prompter = NtuiPermissionPrompter::new(pending_permission);
     let responder = prompter.responder_handle();
     let gate = Arc::new(PermissionGate::new(
@@ -52,18 +50,19 @@ pub fn rebuild_agent(
         permission_settings,
         Arc::new(prompter),
     ));
-    let agent = Arc::new(
-        build_streaming_agent_with_history(
-            model,
-            gate.clone(),
-            initial_messages,
-            extra_system_context,
-            mcp_tools,
-            skills,
-        )
-        .expect("agent construction should not fail"),
-    );
-    (agent, gate, responder)
+    // Construction only fails on builder-rejected config (e.g. a duplicate
+    // tool name from an MCP server). Propagated rather than `.expect`ed so
+    // the `/model`/`/resume`/`/mcp add` switch sites can keep the old agent
+    // and surface a notice instead of panicking the whole TUI.
+    let agent = Arc::new(build_streaming_agent_with_history(
+        model,
+        gate.clone(),
+        initial_messages,
+        extra_system_context,
+        mcp_tools,
+        skills,
+    )?);
+    Ok((agent, gate, responder))
 }
 
 /// Reloads `old_agent`'s conversation history and calls [`rebuild_agent`]
@@ -86,7 +85,7 @@ pub async fn rebuild_agent_from_history(
     mcp_tools: Vec<NamespacedMcpTool>,
     skills: Vec<Skill>,
     pending_permission: ntui::State<Option<PermissionRequest>>,
-) -> (Arc<Agent>, Arc<PermissionGate>, ResponderHandle) {
+) -> daimon::Result<(Arc<Agent>, Arc<PermissionGate>, ResponderHandle)> {
     let history = old_agent
         .memory()
         .get_messages_erased()
@@ -148,7 +147,8 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     pending,
-                );
+                )
+                .expect("static test tool set never fails to build");
                 tokio::spawn(async move {
                     let response = agent.prompt("hi").await.unwrap();
                     result_text.set(response.text().to_string());

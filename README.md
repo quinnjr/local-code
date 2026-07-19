@@ -35,7 +35,9 @@ Ollama. No cloud calls, no API keys required.
 - MCP (Model Context Protocol) client support (stdio/HTTP/SSE/WebSocket)
   alongside built-in file/shell tools, configurable via `/mcp add`'s in-TUI
   wizard or by hand-editing `mcp.toml` (see below)
-- Flat-file cross-session memory (`memory search` / `memory core` / `memory add`)
+- Flat-file cross-session memory (`memory search` / `memory core` /
+  `memory core add` / `memory add`) with automatic daily rollover and
+  recent/archive rollup
 - GitHub-backed skills (`skills install` / `skills list` / `skills remove` / `skills update`)
 - Headless mode (`local-code -p "..."`) for scripted, non-interactive use
 

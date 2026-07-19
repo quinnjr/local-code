@@ -83,9 +83,20 @@ pub enum ConnectionsAction {
 pub enum MemoryAction {
     /// Keyword-search the buffer, daily files, recent.md, and archive.md
     Search { query: String },
-    /// Print the always-loaded core-memories.md file in full
-    Core,
-    /// Append a manual entry to the short-term buffer
+    /// Print the always-loaded core-memories.md file in full, or `core add
+    /// <text>` to append a permanent entry to it
+    Core {
+        #[command(subcommand)]
+        action: Option<CoreAction>,
+    },
+    /// Append a manual entry to the short-term buffer (also runs the daily
+    /// rollover/rollup maintenance pass)
+    Add { text: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CoreAction {
+    /// Append a permanent entry to core-memories.md
     Add { text: String },
 }
 
@@ -205,8 +216,13 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             MemoryAction::Search { query } => {
                 memory::search_command(&paths, &query, stdout())?;
             }
-            MemoryAction::Core => {
+            MemoryAction::Core { action: None } => {
                 memory::core_command(&paths, stdout())?;
+            }
+            MemoryAction::Core {
+                action: Some(CoreAction::Add { text }),
+            } => {
+                memory::core_add_command(&paths, &text, stdout())?;
             }
             MemoryAction::Add { text } => {
                 memory::add_command(&paths, &text, stdout())?;

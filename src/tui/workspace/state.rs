@@ -1,5 +1,3 @@
-// src/tui/workspace/state.rs
-//
 // Pure state machine for the tmux-style workspace: windows (fullscreen tabs)
 // each holding a row or column of panes, every pane an agent session. Follows
 // the `mcp_wizard.rs` pattern — no side effects, no ntui state, fully
@@ -134,7 +132,10 @@ impl WorkspaceState {
     }
 
     /// Every live session id across all windows, in window order then pane
-    /// order — the component renders (mounts) exactly this set.
+    /// order. Test-only observability helper (the component iterates windows
+    /// directly when rendering); `#[cfg(test)]` keeps it honest now that this
+    /// module is crate-private and dead-code analysis applies.
+    #[cfg(test)]
     pub fn all_sessions(&self) -> Vec<SessionId> {
         self.windows.iter().flat_map(|w| w.panes.clone()).collect()
     }
