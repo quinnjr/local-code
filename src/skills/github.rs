@@ -293,7 +293,9 @@ impl GithubClient {
                     .map_err(SkillHostError::Request)?;
                 let status = response.status();
                 if !status.is_success() {
-                    let body = response.text().await.unwrap_or_default();
+                    let body = crate::skills::client::sanitize_body(
+                        response.text().await.unwrap_or_default(),
+                    );
                     return Err(SkillHostError::Api {
                         status: status.as_u16(),
                         url: download_url,
@@ -323,8 +325,6 @@ impl GithubClient {
     }
 }
 
-/// GitHub ref names can contain `/` (e.g. `feature/x`); percent-encode just
-/// that character so the commits-endpoint path segment stays well-formed.
 #[cfg(test)]
 mod github_client_tests {
     use super::*;

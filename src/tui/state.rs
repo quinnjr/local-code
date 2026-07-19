@@ -152,6 +152,55 @@ mod tests {
         assert!(find_tool_call_mut(&mut entries, "missing").is_none());
     }
 
+    /// The load-bearing Arc invariant: while streaming, a previous render
+    /// holds clones of every entry (refcount ≥ 2), so a mutation must
+    /// clone-on-write — landing in the live Vec while leaving the snapshot
+    /// the in-flight frame rendered untouched.
+    #[test]
+    fn find_tool_call_mut_under_a_shared_arc_writes_the_vec_not_the_snapshot() {
+        let mut entries = vec![sample_call("a"), sample_call("b")];
+        let snapshot = entries.clone(); // what a prior render would hold
+
+        find_tool_call_mut(&mut entries, "b")
+            .expect("call b exists")
+            .arguments_json = "{\"x\":1}".into();
+
+        let TranscriptEntry::ToolCall(live) = &*entries[1] else {
+            panic!()
+        };
+        let TranscriptEntry::ToolCall(snap) = &*snapshot[1] else {
+            panic!()
+        };
+        assert_eq!(
+            live.arguments_json, "{\"x\":1}",
+            "mutation lands in the vec"
+        );
+        assert_eq!(snap.arguments_json, "", "the shared snapshot is untouched");
+        assert!(
+            !Arc::ptr_eq(&entries[1], &snapshot[1]),
+            "the mutated entry was cloned-on-write"
+        );
+        assert!(
+            Arc::ptr_eq(&entries[0], &snapshot[0]),
+            "unmutated siblings still share their allocation"
+        );
+    }
+
+    #[test]
+    fn toggle_under_a_shared_arc_writes_the_vec_not_the_snapshot() {
+        let mut entries = vec![sample_call("a")];
+        let snapshot = entries.clone();
+        toggle_last_tool_call_expanded(&mut entries);
+        let TranscriptEntry::ToolCall(live) = &*entries[0] else {
+            panic!()
+        };
+        let TranscriptEntry::ToolCall(snap) = &*snapshot[0] else {
+            panic!()
+        };
+        assert!(!live.expanded);
+        assert!(snap.expanded, "snapshot keeps the pre-toggle state");
+    }
+
     #[test]
     fn toggle_last_tool_call_expanded_flips_only_the_most_recent_call() {
         let mut entries = vec![sample_call("a"), sample_call("b")];

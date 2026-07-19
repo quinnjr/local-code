@@ -40,7 +40,7 @@ pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
     let response = request.send().await.map_err(SkillHostError::Request)?;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = sanitize_body(response.text().await.unwrap_or_default());
         return Err(SkillHostError::Api {
             status: status.as_u16(),
             url: url.to_string(),
@@ -48,6 +48,24 @@ pub(crate) async fn get_json<T: serde::de::DeserializeOwned>(
         });
     }
     response.json::<T>().await.map_err(SkillHostError::Request)
+}
+
+/// Strips control bytes (keeping `\n`/`\t`) from an untrusted HTTP response
+/// body before it is embedded in a user-facing error: `SkillHostError::Api`'s
+/// Display prints the body to the terminal, and a malicious or MITM'd host
+/// could otherwise smuggle ANSI escape sequences into that output (cursor
+/// moves, line rewrites, fake banners).
+pub(crate) fn sanitize_body(body: String) -> String {
+    if body
+        .chars()
+        .any(|c| c.is_control() && c != '\n' && c != '\t')
+    {
+        body.chars()
+            .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+            .collect()
+    } else {
+        body
+    }
 }
 
 impl SkillClient {

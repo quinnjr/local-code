@@ -66,9 +66,14 @@ pub enum Direction {
 pub enum KeyAction {
     /// Not the workspace's key — let it fall through to the focused session.
     Pass,
-    /// Handled internally (window switch, focus move, prefix armed/canceled);
+    /// Handled internally (window switch, focus move, prefix armed);
     /// nothing further for the component to do beyond re-rendering.
     Consumed,
+    /// An armed prefix was canceled (`Esc` or an unbound key) without any
+    /// command running. Distinct from `Consumed` so the component can keep a
+    /// pending notice readable — an accidental `C-b` + `Esc` must not eat
+    /// the message the user was about to read.
+    PrefixCanceled,
     /// A split or new window created this session; the component must build
     /// its `AppProps` (new session file etc.) before the next render.
     SessionCreated(SessionId),
@@ -262,7 +267,7 @@ impl WorkspaceState {
                 KeyAction::Consumed
             }
             // Esc — and any unbound key, matching tmux — cancels the prefix.
-            _ => KeyAction::Consumed,
+            _ => KeyAction::PrefixCanceled,
         }
     }
 }
@@ -310,7 +315,7 @@ mod tests {
         let (mut state, _) = WorkspaceState::new();
         assert_eq!(
             prefixed(&mut state, KeyCode::Char('z')),
-            KeyAction::Consumed
+            KeyAction::PrefixCanceled
         );
         assert!(!state.prefix_pending);
         assert_eq!(state.windows.len(), 1);
@@ -319,7 +324,10 @@ mod tests {
     #[test]
     fn esc_cancels_prefix() {
         let (mut state, _) = WorkspaceState::new();
-        assert_eq!(prefixed(&mut state, KeyCode::Esc), KeyAction::Consumed);
+        assert_eq!(
+            prefixed(&mut state, KeyCode::Esc),
+            KeyAction::PrefixCanceled
+        );
         assert!(!state.prefix_pending);
     }
 
@@ -536,7 +544,7 @@ mod tests {
         // A second C-b while armed is just an unbound key: cancels.
         assert_eq!(
             state.on_key(KeyCode::Char('b'), KeyModifiers::CONTROL),
-            KeyAction::Consumed
+            KeyAction::PrefixCanceled
         );
         assert!(!state.prefix_pending);
     }

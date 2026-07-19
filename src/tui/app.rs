@@ -238,7 +238,7 @@ enum PendingMenu {
     McpAddWizard(crate::tui::mcp_wizard::McpAddWizard),
     /// The wizard finished (`Advance::Finalize`) and its `connect_one` +
     /// save + agent-rebuild is running in a spawned task, bounded by its own
-    /// 30s timeout. `Esc` here frees the input loop immediately without
+    /// connect timeout. `Esc` here frees the input loop immediately without
     /// waiting for the timeout (the background task keeps running and posts
     /// its own notice when it finishes either way). All input is otherwise
     /// blocked (like `streaming`) until the task resolves and resets this to
@@ -847,14 +847,19 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                     // wizard's config is raw user input, never passed
                                     // through interpolation the way a disk-loaded config is.
                                     let resolved_config = crate::config::mcp_servers::resolve_server_refs(config.clone());
-                                    let connect_result = tokio::time::timeout(
-                                        std::time::Duration::from_secs(30),
-                                        crate::mcp::connect::connect_one(&resolved_config),
-                                    )
-                                    .await;
+                                    // No outer timeout wrapper: `connect_one`
+                                    // self-bounds every transport (and the
+                                    // tools/list handshake) at its own
+                                    // CONNECT_TIMEOUT, surfacing elapsed time
+                                    // as `McpConnectError::Timeout` through
+                                    // the normal Err arm below. (An older 30s
+                                    // outer wrapper became dead code once the
+                                    // inner bound landed.)
+                                    let connect_result =
+                                        crate::mcp::connect::connect_one(&resolved_config).await;
 
                                     match connect_result {
-                                        Ok(Ok(new_tools)) => {
+                                        Ok(new_tools) => {
                                             let tool_count = new_tools.len();
                                             let mut tools = mcp_tools_state_for_task.get();
                                             // Drop any tools from a prior connection of a
@@ -912,31 +917,19 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                                 }
                                             }
                                         }
-                                        Ok(Err(e)) => {
+                                        Err(e) => {
                                             let retry_note = if saved {
                                                 "It will be retried on next launch.".to_string()
                                             } else {
                                                 "It was NOT saved, so it won't be retried — run /mcp add again.".to_string()
                                             };
+                                            // `e` covers both connect failures and
+                                            // `McpConnectError::Timeout` (whose Display names
+                                            // the actual bound), so no separate timeout arm.
                                             transcript_for_task.update(|entries| {
                                                 entries.push_entry(TranscriptEntry::SystemNotice {
                                                     text: format!(
                                                         "MCP server '{}' failed to connect now: {e}. {retry_note}",
-                                                        config.name
-                                                    ),
-                                                });
-                                            });
-                                        }
-                                        Err(_elapsed) => {
-                                            let retry_note = if saved {
-                                                "It will be retried on next launch.".to_string()
-                                            } else {
-                                                "It was NOT saved, so it won't be retried — run /mcp add again.".to_string()
-                                            };
-                                            transcript_for_task.update(|entries| {
-                                                entries.push_entry(TranscriptEntry::SystemNotice {
-                                                    text: format!(
-                                                        "MCP server '{}' timed out while connecting (30s). {retry_note}",
                                                         config.name
                                                     ),
                                                 });
@@ -953,7 +946,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 PendingMenu::McpAddConnecting => {
                     if ev.code == KeyCode::Esc {
                         // The spawned connect+save+rebuild task keeps running in the
-                        // background (it's bounded by its own 30s timeout above and
+                        // background (it's bounded by connect_one's own timeout and
                         // always finishes by resetting pending_menu to None again) —
                         // this just frees up the input loop immediately instead of
                         // making the user wait out the full timeout.
@@ -2995,7 +2988,25 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             t.tick().await.unwrap();
         }
-        assert!(t.frame_text().contains("compacted"), "{}", t.frame_text());
+        let text = t.frame_text();
+        assert!(text.contains("compacted"), "{text}");
+        // The last RETAIN_RECENT (10) display entries survive — with 2 entries
+        // per turn that is the last ~5 turns — while early turns are gone and
+        // the summary notice sits ABOVE the retained tail, not appended.
+        assert!(
+            text.contains("turn 24"),
+            "recent turns must survive: {text}"
+        );
+        assert!(
+            !text.contains("turn 0\n") && !text.contains("turn 1\n"),
+            "old turns must be compacted away: {text}"
+        );
+        let notice_at = text.find("compacted").expect("asserted above");
+        let recent_at = text.find("turn 24").expect("asserted above");
+        assert!(
+            notice_at < recent_at,
+            "the summary notice must precede the retained turns: {text}"
+        );
         let _ = props; // props is cloned above only to keep it available for potential future assertions
     }
 

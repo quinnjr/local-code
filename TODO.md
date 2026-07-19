@@ -39,7 +39,10 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    the same second would otherwise collide) and because pane creation surfaces disk errors
    immediately. The cost is that `/resume` reads and JSON-parses each empty file just to skip it.
    A byte-length pre-filter was rejected as fragile (empty-file size varies with connection/model
-   name lengths). Revisit only if a resume listing ever gets slow.
+   name lengths). The write side of the same loan: pane creation performs that small session-file
+   write synchronously inside the workspace's key handler (sub-millisecond on a local FS; would
+   stall the render thread on a slow/networked mount). Revisit only if a resume listing ever gets
+   slow or pane creation is ever observed to hitch.
 
 9. **Workspace panes have one split axis per window and no resizing.** A window's first split
    (`C-b %` or `C-b "`) fixes its layout axis; later splits extend along that axis (the other

@@ -234,6 +234,20 @@ default_model = "m2"
     }
 
     #[test]
+    fn save_connections_reports_a_write_error_when_the_target_is_unwritable() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the config DIRECTORY should be: create_dir_all fails.
+        let blocking_file = dir.path().join("not-a-dir");
+        std::fs::write(&blocking_file, "x").unwrap();
+        let target = blocking_file.join("nested");
+        let err = save_connections(&target, &[]).unwrap_err();
+        assert!(
+            matches!(err, ConnectionsError::Write { .. }),
+            "a save failure must be labeled Write, not Read: {err}"
+        );
+    }
+
+    #[test]
     fn save_then_load_round_trips() {
         let dir = tempdir().unwrap();
         let conn = Connection {

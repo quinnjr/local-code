@@ -161,6 +161,60 @@ mod tests {
         }
     }
 
+    /// Forces the one realistic construction failure — two MCP tools whose
+    /// namespaced names collide — and pins that `rebuild_agent` returns `Err`
+    /// instead of panicking (the call sites' keep-old-agent recovery depends
+    /// on this being an `Err`, not an `.expect`).
+    #[derive(Clone, Default)]
+    struct DupToolProps {
+        saw_err: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+    impl PartialEq for DupToolProps {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+
+    #[component]
+    fn DupToolHarness(props: &DupToolProps, hooks: &mut ntui::Hooks) -> ntui::Element {
+        let pending = hooks.use_state(|| Option::<PermissionRequest>::None);
+        hooks.use_effect((), {
+            let saw_err = props.saw_err.clone();
+            let pending = pending.clone();
+            move || {
+                use crate::mcp::tool::{NamespacedMcpTool, test_support::bridge_named};
+                let model: SharedModel = Arc::new(EchoModel);
+                let result = rebuild_agent(
+                    model,
+                    PermissionTier::FullAuto,
+                    PermissionSettings::default(),
+                    Vec::new(),
+                    "",
+                    vec![
+                        NamespacedMcpTool::new("srv", bridge_named("do_thing")),
+                        NamespacedMcpTool::new("srv", bridge_named("do_thing")),
+                    ],
+                    Vec::new(),
+                    pending,
+                );
+                *saw_err.lock().unwrap() = Some(result.is_err());
+            }
+        });
+        element! { View {} }
+    }
+
+    #[tokio::test]
+    async fn rebuild_agent_propagates_a_duplicate_tool_name_failure() {
+        let props = DupToolProps::default();
+        let saw_err = props.saw_err.clone();
+        let _t = TestTerminal::new(10, 1, Element::component::<DupToolHarness>(props)).unwrap();
+        assert_eq!(
+            *saw_err.lock().unwrap(),
+            Some(true),
+            "duplicate namespaced tool names must surface as Err, not a panic"
+        );
+    }
+
     #[tokio::test]
     async fn rebuild_agent_produces_a_working_agent_seeded_with_history() {
         let mut t = TestTerminal::new(60, 1, Element::component::<Harness>(HarnessProps)).unwrap();

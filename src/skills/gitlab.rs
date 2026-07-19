@@ -129,7 +129,8 @@ impl GitlabClient {
             let response = self.request(&url).send().await?;
             let status = response.status();
             if !status.is_success() {
-                let body = response.text().await.unwrap_or_default();
+                let body =
+                    crate::skills::client::sanitize_body(response.text().await.unwrap_or_default());
                 return Err(SkillHostError::Api {
                     status: status.as_u16(),
                     url,
@@ -169,7 +170,9 @@ impl GitlabClient {
                     let response = self.request(&raw_url).send().await?;
                     let status = response.status();
                     if !status.is_success() {
-                        let body = response.text().await.unwrap_or_default();
+                        let body = crate::skills::client::sanitize_body(
+                            response.text().await.unwrap_or_default(),
+                        );
                         return Err(SkillHostError::Api {
                             status: status.as_u16(),
                             url: raw_url,
@@ -229,7 +232,8 @@ impl GitlabClient {
             // previously be swallowed and misreported as an invalid spec,
             // sending the user to fix a spec that was fine all along.
             if status != reqwest::StatusCode::NOT_FOUND {
-                let body = response.text().await.unwrap_or_default();
+                let body =
+                    crate::skills::client::sanitize_body(response.text().await.unwrap_or_default());
                 return Err(SkillHostError::Api {
                     status: status.as_u16(),
                     url,

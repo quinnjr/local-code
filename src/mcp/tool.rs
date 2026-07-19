@@ -47,6 +47,59 @@ impl Tool for NamespacedMcpTool {
     }
 }
 
+/// Test-only bridge factory shared with sibling modules' tests (e.g.
+/// `tui::rebuild`'s duplicate-tool-name failure test): a minimal in-process
+/// `McpTransport` that never answers (none of its consumers execute the
+/// tool), wrapped in a real `McpToolBridge` carrying the given tool name.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use daimon::mcp::protocol::{JsonRpcNotification, JsonRpcResponse, McpToolInfo};
+    use daimon::mcp::{McpToolBridge, McpTransport};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    struct InertTransport;
+
+    impl McpTransport for InertTransport {
+        fn request<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<serde_json::Value>,
+        ) -> Pin<Box<dyn Future<Output = daimon::Result<JsonRpcResponse>> + Send + 'a>> {
+            Box::pin(async {
+                Ok(serde_json::from_value(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": { "content": [], "isError": false }
+                }))
+                .unwrap())
+            })
+        }
+
+        fn notify<'a>(
+            &'a self,
+            _notification: &'a JsonRpcNotification,
+        ) -> Pin<Box<dyn Future<Output = daimon::Result<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = daimon::Result<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    pub(crate) fn bridge_named(tool_name: &str) -> McpToolBridge {
+        let transport: Arc<dyn McpTransport> = Arc::new(InertTransport);
+        let info = McpToolInfo {
+            name: tool_name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        McpToolBridge::new(transport, info)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

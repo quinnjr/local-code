@@ -166,4 +166,19 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].line_number, 2);
     }
+
+    #[test]
+    fn search_treats_regex_metacharacters_as_literals() {
+        let dir = tempdir().unwrap();
+        let memory_dir = dir.path().join("memory");
+        write(&memory_dir, "recent.md", "config: a.b\nother: axb\n");
+        let hits = search(&memory_dir, "a.b").unwrap();
+        assert_eq!(hits.len(), 1, "the dot must not match 'axb': {hits:?}");
+        assert!(hits[0].line.contains("a.b"));
+        let paren_hits = search(&memory_dir, "(config").unwrap();
+        assert!(
+            paren_hits.is_empty(),
+            "an unbalanced paren query must not panic or match"
+        );
+    }
 }

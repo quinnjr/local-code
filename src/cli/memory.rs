@@ -55,11 +55,26 @@ fn add_command_at<W: Write>(
     mut out: W,
 ) -> anyhow::Result<()> {
     let dir = memory_dir(paths);
-    if maybe_rollover(&dir, now)? {
-        rollup_and_archive(&dir, now.date_naive())?;
-    }
+    // Maintenance is best-effort: its failure must never cost the entry the
+    // user actually asked to record. A failed rollover leaves the entry in a
+    // stale-dated buffer (the pre-wiring status quo); a failed rollup leaves
+    // daily files unarchived until the next day boundary. Both degrade, the
+    // append below still runs, and the warning names what happened.
+    let maintenance_error = match maybe_rollover(&dir, now) {
+        Ok(true) => rollup_and_archive(&dir, now.date_naive())
+            .err()
+            .map(|e| e.to_string()),
+        Ok(false) => None,
+        Err(e) => Some(e.to_string()),
+    };
     append_buffer_entry(&dir, now, text)?;
     writeln!(out, "Recorded memory entry.")?;
+    if let Some(e) = maintenance_error {
+        writeln!(
+            out,
+            "warning: memory maintenance failed (the entry was still recorded): {e}"
+        )?;
+    }
     Ok(())
 }
 
@@ -144,6 +159,55 @@ mod tests {
         let archive = std::fs::read_to_string(&mp.archive).unwrap();
         assert!(archive.contains("# 2026-06-01"));
         assert!(archive.contains("Ancient fact."));
+    }
+
+    #[test]
+    fn same_day_add_does_not_roll_up() {
+        use crate::memory::MemoryPaths;
+        let dir = tempdir().unwrap();
+        let paths = test_paths(dir.path());
+
+        let morning = Utc.with_ymd_and_hms(2026, 7, 11, 9, 0, 0).unwrap();
+        let evening = Utc.with_ymd_and_hms(2026, 7, 11, 21, 0, 0).unwrap();
+        add_command_at(&paths, morning, "First.", &mut Vec::new()).unwrap();
+        add_command_at(&paths, evening, "Second.", &mut Vec::new()).unwrap();
+
+        let mp = MemoryPaths::new(&memory_dir(&paths));
+        assert!(!mp.recent.exists(), "no rollup on a same-day add");
+        assert!(!mp.archive.exists());
+        let buffer = std::fs::read_to_string(&mp.buffer).unwrap();
+        assert_eq!(buffer.matches("<!-- buffer-date:").count(), 1);
+        assert!(buffer.contains("First.") && buffer.contains("Second."));
+    }
+
+    #[test]
+    fn maintenance_failure_still_records_the_entry_and_warns() {
+        use crate::memory::MemoryPaths;
+        let dir = tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let memory = memory_dir(&paths);
+
+        // Stale entry from long ago, so the next add triggers rollover+rollup...
+        let long_ago = Utc.with_ymd_and_hms(2026, 6, 1, 9, 0, 0).unwrap();
+        add_command_at(&paths, long_ago, "Old.", &mut Vec::new()).unwrap();
+        // ...but archive.md is a DIRECTORY, so the archive append fails.
+        std::fs::create_dir_all(memory.join("archive.md")).unwrap();
+
+        let today = Utc.with_ymd_and_hms(2026, 7, 11, 9, 0, 0).unwrap();
+        let mut out = Vec::new();
+        add_command_at(&paths, today, "New fact.", &mut out).unwrap();
+
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("Recorded memory entry."));
+        assert!(
+            printed.contains("memory maintenance failed"),
+            "the maintenance failure must be surfaced: {printed}"
+        );
+        let buffer = std::fs::read_to_string(MemoryPaths::new(&memory).buffer).unwrap();
+        assert!(
+            buffer.contains("New fact."),
+            "the user's entry must never be lost to a maintenance failure: {buffer}"
+        );
     }
 
     #[test]

@@ -183,7 +183,9 @@ impl BitbucketClient {
                     let response = self.request(&entry.links.self_link.href).send().await?;
                     let status = response.status();
                     if !status.is_success() {
-                        let body = response.text().await.unwrap_or_default();
+                        let body = crate::skills::client::sanitize_body(
+                            response.text().await.unwrap_or_default(),
+                        );
                         return Err(SkillHostError::Api {
                             status: status.as_u16(),
                             url: entry.links.self_link.href.clone(),

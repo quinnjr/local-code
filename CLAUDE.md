@@ -130,7 +130,7 @@ cargo test --test live_ollama -- --ignored --nocapture
   - `discovery.rs`/`frontmatter.rs`/`agent/skill_tool.rs` operate purely on already-downloaded
     local files and know nothing about hosts — everything upstream of "skill is on disk" is
     host-agnostic by design.
-- `memory/` — flat-file, cross-session memory (`memory search`/`memory core`/`memory add`):
+- `memory/` — flat-file, cross-session memory (`memory search`/`memory core`/`memory core add`/`memory add`):
   `buffer.rs` (short-term), `rollup.rs` (daily/recent/archive rollup), `search.rs` (keyword search
   across all of it).
 - `session/` — session persistence (`store.rs` load/save, `types.rs::SessionFile`); every TUI turn

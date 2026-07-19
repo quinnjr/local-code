@@ -12,7 +12,7 @@ use crate::permissions::gate::{CheckOutcome, PermissionGate};
 /// `daimon-0.16.0/src/agent/runner.rs`) makes permission enforcement work
 /// identically no matter which of the two the caller uses. This is the single
 /// enforcement mechanism for the whole project: headless mode (this phase's
-/// `build_agent`/`register_all_tools`), the TUI (a later phase's `build_streaming_agent`),
+/// `build_agent`/`register_all_tools`), the TUI (the TUI's `build_streaming_agent_with_history`),
 /// and MCP tools (a later phase's `NamespacedMcpTool`, wrapped exactly like a built-in)
 /// all wrap every tool in `GatedTool` before registering it.
 pub struct GatedTool<T> {

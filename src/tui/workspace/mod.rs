@@ -62,6 +62,12 @@ fn new_session_props(template: &AppProps) -> Result<AppProps, String> {
     })
 }
 
+/// Shown when `C-b x` targets a pane with a turn in flight. The prose names
+/// the confirming chord, so the constant lives beside the handler that
+/// implements it — if the kill binding is ever remapped, both change here
+/// (and the test asserting this string fails until they agree).
+const KILL_CONFIRM_NOTICE: &str = "pane is mid-turn — press C-b x again to kill it";
+
 #[component]
 pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
     let workspace = hooks.use_state(|| WorkspaceState::new().0);
@@ -109,9 +115,7 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
                 let busy = streaming_flags.get().get(&target).copied().unwrap_or(false);
                 if busy && pending_kill.get() != Some(target) {
                     pending_kill.set(Some(target));
-                    notice.set(Some(
-                        "pane is mid-turn — press C-b x again to kill it".to_string(),
-                    ));
+                    notice.set(Some(KILL_CONFIRM_NOTICE.to_string()));
                     state.prefix_pending = false;
                     input_gate.set(false);
                     workspace.set(state);
@@ -130,13 +134,18 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
             if action == KeyAction::Pass {
                 return;
             }
-            if !arming {
+            // A pending notice (session-creation failure, kill-confirm
+            // prompt) is cleared only when a chord COMPLETES a command:
+            // neither the arming `C-b` (the notice must survive into the
+            // user's retry) nor a cancel (`Esc` — an accidental arm must not
+            // eat the message) may clear it.
+            if !arming && action != KeyAction::PrefixCanceled {
                 notice.set(None);
                 pending_kill.set(None);
             }
             match action {
                 KeyAction::Pass => unreachable!("handled above"),
-                KeyAction::Consumed => {}
+                KeyAction::Consumed | KeyAction::PrefixCanceled => {}
                 KeyAction::SessionCreated(id) => match new_session_props(&template) {
                     Ok(new_props) => sessions.update(|list| list.push((id, new_props))),
                     Err(err) => {
@@ -613,6 +622,117 @@ mod tests {
         assert!(
             text.contains("0:agent*") && !text.contains("1:agent"),
             "the failed window must be rolled back: {text}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn c_b_x_on_a_busy_pane_warns_then_a_second_x_kills() {
+        let dir = tempfile::tempdir().unwrap();
+        let (model, events) = ChannelModel::new();
+        let mut t = TestTerminal::new(
+            120,
+            30,
+            Element::component::<Workspace>(props_with_model(dir.path(), Arc::new(model))),
+        )
+        .unwrap();
+        // Open a second window so killing the busy pane doesn't exit the app.
+        chord(&mut t, KeyCode::Char('c')).await;
+        chord(&mut t, KeyCode::Char('p')).await; // back to window 0
+        for c in "go".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.send_key(KeyCode::Enter).unwrap();
+        t.tick().await.unwrap();
+        t.tick().await.unwrap(); // turn is now streaming (channel held open)
+
+        chord(&mut t, KeyCode::Char('x')).await;
+        let text = t.frame_text();
+        assert!(
+            text.contains(KILL_CONFIRM_NOTICE),
+            "first C-b x on a busy pane must warn, not kill: {text}"
+        );
+        assert!(
+            text.contains("0:agent"),
+            "the busy pane must still be alive: {text}"
+        );
+
+        chord(&mut t, KeyCode::Char('x')).await;
+        let text = t.frame_text();
+        assert!(
+            !text.contains("1:agent"),
+            "the confirming second C-b x must kill the pane (one window left): {text}"
+        );
+        drop(events);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn another_chord_clears_the_pending_kill_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (model, events) = ChannelModel::new();
+        let mut t = TestTerminal::new(
+            120,
+            30,
+            Element::component::<Workspace>(props_with_model(dir.path(), Arc::new(model))),
+        )
+        .unwrap();
+        chord(&mut t, KeyCode::Char('c')).await;
+        chord(&mut t, KeyCode::Char('p')).await;
+        for c in "go".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.send_key(KeyCode::Enter).unwrap();
+        t.tick().await.unwrap();
+        t.tick().await.unwrap();
+
+        chord(&mut t, KeyCode::Char('x')).await; // arm the kill confirm
+        chord(&mut t, KeyCode::Char('n')).await; // different chord: clears it
+        chord(&mut t, KeyCode::Char('p')).await; // back to the busy window
+        chord(&mut t, KeyCode::Char('x')).await; // must WARN again, not kill
+        let text = t.frame_text();
+        assert!(
+            text.contains(KILL_CONFIRM_NOTICE),
+            "pending kill must reset after an unrelated chord: {text}"
+        );
+        assert!(text.contains("1:agent"), "no pane was killed: {text}");
+        drop(events);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_notice_survives_the_arming_press_of_the_next_chord() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join("not-a-dir");
+        std::fs::write(&state_file, "x").unwrap();
+        let mut props = props_in(dir.path());
+        props.template.user_state_dir = state_file;
+
+        let mut t = TestTerminal::new(120, 30, Element::component::<Workspace>(props)).unwrap();
+        chord(&mut t, KeyCode::Char('c')).await; // fails -> notice
+        assert!(t.frame_text().contains("couldn't create session"));
+
+        // An accidental arm + cancel must not eat the message: while armed
+        // the tab bar shows the `C-b …` badge instead, but after Esc the
+        // notice is back on screen.
+        prefix(&mut t);
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("C-b …"),
+            "armed badge shows while mid-chord: {}",
+            t.frame_text()
+        );
+        t.send_key(KeyCode::Esc).unwrap();
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("couldn't create session"),
+            "an armed-then-canceled chord must not clear the notice: {}",
+            t.frame_text()
+        );
+
+        // A chord that completes a real command clears it.
+        chord(&mut t, KeyCode::Char('n')).await;
+        assert!(
+            !t.frame_text().contains("couldn't create session"),
+            "a completed chord clears the notice: {}",
+            t.frame_text()
         );
     }
 
