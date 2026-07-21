@@ -14,11 +14,12 @@ pub(crate) mod tab_bar;
 use std::collections::HashMap;
 
 use ntui::props::{Dimension, FlexDirection, Overflow};
-use ntui::style::{BorderStyle, Color};
+use ntui::style::BorderStyle;
 use ntui::{Element, KeyCode, component, element};
 
 use crate::session::store::create_fresh_session;
 use crate::tui::app::{App, AppProps};
+use crate::tui::theme::local_code_theme;
 use state::{KeyAction, SessionId, SplitDir, WorkspaceState};
 use tab_bar::{TabBar, TabBarProps, TabInfo};
 
@@ -208,9 +209,9 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
                 BorderStyle::None
             };
             let border_color = if split && app_props.focused {
-                Color::Cyan
+                local_code_theme().accent
             } else {
-                Color::DarkGrey
+                local_code_theme().border
             };
             pane_els.push(
                 element! {
@@ -272,9 +273,13 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
         .with_key("tab-bar"),
     );
 
+    // The one place the app-wide theme is provided: every pane's `App` (and
+    // every widget below it) resolves `use_theme()` against this context.
     element! {
-        View(flex_direction: FlexDirection::Column, width: Dimension::Percent(100.0), height: Dimension::Percent(100.0), padding: 0) {
-            #(children)
+        ContextProvider(value: local_code_theme()) {
+            View(flex_direction: FlexDirection::Column, width: Dimension::Percent(100.0), height: Dimension::Percent(100.0), padding: 0) {
+                #(children)
+            }
         }
     }
 }
@@ -338,7 +343,8 @@ mod tests {
         .unwrap();
         t.tick().await.unwrap();
         let text = t.frame_text();
-        assert!(text.contains("[local-code] 0:agent*"), "{text}");
+        assert!(text.contains("local-code"), "{text}");
+        assert!(text.contains("0:agent*"), "{text}");
     }
 
     #[tokio::test(start_paused = true)]

@@ -1982,9 +1982,9 @@ dependencies = [
 
 [[package]]
 name = "ntui"
-version = "0.1.2"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8b77f8b3b1c81091bcbd3d96178bb3d45124d3a707f59b8c3159a7ab9b11e7c"
+checksum = "95436cff5211d2de9a87e3d521faeba45501ad1ea7270f0e220ca77244c35185"
 dependencies = [
  "crossterm",
  "futures",

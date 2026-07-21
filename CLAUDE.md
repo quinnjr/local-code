@@ -72,6 +72,11 @@ cargo test --test live_ollama -- --ignored --nocapture
   - `mcp_wizard.rs` is a pure state machine for the `/mcp add` in-TUI stepper (transport selection,
     prompts, `Advance` enum) — kept side-effect-free and unit-testable separately from `app.rs`'s
     wiring of it.
+  - `theme.rs` — the app-wide `ntui::widgets::Theme` (`local_code_theme()`) plus the brand
+    gradient endpoints (`BRAND_FROM`/`BRAND_TO`). Provided once via `ContextProvider` at the
+    `Workspace` root; components with `Hooks` read it via `hooks.use_theme()`, while plain
+    render functions (e.g. `transcript::render_entry`) call `local_code_theme()` directly —
+    don't hardcode `Color::*` values in TUI components, take them from the theme.
   - `workspace/` — tmux-style tabbing: `Workspace` (the actual root component `run_tui` mounts;
     `App` is mounted once per pane under it) keeps every window's sessions mounted at all times
     (inactive windows collapse to a zero-height clipped `View` — never unmount, or their live

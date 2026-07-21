@@ -1,5 +1,5 @@
 use ntui::props::{FlexDirection, JustifyContent};
-use ntui::style::Color;
+use ntui::widgets::{Spinner, SpinnerProps};
 use ntui::{component, element};
 
 use crate::tui::state::UsageSummary;
@@ -16,11 +16,12 @@ pub struct FooterProps {
 /// the spec calls the footer's hint list out explicitly as always-visible UI,
 /// not as a slash-command implementation.
 #[component]
-pub fn Footer(props: &FooterProps, _hooks: &mut ntui::Hooks) -> ntui::Element {
-    let status = if props.streaming {
-        "generating…"
+pub fn Footer(props: &FooterProps, hooks: &mut ntui::Hooks) -> ntui::Element {
+    let theme = hooks.use_theme();
+    let status: ntui::Element = if props.streaming {
+        element! { Spinner(label: "generating…".to_string()) }
     } else {
-        "ready"
+        element! { Text(content: "● ready".to_string(), color: theme.success) }
     };
     let tokens = format!(
         "{} in / {} out",
@@ -28,9 +29,9 @@ pub fn Footer(props: &FooterProps, _hooks: &mut ntui::Hooks) -> ntui::Element {
     );
     element! {
         View(flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, padding: 0) {
-            Text(content: "/model  ctrl+a auto-accept  ctrl+c exit", color: Color::DarkGrey)
-            Text(content: status.to_string(), color: Color::DarkGrey)
-            Text(content: tokens, color: Color::DarkGrey)
+            Text(content: "/model · ctrl+a auto-accept · ctrl+c exit", color: theme.muted)
+            #(vec![status])
+            Text(content: tokens, color: theme.muted)
         }
     }
 }
@@ -51,20 +52,22 @@ mod tests {
             },
             streaming: false,
         };
-        let t = TestTerminal::new(60, 1, Element::component::<Footer>(props)).unwrap();
+        let t = TestTerminal::new(80, 1, Element::component::<Footer>(props)).unwrap();
         let text = t.frame_text();
         assert!(text.contains("/model"));
-        assert!(text.contains("ready"));
+        assert!(text.contains("● ready"));
         assert!(text.contains("120 in / 45 out"));
     }
 
     #[tokio::test]
-    async fn shows_generating_status_while_streaming() {
+    async fn shows_spinner_while_streaming() {
         let props = FooterProps {
             usage: UsageSummary::default(),
             streaming: true,
         };
-        let t = TestTerminal::new(60, 1, Element::component::<Footer>(props)).unwrap();
-        assert!(t.frame_text().contains("generating…"));
+        let t = TestTerminal::new(80, 1, Element::component::<Footer>(props)).unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("generating…"));
+        assert!(!text.contains("● ready"));
     }
 }

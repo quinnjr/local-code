@@ -2641,14 +2641,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ctrl_a_cycles_the_permission_tier_label() {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
-        assert!(t.frame_text().contains("[full-auto]"));
+        assert!(t.frame_text().contains(" full-auto "));
         t.send_key_event(ntui::KeyEvent::new(
             KeyCode::Char('a'),
             ntui::hooks::input::KeyModifiers::CONTROL,
         ))
         .unwrap();
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("[ask]"));
+        assert!(t.frame_text().contains(" ask "));
     }
 
     #[tokio::test(start_paused = true)]
@@ -2885,7 +2885,7 @@ mod tests {
 
         t.send_key(KeyCode::Char('1')).unwrap();
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("[ask]"), "{}", t.frame_text());
+        assert!(t.frame_text().contains(" ask "), "{}", t.frame_text());
     }
 
     #[tokio::test(start_paused = true)]

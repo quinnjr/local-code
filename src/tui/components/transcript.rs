@@ -1,6 +1,9 @@
 use ntui::props::{FlexDirection, Overflow};
-use ntui::style::{BorderStyle, Color};
+use ntui::style::Color;
+use ntui::widgets::{Spinner, SpinnerProps};
 use ntui::{Element, KeyCode, component, element};
+
+use crate::tui::theme::{TOOL_ACCENT, local_code_theme};
 
 use std::sync::Arc;
 
@@ -118,10 +121,15 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
         .collect();
 
     if !props.streaming_text.is_empty() {
+        // The in-flight turn gets a live spinner under the growing text so
+        // the transcript itself shows work in progress, not just the footer.
         children.push(
-            render_entry(&TranscriptEntry::AssistantText {
-                text: props.streaming_text.clone(),
-            })
+            element! {
+                View(flex_direction: FlexDirection::Column, padding: 1) {
+                    Text(content: props.streaming_text.clone(), color: Color::Reset)
+                    Spinner()
+                }
+            }
             .with_key("streaming-tail"),
         );
     }
@@ -177,10 +185,13 @@ fn TranscriptEntryView(props: &EntryProps, _hooks: &mut ntui::Hooks) -> Element 
 }
 
 fn render_entry(entry: &TranscriptEntry) -> Element {
+    // Plain function, no `Hooks` — theme tokens come straight from
+    // `local_code_theme()` (see the note on that function).
+    let theme = local_code_theme();
     match entry {
         TranscriptEntry::UserTurn { text } => element! {
-            View(border_style: BorderStyle::Single, border_color: Color::Blue, padding: 1) {
-                Text(content: text.clone(), color: Color::White)
+            View(border_style: theme.border_style, border_color: theme.accent, padding: 1) {
+                Text(content: text.clone(), color: theme.foreground)
             }
         },
         TranscriptEntry::AssistantText { text } => element! {
@@ -194,9 +205,9 @@ fn render_entry(entry: &TranscriptEntry) -> Element {
             allowed,
         } => {
             let (label, color) = if *allowed {
-                ("allowed", Color::Green)
+                ("allowed", theme.success)
             } else {
-                ("denied", Color::Red)
+                ("denied", theme.danger)
             };
             element! {
                 View(padding: 1) {
@@ -206,24 +217,32 @@ fn render_entry(entry: &TranscriptEntry) -> Element {
         }
         TranscriptEntry::SystemNotice { text } => element! {
             View(padding: 1) {
-                Text(content: text.clone(), color: Color::DarkGrey)
+                Text(content: text.clone(), color: theme.muted)
             }
         },
     }
 }
 
 fn render_tool_card(call: &crate::tui::state::ToolCallEntry) -> Element {
+    let theme = local_code_theme();
+    let running = call.result.is_none();
     let header = format!("{} {}", if call.expanded { "▾" } else { "▸" }, call.name);
     if !call.expanded {
+        // A collapsed card still animates while its call is in flight.
+        let header_el: Element = if running {
+            element! { Spinner(label: header, color: Some(TOOL_ACCENT)) }
+        } else {
+            element! { Text(content: header, color: TOOL_ACCENT) }
+        };
         return element! {
-            View(border_style: BorderStyle::Single, border_color: Color::DarkGrey, padding: 0) {
-                Text(content: header, color: Color::Magenta)
+            View(border_style: theme.border_style, border_color: theme.border, padding: 0) {
+                #(vec![header_el])
             }
         };
     }
 
     let mut body: Vec<Element> = vec![element! {
-        Text(content: format!("args: {}", call.arguments_json), color: Color::DarkGrey)
+        Text(content: format!("args: {}", call.arguments_json), color: theme.muted)
     }];
 
     if let Some(result) = &call.result {
@@ -231,15 +250,15 @@ fn render_tool_card(call: &crate::tui::state::ToolCallEntry) -> Element {
             body.push(line);
         }
         if result.is_error {
-            body.push(element! { Text(content: "(tool reported an error)", color: Color::Red) });
+            body.push(element! { Text(content: "(tool reported an error)", color: theme.danger) });
         }
     } else {
-        body.push(element! { Text(content: "(running…)", color: Color::DarkGrey) });
+        body.push(element! { Spinner(label: "running…".to_string(), color: Some(TOOL_ACCENT)) });
     }
 
     element! {
-        View(flex_direction: FlexDirection::Column, border_style: BorderStyle::Single, border_color: Color::Magenta, padding: 1) {
-            Text(content: header, color: Color::Magenta)
+        View(flex_direction: FlexDirection::Column, border_style: theme.border_style, border_color: TOOL_ACCENT, padding: 1) {
+            Text(content: header, color: TOOL_ACCENT)
             #(body)
         }
     }
@@ -255,11 +274,12 @@ fn render_tool_card(call: &crate::tui::state::ToolCallEntry) -> Element {
 /// information the Phase 2 tool contract exposes today.
 fn diff_lines(tool_name: &str, content: &str) -> Vec<Element> {
     let is_mutation = matches!(tool_name, "write_file" | "edit_file" | "bash");
+    let theme = local_code_theme();
     content
         .lines()
         .map(|line| {
             let (prefix, color) = if is_mutation {
-                ("+ ", Color::Green)
+                ("+ ", theme.success)
             } else {
                 ("  ", Color::Reset)
             };
@@ -340,6 +360,38 @@ mod tests {
             t.frame_text()
                 .contains("Permission requested: run shell command: rm x")
         );
+    }
+
+    #[tokio::test]
+    async fn running_tool_call_shows_a_spinner() {
+        let entries: TranscriptEntries = vec![Arc::new(TranscriptEntry::ToolCall(ToolCallEntry {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments_json: r#"{"command":"ls"}"#.into(),
+            result: None,
+            expanded: true,
+        }))];
+        let props = TranscriptProps {
+            entries,
+            ..Default::default()
+        };
+        let t = TestTerminal::new(60, 10, Element::component::<Transcript>(props)).unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("running…"), "{text}");
+        assert!(text.contains('⠋'), "expected a spinner glyph: {text}");
+    }
+
+    #[tokio::test]
+    async fn streaming_tail_carries_a_live_spinner() {
+        let props = TranscriptProps {
+            entries: vec![],
+            streaming_text: "thinking about it".into(),
+            ..Default::default()
+        };
+        let t = TestTerminal::new(60, 10, Element::component::<Transcript>(props)).unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("thinking about it"));
+        assert!(text.contains('⠋'), "expected a spinner glyph: {text}");
     }
 
     #[tokio::test]
