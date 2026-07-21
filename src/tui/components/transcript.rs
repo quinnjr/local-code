@@ -1,9 +1,9 @@
 use ntui::props::{FlexDirection, Overflow};
 use ntui::style::Color;
-use ntui::widgets::{Spinner, SpinnerProps};
+use ntui::widgets::{Spinner, SpinnerProps, Theme};
 use ntui::{Element, KeyCode, component, element};
 
-use crate::tui::theme::{TOOL_ACCENT, local_code_theme};
+use crate::tui::theme::TOOL_ACCENT;
 
 use std::sync::Arc;
 
@@ -108,25 +108,30 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
     // means every earlier (unchanged) entry's rebuild is skipped on every
     // streamed token, rather than being rebuilt from scratch on each
     // `Transcript` render as before.
-    let mut children: Vec<Element> = props
-        .entries
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            Element::component::<TranscriptEntryView>(EntryProps {
-                entry: entry.clone(),
-            })
-            .with_key(i.to_string())
+    let theme = hooks.use_theme();
+    let mut children: Vec<Element> = Vec::with_capacity(props.entries.len() + 2);
+    children.extend(props.entries.iter().enumerate().map(|(i, entry)| {
+        Element::component::<TranscriptEntryView>(EntryProps {
+            entry: entry.clone(),
         })
-        .collect();
+        .with_key(i.to_string())
+    }));
 
     if !props.streaming_text.is_empty() {
         // The in-flight turn gets a live spinner under the growing text so
         // the transcript itself shows work in progress, not just the footer.
+        // The text reuses `render_entry`'s AssistantText arm so in-flight and
+        // settled assistant text can never style differently.
+        let tail = render_entry(
+            &TranscriptEntry::AssistantText {
+                text: props.streaming_text.clone(),
+            },
+            &theme,
+        );
         children.push(
             element! {
-                View(flex_direction: FlexDirection::Column, padding: 1) {
-                    Text(content: props.streaming_text.clone(), color: Color::Reset)
+                View(flex_direction: FlexDirection::Column) {
+                    #(vec![tail])
                     Spinner()
                 }
             }
@@ -135,7 +140,7 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
     }
 
     if let Some(request) = &props.pending_permission {
-        children.push(render_permission_card(request).with_key("pending-permission"));
+        children.push(render_permission_card(request, &theme).with_key("pending-permission"));
     }
 
     element! {
@@ -180,14 +185,11 @@ impl Default for EntryProps {
 }
 
 #[component]
-fn TranscriptEntryView(props: &EntryProps, _hooks: &mut ntui::Hooks) -> Element {
-    render_entry(&props.entry)
+fn TranscriptEntryView(props: &EntryProps, hooks: &mut ntui::Hooks) -> Element {
+    render_entry(&props.entry, &hooks.use_theme())
 }
 
-fn render_entry(entry: &TranscriptEntry) -> Element {
-    // Plain function, no `Hooks` — theme tokens come straight from
-    // `local_code_theme()` (see the note on that function).
-    let theme = local_code_theme();
+fn render_entry(entry: &TranscriptEntry, theme: &Theme) -> Element {
     match entry {
         TranscriptEntry::UserTurn { text } => element! {
             View(border_style: theme.border_style, border_color: theme.accent, padding: 1) {
@@ -199,7 +201,7 @@ fn render_entry(entry: &TranscriptEntry) -> Element {
                 Text(content: text.clone(), color: Color::Reset)
             }
         },
-        TranscriptEntry::ToolCall(call) => render_tool_card(call),
+        TranscriptEntry::ToolCall(call) => render_tool_card(call, theme),
         TranscriptEntry::PermissionResolved {
             description,
             allowed,
@@ -223,8 +225,7 @@ fn render_entry(entry: &TranscriptEntry) -> Element {
     }
 }
 
-fn render_tool_card(call: &crate::tui::state::ToolCallEntry) -> Element {
-    let theme = local_code_theme();
+fn render_tool_card(call: &crate::tui::state::ToolCallEntry, theme: &Theme) -> Element {
     let running = call.result.is_none();
     let header = format!("{} {}", if call.expanded { "▾" } else { "▸" }, call.name);
     if !call.expanded {
@@ -246,7 +247,7 @@ fn render_tool_card(call: &crate::tui::state::ToolCallEntry) -> Element {
     }];
 
     if let Some(result) = &call.result {
-        for line in diff_lines(&call.name, &result.content) {
+        for line in diff_lines(&call.name, &result.content, theme) {
             body.push(line);
         }
         if result.is_error {
@@ -272,9 +273,8 @@ fn render_tool_card(call: &crate::tui::state::ToolCallEntry) -> Element {
 /// so "diff coloring" here colors whole result lines green (success) or red
 /// (error) rather than per-hunk +/-; this is the full extent of diff
 /// information the Phase 2 tool contract exposes today.
-fn diff_lines(tool_name: &str, content: &str) -> Vec<Element> {
+fn diff_lines(tool_name: &str, content: &str, theme: &Theme) -> Vec<Element> {
     let is_mutation = matches!(tool_name, "write_file" | "edit_file" | "bash");
-    let theme = local_code_theme();
     content
         .lines()
         .map(|line| {
@@ -293,6 +293,11 @@ mod tests {
     use super::*;
     use crate::tui::state::{ToolCallEntry, ToolCallResult};
     use ntui::testing::TestTerminal;
+
+    /// Any braille spinner frame, not just frame 0 — pinning the first frame
+    /// would couple these tests to the animation phase and the test
+    /// runtime's polling behavior.
+    const SPINNER_FRAMES: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
 
     fn entries_fixture() -> TranscriptEntries {
         vec![
@@ -349,9 +354,7 @@ mod tests {
             entries: vec![],
             focused: true,
             pending_permission: Some(PermissionRequest {
-                tool_name: "bash".into(),
                 description: "run shell command: rm x".into(),
-                command_preview: Some("rm x".into()),
             }),
             ..Default::default()
         };
@@ -378,7 +381,10 @@ mod tests {
         let t = TestTerminal::new(60, 10, Element::component::<Transcript>(props)).unwrap();
         let text = t.frame_text();
         assert!(text.contains("running…"), "{text}");
-        assert!(text.contains('⠋'), "expected a spinner glyph: {text}");
+        assert!(
+            text.chars().any(|c| SPINNER_FRAMES.contains(c)),
+            "expected a spinner glyph: {text}"
+        );
     }
 
     #[tokio::test]
@@ -391,7 +397,10 @@ mod tests {
         let t = TestTerminal::new(60, 10, Element::component::<Transcript>(props)).unwrap();
         let text = t.frame_text();
         assert!(text.contains("thinking about it"));
-        assert!(text.contains('⠋'), "expected a spinner glyph: {text}");
+        assert!(
+            text.chars().any(|c| SPINNER_FRAMES.contains(c)),
+            "expected a spinner glyph: {text}"
+        );
     }
 
     #[tokio::test]

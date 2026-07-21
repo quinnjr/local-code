@@ -18,8 +18,8 @@ pub enum TranscriptEntry {
     /// A permission decision that has already been resolved (so the transcript
     /// keeps a record after the inline prompt is dismissed).
     PermissionResolved { description: String, allowed: bool },
-    /// A non-fatal system message (errors, and — until Phase 4 implements real
-    /// dispatch — the "slash commands aren't implemented yet" notice).
+    /// A non-fatal system message surfaced in the transcript (e.g. a streamed
+    /// error or slash-command output).
     ///
     /// `text` is NOT auto-wrapped by the Transcript component's current layout
     /// (available width isn't definite when `Text` is measured), so any text

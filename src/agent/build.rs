@@ -16,6 +16,19 @@ search the codebase via your tools. Prefer edit_file for targeted changes over r
 files with write_file. Always explain what you're about to do before calling a tool that changes \
 the filesystem or runs a command.";
 
+/// The base system prompt plus any project/skill context appended after a
+/// blank line. The single composition rule for every agent construction path
+/// (headless via [`build_agent_with_mcp_tools`], TUI via
+/// `tui::gated_tool::build_streaming_agent_with_history`) — keep them
+/// composing through here so the two can't drift.
+pub(crate) fn composed_system_prompt(extra_system_context: &str) -> String {
+    if extra_system_context.trim().is_empty() {
+        DEFAULT_SYSTEM_PROMPT.to_string()
+    } else {
+        format!("{DEFAULT_SYSTEM_PROMPT}\n\n{extra_system_context}")
+    }
+}
+
 /// Registers every available tool onto `builder`, each wrapped in
 /// [`crate::agent::gated_tool::GatedTool`] so permission enforcement is
 /// identical for built-ins and MCP tools alike, under both `Agent::prompt` and
@@ -59,11 +72,7 @@ pub fn build_agent_with_mcp_tools(
     skills: Vec<Skill>,
     extra_system_context: &str,
 ) -> daimon::Result<Agent> {
-    let system_prompt = if extra_system_context.trim().is_empty() {
-        DEFAULT_SYSTEM_PROMPT.to_string()
-    } else {
-        format!("{DEFAULT_SYSTEM_PROMPT}\n\n{extra_system_context}")
-    };
+    let system_prompt = composed_system_prompt(extra_system_context);
     let builder = AgentBuilder::new()
         .shared_model(model)
         .system_prompt(system_prompt);

@@ -35,6 +35,25 @@ pub struct SessionFile {
 
 pub const SESSION_FILE_VERSION: u32 = 1;
 
+/// Serialize-only view of a [`SessionFile`] whose entries borrow the live
+/// transcript's `Arc`s instead of deep-copying every entry per save (the
+/// transcript's text grows with the conversation, so the copy was O(history)
+/// per turn). serde's `rc` feature serializes `Arc<T>` transparently and the
+/// field names/order mirror [`SessionFile`] exactly, so the on-disk JSON is
+/// byte-identical to serializing the owned struct.
+#[derive(Serialize)]
+pub struct SessionFileView<'a> {
+    pub version: u32,
+    pub project_root: &'a std::path::Path,
+    pub connection_name: &'a str,
+    pub model_name: &'a str,
+    pub tier: PermissionTier,
+    pub created_at: &'a str,
+    pub updated_at: &'a str,
+    pub entries: &'a [std::sync::Arc<TranscriptEntry>],
+    pub messages: &'a [Message],
+}
+
 impl SessionFile {
     pub fn new(
         project_root: std::path::PathBuf,

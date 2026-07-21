@@ -99,9 +99,7 @@ mod tests {
 
     fn request() -> PermissionRequest {
         PermissionRequest {
-            tool_name: "bash".into(),
             description: "run shell command: rm file.txt".into(),
-            command_preview: Some("rm file.txt".into()),
         }
     }
 

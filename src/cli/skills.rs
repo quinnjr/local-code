@@ -154,15 +154,46 @@ pub async fn update<W: Write>(
         return Ok(());
     }
 
-    for name in names {
-        let host = crate::skills::install::skill_manifest_host(paths, scope, &name)?;
-        let client = skill_client(host)?;
-        let updated = update_skill(&client, paths, scope, &name).await?;
-        if updated {
-            writeln!(out, "Updated skill '{name}'")?;
-        } else {
-            writeln!(out, "Skill '{name}' is already up to date")?;
+    // Resolve every skill's host and build one client per distinct host up
+    // front, so the concurrent updates below share a connection pool per host
+    // instead of opening a fresh client (new TLS session) per skill.
+    let mut hosts = Vec::with_capacity(names.len());
+    let mut clients: Vec<(Host, SkillClient)> = Vec::new();
+    for name in &names {
+        let host = crate::skills::install::skill_manifest_host(paths, scope, name)?;
+        if !clients.iter().any(|(h, _)| *h == host) {
+            clients.push((host, skill_client(host)?));
         }
+        hosts.push(host);
+    }
+
+    // Each skill's update is an independent network round-trip, so run them
+    // concurrently and report in the original list order once all complete.
+    // Unlike the old serial loop, one skill's failure no longer prevents the
+    // rest from updating; failures are reported per skill plus a summary error.
+    let results = futures::future::join_all(names.iter().zip(&hosts).map(|(name, host)| {
+        let client = &clients
+            .iter()
+            .find(|(h, _)| h == host)
+            .expect("client built for every resolved host above")
+            .1;
+        async move { update_skill(client, paths, scope, name).await }
+    }))
+    .await;
+
+    let mut failures = 0usize;
+    for (name, result) in names.iter().zip(results) {
+        match result {
+            Ok(true) => writeln!(out, "Updated skill '{name}'")?,
+            Ok(false) => writeln!(out, "Skill '{name}' is already up to date")?,
+            Err(e) => {
+                failures += 1;
+                writeln!(out, "Failed to update skill '{name}': {e}")?;
+            }
+        }
+    }
+    if failures > 0 {
+        anyhow::bail!("{failures} skill update(s) failed");
     }
     Ok(())
 }

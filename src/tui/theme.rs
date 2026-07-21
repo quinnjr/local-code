@@ -1,5 +1,12 @@
-use ntui::style::{BorderStyle, Color};
+use ntui::props::{GradientDirection, TextWrap};
+use ntui::style::{BorderStyle, Color, Weight};
 use ntui::widgets::Theme;
+use ntui::{Element, element};
+
+// Token split: `Theme` (below) carries the per-widget tokens ntui's widgets
+// resolve via `use_theme()`; the free consts here are brand identity —
+// gradient endpoints and fixed semantic colors that can't live in a
+// flat-color `Theme` field. Both are part of the one app palette.
 
 /// The two endpoints of the local-code brand gradient (cyan → violet), used
 /// by `GradientText` titles and gradient chip backgrounds so every branded
@@ -11,12 +18,16 @@ pub const BRAND_TO: Color = Color::Rgb(167, 139, 250);
 /// gradient's far endpoint, used flat).
 pub const TOOL_ACCENT: Color = BRAND_TO;
 
+/// Attention/warning surfaces (permission prompts, elevated-but-not-maximal
+/// permission tiers) and the foreground that stays readable on them.
+pub const WARN: Color = Color::Yellow;
+pub const ON_WARN: Color = Color::Black;
+
 /// The app-wide `ntui::widgets::Theme`, provided once via `ContextProvider`
 /// at the `Workspace` root so every widget (and `hooks.use_theme()` call)
-/// below it resolves the same palette. Components rendered from plain
-/// functions without `Hooks` access (e.g. `transcript::render_entry`) reach
-/// the same tokens through this function directly — it's `const`-shaped
-/// (pure, no I/O), so both paths always agree.
+/// below it resolves the same palette. Plain render functions receive it as
+/// a `&Theme` parameter threaded down from their nearest `#[component]`
+/// caller's `use_theme()`, so there is a single resolution path at runtime.
 pub fn local_code_theme() -> Theme {
     Theme {
         accent: BRAND_FROM,
@@ -30,9 +41,39 @@ pub fn local_code_theme() -> Theme {
     }
 }
 
+/// Background of a [`chip`]: a flat color or a horizontal gradient.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ChipBackground {
+    Flat(Color),
+    Gradient(Color, Color),
+}
+
+/// A one-line label chip — bold text on a colored or gradient background,
+/// padded with one space either side.
+///
+/// `Truncate`, not the default `Wrap`: `wrap_text`'s measurement collapses
+/// the chip's deliberate padding spaces. Hand-rolled rather than ntui's
+/// `Badge` because `Badge` pads all four sides (three rows tall) and these
+/// chips must fit single-line rows like the tab bar.
+pub fn chip(label: &str, bg: ChipBackground, fg: Color) -> Element {
+    let (background, background_gradient) = match bg {
+        ChipBackground::Flat(color) => (color, None),
+        ChipBackground::Gradient(from, to) => (
+            Color::Reset,
+            Some((from, to, GradientDirection::Horizontal)),
+        ),
+    };
+    element! {
+        View(background: background, background_gradient: background_gradient) {
+            Text(content: format!(" {label} "), color: fg, weight: Weight::Bold, wrap: TextWrap::Truncate)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ntui::testing::TestTerminal;
 
     #[test]
     fn accent_matches_the_brand_gradient_start() {
@@ -45,5 +86,13 @@ mod tests {
         assert_ne!(t.accent, t.danger);
         assert_ne!(t.danger, t.success);
         assert_ne!(t.muted, t.foreground);
+        assert_ne!(WARN, t.danger);
+    }
+
+    #[tokio::test]
+    async fn chip_keeps_its_padding_spaces() {
+        let el = chip("ask", ChipBackground::Flat(WARN), ON_WARN);
+        let t = TestTerminal::new(10, 1, el).unwrap();
+        assert!(t.frame_text().contains(" ask "));
     }
 }

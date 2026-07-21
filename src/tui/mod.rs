@@ -159,16 +159,24 @@ pub async fn run_tui(
         None => select_connection(&connections, connection_name)?,
     };
 
-    // The keyring read is a blocking Secret Service/DBus round trip; run it
-    // on the blocking pool so a slow or locked keyring backend doesn't stall
-    // the async runtime before the first frame.
-    let api_key = {
+    // Kick off the two slow, independent initializations first — the keyring
+    // read (a blocking Secret Service/DBus round trip, on the blocking pool
+    // so a locked backend can't stall the runtime) and the MCP network
+    // connect (up to 15s per server) — then do the filesystem/CPU work below
+    // while they're in flight, so time-to-first-frame pays max(network, fs)
+    // instead of their sum. Everything is still awaited before rendering.
+    let keyring_task = {
         let connection_name = connection.name.clone();
         tokio::task::spawn_blocking(move || SecretStore::get_api_key(&connection_name))
-            .await
-            .expect("keyring lookup task panicked")?
     };
-    let model = build_model(&connection, api_key)?;
+    // Discover MCP-server tools once at startup, exactly like run_headless
+    // (Phase 5) does — a broken server is logged and skipped, never fatal,
+    // and the resulting tools are threaded through every later agent rebuild
+    // (`/model`, `/resume`) via `AppProps::mcp_tools` so they're never only
+    // present in headless mode.
+    let mcp_server_configs = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)
+        .map_err(TuiSessionError::LoadMcpServers)?;
+    let mcp_task = tokio::spawn(async move { connect_all(&mcp_server_configs).await });
 
     let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;
     let system_context = load_project_context(paths, project_root);
@@ -183,14 +191,9 @@ pub async fn run_tui(
         format!("{system_context}\n\n{rendered_skill_context}")
     };
 
-    // Discover MCP-server tools once at startup, exactly like run_headless
-    // (Phase 5) does — a broken server is logged and skipped, never fatal,
-    // and the resulting tools are threaded through every later agent rebuild
-    // (`/model`, `/resume`) via `AppProps::mcp_tools` so they're never only
-    // present in headless mode.
-    let mcp_server_configs = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)
-        .map_err(TuiSessionError::LoadMcpServers)?;
-    let mcp_report = connect_all(&mcp_server_configs).await;
+    let api_key = keyring_task.await.expect("keyring lookup task panicked")?;
+    let model = build_model(&connection, api_key)?;
+    let mcp_report = mcp_task.await.expect("MCP connect task panicked");
     for error in &mcp_report.errors {
         eprintln!("warning: {error}");
     }

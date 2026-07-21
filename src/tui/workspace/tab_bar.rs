@@ -1,9 +1,9 @@
-use ntui::props::{FlexDirection, GradientDirection, JustifyContent, TextWrap};
-use ntui::style::Weight;
-use ntui::widgets::{GradientText, GradientTextProps};
+use ntui::props::{FlexDirection, JustifyContent};
+use ntui::style::{Color, Weight};
+use ntui::widgets::{GradientText, GradientTextProps, Theme};
 use ntui::{component, element};
 
-use crate::tui::theme::{BRAND_FROM, BRAND_TO};
+use crate::tui::theme::{BRAND_FROM, BRAND_TO, ChipBackground, chip};
 
 /// What the tab bar shows for one window.
 #[derive(Clone, PartialEq, Default, Debug)]
@@ -34,6 +34,20 @@ pub struct TabBarProps {
     pub notice: Option<String>,
 }
 
+/// The color of a non-active tab's label: danger while blocked on a
+/// permission decision, accent while streaming, muted otherwise. Pure and
+/// separate from the render body because the color choice is invisible to
+/// `frame_text()`-based tests — this seam is what the unit tests assert on.
+fn tab_color(tab: &TabInfo, theme: &Theme) -> Color {
+    if tab.awaiting_permission {
+        theme.danger
+    } else if tab.streaming {
+        theme.accent
+    } else {
+        theme.muted
+    }
+}
+
 /// One-line tmux-style status bar listing windows: `0:agent* 1:agent✻ 2:agent!`
 /// — `*` marks the active window, `✻` a window with a streaming session, `!`
 /// a window whose session is blocked waiting for a permission decision. The
@@ -61,21 +75,13 @@ pub fn TabBar(props: &TabBarProps, hooks: &mut ntui::Hooks) -> ntui::Element {
             };
             let label = format!("{}:agent{panes}{marker}{busy}", tab.index);
             if tab.index == props.active {
-                element! {
-                    View(background_gradient: Some((BRAND_FROM, BRAND_TO, GradientDirection::Horizontal))) {
-                        // Truncate keeps the chip's padding spaces, which the
-                        // default Wrap measurement would collapse away.
-                        Text(content: format!(" {label} "), color: theme.surface, weight: Weight::Bold, wrap: TextWrap::Truncate)
-                    }
-                }
+                chip(
+                    &label,
+                    ChipBackground::Gradient(BRAND_FROM, BRAND_TO),
+                    theme.surface,
+                )
             } else {
-                let color = if tab.awaiting_permission {
-                    theme.danger
-                } else if tab.streaming {
-                    theme.accent
-                } else {
-                    theme.muted
-                };
+                let color = tab_color(tab, &theme);
                 element! { Text(content: label, color: color) }
             }
         })
@@ -181,6 +187,22 @@ mod tests {
         };
         let t = TestTerminal::new(80, 1, Element::component::<TabBar>(props)).unwrap();
         assert!(t.frame_text().contains("C-b …"));
+    }
+
+    #[test]
+    fn tab_color_ranks_permission_over_streaming_over_idle() {
+        let theme = crate::tui::theme::local_code_theme();
+        let mut tab = TabInfo {
+            index: 0,
+            panes: 1,
+            streaming: false,
+            awaiting_permission: false,
+        };
+        assert_eq!(tab_color(&tab, &theme), theme.muted);
+        tab.streaming = true;
+        assert_eq!(tab_color(&tab, &theme), theme.accent);
+        tab.awaiting_permission = true; // outranks streaming
+        assert_eq!(tab_color(&tab, &theme), theme.danger);
     }
 
     #[tokio::test]

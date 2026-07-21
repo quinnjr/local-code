@@ -208,10 +208,13 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
             } else {
                 BorderStyle::None
             };
+            // Direct call, not `use_theme()`: `Workspace` sits above its own
+            // `ContextProvider`, so there is no ancestor theme to resolve.
+            let theme = local_code_theme();
             let border_color = if split && app_props.focused {
-                local_code_theme().accent
+                theme.accent
             } else {
-                local_code_theme().border
+                theme.border
             };
             pane_els.push(
                 element! {

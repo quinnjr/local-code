@@ -1,7 +1,7 @@
 use ntui::props::{FlexDirection, JustifyContent};
-use ntui::widgets::{Spinner, SpinnerProps};
 use ntui::{component, element};
 
+use crate::tui::components::status_indicator::{StatusIndicator, StatusIndicatorProps};
 use crate::tui::state::UsageSummary;
 
 #[derive(Clone, PartialEq, Default)]
@@ -10,19 +10,12 @@ pub struct FooterProps {
     pub streaming: bool,
 }
 
-/// Bottom status line: quick hints plus token usage, per the spec. `/model` and
-/// auto-accept-toggle hints are listed even though the keys aren't wired up
-/// until Phase 4 — the footer is allowed to advertise the hint text now since
-/// the spec calls the footer's hint list out explicitly as always-visible UI,
-/// not as a slash-command implementation.
+/// Bottom status line: quick hints (`/model`, ctrl+a auto-accept, ctrl+c
+/// exit) plus token usage. The hint list is always-visible UI, per the
+/// spec's footer note.
 #[component]
 pub fn Footer(props: &FooterProps, hooks: &mut ntui::Hooks) -> ntui::Element {
     let theme = hooks.use_theme();
-    let status: ntui::Element = if props.streaming {
-        element! { Spinner(label: "generating…".to_string()) }
-    } else {
-        element! { Text(content: "● ready".to_string(), color: theme.success) }
-    };
     let tokens = format!(
         "{} in / {} out",
         props.usage.input_tokens, props.usage.output_tokens
@@ -30,7 +23,7 @@ pub fn Footer(props: &FooterProps, hooks: &mut ntui::Hooks) -> ntui::Element {
     element! {
         View(flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, padding: 0) {
             Text(content: "/model · ctrl+a auto-accept · ctrl+c exit", color: theme.muted)
-            #(vec![status])
+            StatusIndicator(streaming: props.streaming)
             Text(content: tokens, color: theme.muted)
         }
     }
