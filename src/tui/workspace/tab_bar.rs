@@ -1,6 +1,9 @@
 use ntui::props::{FlexDirection, JustifyContent};
-use ntui::style::Color;
+use ntui::style::{Color, Weight};
+use ntui::widgets::{GradientText, GradientTextProps, Theme};
 use ntui::{component, element};
+
+use crate::tui::theme::{BRAND_FROM, BRAND_TO, ChipBackground, chip};
 
 /// What the tab bar shows for one window.
 #[derive(Clone, PartialEq, Default, Debug)]
@@ -31,12 +34,29 @@ pub struct TabBarProps {
     pub notice: Option<String>,
 }
 
+/// The color of a non-active tab's label: danger while blocked on a
+/// permission decision, accent while streaming, muted otherwise. Pure and
+/// separate from the render body because the color choice is invisible to
+/// `frame_text()`-based tests — this seam is what the unit tests assert on.
+fn tab_color(tab: &TabInfo, theme: &Theme) -> Color {
+    if tab.awaiting_permission {
+        theme.danger
+    } else if tab.streaming {
+        theme.accent
+    } else {
+        theme.muted
+    }
+}
+
 /// One-line tmux-style status bar listing windows: `0:agent* 1:agent✻ 2:agent!`
 /// — `*` marks the active window, `✻` a window with a streaming session, `!`
-/// a window whose session is blocked waiting for a permission decision.
+/// a window whose session is blocked waiting for a permission decision. The
+/// active window's label sits on a brand-gradient chip; blocked windows show
+/// in the danger color, streaming ones in the accent.
 #[component]
-pub fn TabBar(props: &TabBarProps, _hooks: &mut ntui::Hooks) -> ntui::Element {
-    let tabs = props
+pub fn TabBar(props: &TabBarProps, hooks: &mut ntui::Hooks) -> ntui::Element {
+    let theme = hooks.use_theme();
+    let tab_els: Vec<ntui::Element> = props
         .tabs
         .iter()
         .map(|tab| {
@@ -53,10 +73,19 @@ pub fn TabBar(props: &TabBarProps, _hooks: &mut ntui::Hooks) -> ntui::Element {
             } else {
                 String::new()
             };
-            format!("{}:agent{panes}{marker}{busy}", tab.index)
+            let label = format!("{}:agent{panes}{marker}{busy}", tab.index);
+            if tab.index == props.active {
+                chip(
+                    &label,
+                    ChipBackground::Gradient(BRAND_FROM, BRAND_TO),
+                    theme.surface,
+                )
+            } else {
+                let color = tab_color(tab, &theme);
+                element! { Text(content: label, color: color) }
+            }
         })
-        .collect::<Vec<_>>()
-        .join("  ");
+        .collect();
     let right = if props.prefix_pending {
         "C-b …".to_string()
     } else if let Some(notice) = &props.notice {
@@ -65,15 +94,18 @@ pub fn TabBar(props: &TabBarProps, _hooks: &mut ntui::Hooks) -> ntui::Element {
         "C-b c/n/p/%/\"/x".to_string()
     };
     let right_color = if props.prefix_pending {
-        Color::Yellow
+        theme.accent
     } else if props.notice.is_some() {
-        Color::Red
+        theme.danger
     } else {
-        Color::DarkGrey
+        theme.muted
     };
     element! {
         View(flex_direction: FlexDirection::Row, justify_content: JustifyContent::SpaceBetween, padding: 0) {
-            Text(content: format!("[local-code] {tabs}"), color: Color::Green)
+            View(flex_direction: FlexDirection::Row, gap: 1) {
+                GradientText(content: "local-code".to_string(), from: Some(BRAND_FROM), to: Some(BRAND_TO), weight: Weight::Bold)
+                #(tab_els)
+            }
             Text(content: right, color: right_color)
         }
     }
@@ -155,6 +187,22 @@ mod tests {
         };
         let t = TestTerminal::new(80, 1, Element::component::<TabBar>(props)).unwrap();
         assert!(t.frame_text().contains("C-b …"));
+    }
+
+    #[test]
+    fn tab_color_ranks_permission_over_streaming_over_idle() {
+        let theme = crate::tui::theme::local_code_theme();
+        let mut tab = TabInfo {
+            index: 0,
+            panes: 1,
+            streaming: false,
+            awaiting_permission: false,
+        };
+        assert_eq!(tab_color(&tab, &theme), theme.muted);
+        tab.streaming = true;
+        assert_eq!(tab_color(&tab, &theme), theme.accent);
+        tab.awaiting_permission = true; // outranks streaming
+        assert_eq!(tab_color(&tab, &theme), theme.danger);
     }
 
     #[tokio::test]

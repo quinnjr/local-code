@@ -145,6 +145,33 @@ pub async fn connect_all(configs: &[McpServerConfig]) -> McpDiscoveryReport {
     McpDiscoveryReport { tools, errors }
 }
 
+/// Closes every distinct MCP server connection behind `tools`, best-effort.
+/// Called at app exit so well-behaved stdio servers get an orderly shutdown
+/// (children reaped promptly) instead of waiting for process teardown to
+/// break their pipes. Tools from the same server share one connection, which
+/// is closed exactly once; failures are logged, never propagated — this runs
+/// on the way out.
+pub async fn close_all(tools: &[NamespacedMcpTool]) {
+    use daimon::tool::Tool as _;
+    let mut representatives: Vec<&NamespacedMcpTool> = Vec::new();
+    for tool in tools {
+        if !representatives
+            .iter()
+            .any(|r| r.shares_connection_with(tool))
+        {
+            representatives.push(tool);
+        }
+    }
+    for tool in representatives {
+        if let Err(e) = tool.close_connection().await {
+            eprintln!(
+                "warning: failed to close MCP connection behind {}: {e}",
+                tool.name()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

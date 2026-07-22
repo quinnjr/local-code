@@ -36,17 +36,40 @@ pub enum SessionError {
 }
 
 /// Overwrites `path` with `session`'s current contents, creating parent
-/// directories as needed. Called after every completed turn, after
-/// `/compact`, and after `/clear` starts a fresh session — see `src/tui/app.rs`.
+/// directories as needed. Called after `/compact` and after `/clear` starts
+/// a fresh session — see `src/tui/app.rs`. (The per-turn save path uses
+/// [`save_session_view`] to avoid deep-copying the transcript.)
 pub fn save_session(path: &Path, session: &SessionFile) -> Result<(), SessionError> {
+    write_session_json(path, session)
+}
+
+/// Same as [`save_session`] but serializing a borrowing
+/// [`crate::session::types::SessionFileView`] — the per-turn TUI save uses
+/// this so the growing transcript is shared via `Arc`, not cloned each turn.
+pub fn save_session_view(
+    path: &Path,
+    session: &crate::session::types::SessionFileView<'_>,
+) -> Result<(), SessionError> {
+    write_session_json(path, session)
+}
+
+fn write_session_json<T: serde::Serialize>(path: &Path, session: &T) -> Result<(), SessionError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| SessionError::Write {
             path: path.to_path_buf(),
             source,
         })?;
     }
-    let text = serde_json::to_string_pretty(session).map_err(SessionError::Serialize)?;
-    fs::write(path, text).map_err(|source| SessionError::Write {
+    // Streamed via `to_writer_pretty` rather than `to_string_pretty` +
+    // `fs::write`: the latter holds the entire serialized session (which grows
+    // with history) in memory as a String before writing a byte.
+    let file = fs::File::create(path).map_err(|source| SessionError::Write {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, session).map_err(SessionError::Serialize)?;
+    std::io::Write::flush(&mut writer).map_err(|source| SessionError::Write {
         path: path.to_path_buf(),
         source,
     })

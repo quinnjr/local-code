@@ -91,6 +91,13 @@ pub async fn run_headless(
     let connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
     let connection = select_connection(&connections, connection_name)?;
 
+    // Start the MCP network connect (the dominant tail latency, up to 15s
+    // per server) before the local fs/keyring work, so startup pays
+    // max(network, local) instead of their sum — mirrors `tui::run_tui`.
+    let mcp_server_configs = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)
+        .map_err(HeadlessError::LoadMcpServers)?;
+    let mcp_task = tokio::spawn(async move { connect_all(&mcp_server_configs).await });
+
     let api_key = SecretStore::get_api_key(&connection.name)?;
     let model = build_model(&connection, api_key)?;
 
@@ -102,19 +109,20 @@ pub async fn run_headless(
         Arc::new(StdioPrompter::real()),
     ));
 
-    let mcp_server_configs = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)
-        .map_err(HeadlessError::LoadMcpServers)?;
-    let mcp_report = connect_all(&mcp_server_configs).await;
-    for error in &mcp_report.errors {
-        eprintln!("warning: {error}");
-    }
-
     let discovered_skills = discover_skills(paths);
     let skill_context = resolve_skill_context(&discovered_skills, project_root);
     let rendered_skill_context = render_skill_context(&skill_context);
     let project_context = crate::context::load_project_context(paths, project_root);
     let system_context = combined_system_context(&project_context, &rendered_skill_context);
 
+    let mcp_report = mcp_task.await.expect("MCP connect task panicked");
+    for error in &mcp_report.errors {
+        eprintln!("warning: {error}");
+    }
+
+    // Cheap Arc clones retained so the connections can be closed after the
+    // prompt completes (orderly stdio-server shutdown, matching run_tui).
+    let mcp_tools_for_shutdown = mcp_report.tools.clone();
     let agent = build_agent_with_mcp_tools(
         model,
         gate,
@@ -122,8 +130,9 @@ pub async fn run_headless(
         discovered_skills,
         &system_context,
     )?;
-    let response = agent.prompt(prompt).await?;
-    Ok(response.text().to_string())
+    let response = agent.prompt(prompt).await;
+    crate::mcp::connect::close_all(&mcp_tools_for_shutdown).await;
+    Ok(response?.text().to_string())
 }
 
 #[cfg(test)]

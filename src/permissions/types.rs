@@ -2,10 +2,11 @@ use std::future::Future;
 use std::pin::Pin;
 
 /// How aggressively the agent may act without asking the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionTier {
     /// Every write/edit/bash call prompts (default).
+    #[default]
     Ask,
     /// File writes/edits auto-approved; bash still prompts.
     AutoAcceptEdits,
@@ -42,9 +43,7 @@ pub fn classify_tool(name: &str) -> ToolKind {
 /// whatever [`PermissionPrompter`] is in use.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionRequest {
-    pub tool_name: String,
     pub description: String,
-    pub command_preview: Option<String>,
 }
 
 /// What the user decided in response to a [`PermissionRequest`].

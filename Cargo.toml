@@ -12,8 +12,7 @@ name = "local-code"
 path = "src/main.rs"
 
 [dependencies]
-ntui = "0.1.2"
-ntui-macros = "0.1.0"
+ntui = "0.2.0"
 directories = "6.0"
 serde = { version = "1", features = ["derive", "rc"] }
 toml = "1"
@@ -21,7 +20,7 @@ clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 thiserror = "2"
 anyhow = "1"
-daimon = { version = "0.22.0", features = ["local", "macros", "mcp"] }
+daimon = { version = "0.22.1", features = ["local", "macros", "mcp"] }
 tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 regex = "1"

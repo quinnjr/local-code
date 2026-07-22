@@ -133,10 +133,8 @@ impl BitbucketClient {
         path: &str,
         revision: &str,
     ) -> Result<Vec<FetchedFile>, SkillHostError> {
-        let mut files = Vec::new();
-        self.fetch_into(workspace, repo_slug, path, path, revision, &mut files)
-            .await?;
-        Ok(files)
+        self.fetch_into(workspace, repo_slug, path, path, revision)
+            .await
     }
 
     fn fetch_into<'a>(
@@ -146,73 +144,80 @@ impl BitbucketClient {
         base_path: &'a str,
         current_path: &'a str,
         revision: &'a str,
-        out: &'a mut Vec<FetchedFile>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SkillHostError>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<FetchedFile>, SkillHostError>> + Send + 'a>,
+    > {
         Box::pin(async move {
+            let mut files = Vec::new();
             let mut url = Some(format!(
                 "{}/repositories/{workspace}/{repo_slug}/src/{revision}/{current_path}",
                 self.api_base
             ));
             while let Some(page_url) = url {
                 let listing: SrcListing = self.get_json(&page_url).await?;
+                let mut dir_paths = Vec::new();
                 let mut file_entries = Vec::new();
                 for entry in listing.values {
                     match entry.entry_type.as_str() {
-                        "commit_directory" => {
-                            self.fetch_into(
-                                workspace,
-                                repo_slug,
-                                base_path,
-                                &entry.path,
-                                revision,
-                                out,
-                            )
-                            .await?;
-                        }
+                        "commit_directory" => dir_paths.push(entry.path),
                         "commit_file" => file_entries.push(entry),
                         _ => {} // symlinks/submodules: skip
                     }
                 }
 
-                // Every file in this page's listing is an independent
-                // download — fetch them concurrently instead of one round
-                // trip at a time, since this is the dominant cost for skills
-                // with more than a couple of files.
-                let downloads = file_entries.into_iter().map(|entry| async move {
-                    let response = self.request(&entry.links.self_link.href).send().await?;
-                    let status = response.status();
-                    if !status.is_success() {
-                        let body = crate::skills::client::sanitize_body(
-                            response.text().await.unwrap_or_default(),
-                        );
-                        return Err(SkillHostError::Api {
-                            status: status.as_u16(),
-                            url: entry.links.self_link.href.clone(),
-                            body,
-                        });
-                    }
-                    let bytes = response
-                        .bytes()
-                        .await
-                        .map_err(SkillHostError::Request)?
-                        .to_vec();
-                    let relative = entry
-                        .path
-                        .strip_prefix(base_path)
-                        .unwrap_or(&entry.path)
-                        .trim_start_matches('/');
-                    Ok(FetchedFile {
-                        relative_path: PathBuf::from(relative),
-                        bytes,
-                    })
-                });
-                for result in futures::future::join_all(downloads).await {
-                    out.push(result?);
+                // Sibling subtree recursions and this page's file downloads
+                // are all independent — run them as one concurrent wave
+                // rather than a serial depth-first chain. Pages themselves
+                // stay serial: each `next` URL comes from the previous page's
+                // response.
+                let subtrees =
+                    futures::future::join_all(dir_paths.into_iter().map(|dir_path| async move {
+                        self.fetch_into(workspace, repo_slug, base_path, &dir_path, revision)
+                            .await
+                    }));
+                let downloads =
+                    futures::future::join_all(file_entries.into_iter().map(|entry| async move {
+                        let response = self.request(&entry.links.self_link.href).send().await?;
+                        let status = response.status();
+                        if !status.is_success() {
+                            let body = crate::skills::client::sanitize_body(
+                                response.text().await.unwrap_or_default(),
+                            );
+                            return Err(SkillHostError::Api {
+                                status: status.as_u16(),
+                                url: entry.links.self_link.href.clone(),
+                                body,
+                            });
+                        }
+                        let bytes = response
+                            .bytes()
+                            .await
+                            .map_err(SkillHostError::Request)?
+                            .to_vec();
+                        let relative = entry
+                            .path
+                            .strip_prefix(base_path)
+                            .unwrap_or(&entry.path)
+                            .trim_start_matches('/');
+                        Ok(FetchedFile {
+                            relative_path: PathBuf::from(relative),
+                            bytes,
+                        })
+                    }));
+
+                let (subtree_results, download_results) =
+                    futures::future::join(subtrees, downloads).await;
+                // Subtrees first, matching the old depth-first accumulation
+                // order within each page.
+                for result in subtree_results {
+                    files.extend(result?);
+                }
+                for result in download_results {
+                    files.push(result?);
                 }
                 url = listing.next;
             }
-            Ok(())
+            Ok(files)
         })
     }
 }

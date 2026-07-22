@@ -12,12 +12,6 @@ use crate::skills::types::Skill;
 use crate::tui::memory_seed::SeededMemory;
 use daimon::model::types::Message;
 
-const SYSTEM_PROMPT: &str = "You are local-code, a coding assistant that talks only to \
-local/local-network LLM backends. You can read, write, and edit files, run shell commands, and \
-search the codebase via your tools. Prefer edit_file for targeted changes over rewriting whole \
-files with write_file. Always explain what you're about to do before calling a tool that changes \
-the filesystem or runs a command.";
-
 /// Builds the `daimon::agent::Agent` used by the interactive TUI: (a) seeds the agent's memory
 /// with `initial_messages` via [`SeededMemory`] instead of starting empty,
 /// (b) appends `extra_system_context` (AGENTS.md/CLAUDE.md content, or an
@@ -45,11 +39,7 @@ pub fn build_streaming_agent_with_history(
     mcp_tools: Vec<NamespacedMcpTool>,
     skills: Vec<Skill>,
 ) -> daimon::Result<Agent> {
-    let system_prompt = if extra_system_context.trim().is_empty() {
-        SYSTEM_PROMPT.to_string()
-    } else {
-        format!("{SYSTEM_PROMPT}\n\n{extra_system_context}")
-    };
+    let system_prompt = crate::agent::build::composed_system_prompt(extra_system_context);
 
     let builder = AgentBuilder::new()
         .shared_model(model)

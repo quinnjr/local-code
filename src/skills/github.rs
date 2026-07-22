@@ -127,10 +127,6 @@ enum ContentsResponse {
 
 #[derive(serde::Deserialize, Clone)]
 struct ContentsEntry {
-    // Present in GitHub's API response but never read here — `path` is what
-    // callers key off of.
-    #[allow(dead_code)]
-    name: String,
     path: String,
     #[serde(rename = "type")]
     entry_type: String,
@@ -228,10 +224,8 @@ impl GithubClient {
         path: &str,
         commit_sha: &str,
     ) -> Result<Vec<FetchedFile>, SkillHostError> {
-        let mut files = Vec::new();
-        self.fetch_directory_files_into(owner, repo, path, path, commit_sha, &mut files)
-            .await?;
-        Ok(files)
+        self.fetch_directory_files_into(owner, repo, path, path, commit_sha)
+            .await
     }
 
     fn fetch_directory_files_into<'a>(
@@ -241,9 +235,9 @@ impl GithubClient {
         base_path: &'a str,
         current_path: &'a str,
         commit_sha: &'a str,
-        out: &'a mut Vec<FetchedFile>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), SkillHostError>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Vec<FetchedFile>, SkillHostError>> + Send + 'a>,
+    > {
         Box::pin(async move {
             let url = format!(
                 "{}/repos/{owner}/{repo}/contents/{current_path}?ref={commit_sha}",
@@ -257,70 +251,76 @@ impl GithubClient {
                 }
             };
 
+            let mut dir_paths = Vec::new();
             let mut file_entries = Vec::new();
             for entry in entries {
                 match entry.entry_type.as_str() {
-                    "dir" => {
-                        self.fetch_directory_files_into(
-                            owner,
-                            repo,
-                            base_path,
-                            &entry.path,
-                            commit_sha,
-                            out,
-                        )
-                        .await?;
-                    }
+                    "dir" => dir_paths.push(entry.path),
                     "file" => file_entries.push(entry),
                     _ => {} // symlinks/submodules: skip, not relevant to skill content
                 }
             }
 
-            // Every file in this directory listing is an independent
-            // download — fetch them concurrently instead of one round trip
-            // at a time, since this is the dominant cost for skills with
-            // more than a couple of files.
-            let downloads = file_entries.into_iter().map(|entry| async move {
-                let download_url = entry.download_url.ok_or_else(|| SkillHostError::Api {
-                    status: 0,
-                    url: entry.path.clone(),
-                    body: "file entry missing download_url".to_string(),
-                })?;
-                let response = self
-                    .request(&download_url)
-                    .send()
-                    .await
-                    .map_err(SkillHostError::Request)?;
-                let status = response.status();
-                if !status.is_success() {
-                    let body = crate::skills::client::sanitize_body(
-                        response.text().await.unwrap_or_default(),
-                    );
-                    return Err(SkillHostError::Api {
-                        status: status.as_u16(),
-                        url: download_url,
-                        body,
-                    });
-                }
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(SkillHostError::Request)?
-                    .to_vec();
-                let relative = entry
-                    .path
-                    .strip_prefix(base_path)
-                    .unwrap_or(&entry.path)
-                    .trim_start_matches('/');
-                Ok(FetchedFile {
-                    relative_path: PathBuf::from(relative),
-                    bytes,
-                })
-            });
-            for result in futures::future::join_all(downloads).await {
-                out.push(result?);
+            // Sibling subtree recursions and this directory's file downloads
+            // are all independent network round trips — run them as one
+            // concurrent wave instead of the previous serial depth-first
+            // chain (which paid one listing round trip per directory before
+            // any downloads could start).
+            let subtrees =
+                futures::future::join_all(dir_paths.into_iter().map(|dir_path| async move {
+                    self.fetch_directory_files_into(owner, repo, base_path, &dir_path, commit_sha)
+                        .await
+                }));
+            let downloads =
+                futures::future::join_all(file_entries.into_iter().map(|entry| async move {
+                    let download_url = entry.download_url.ok_or_else(|| SkillHostError::Api {
+                        status: 0,
+                        url: entry.path.clone(),
+                        body: "file entry missing download_url".to_string(),
+                    })?;
+                    let response = self
+                        .request(&download_url)
+                        .send()
+                        .await
+                        .map_err(SkillHostError::Request)?;
+                    let status = response.status();
+                    if !status.is_success() {
+                        let body = crate::skills::client::sanitize_body(
+                            response.text().await.unwrap_or_default(),
+                        );
+                        return Err(SkillHostError::Api {
+                            status: status.as_u16(),
+                            url: download_url,
+                            body,
+                        });
+                    }
+                    let bytes = response
+                        .bytes()
+                        .await
+                        .map_err(SkillHostError::Request)?
+                        .to_vec();
+                    let relative = entry
+                        .path
+                        .strip_prefix(base_path)
+                        .unwrap_or(&entry.path)
+                        .trim_start_matches('/');
+                    Ok(FetchedFile {
+                        relative_path: PathBuf::from(relative),
+                        bytes,
+                    })
+                }));
+
+            let (subtree_results, download_results) =
+                futures::future::join(subtrees, downloads).await;
+            // Subtrees first, matching the old depth-first accumulation order.
+            let mut files = Vec::new();
+            for result in subtree_results {
+                files.extend(result?);
             }
-            Ok(())
+            for result in download_results {
+                files.push(result?);
+            }
+            Ok(files)
         })
     }
 }

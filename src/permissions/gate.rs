@@ -105,15 +105,8 @@ impl PermissionGate {
             return CheckOutcome::Allowed;
         }
 
-        let command_preview = arguments
-            .get("command")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let description = describe_call(tool_name, arguments);
         let request = PermissionRequest {
-            tool_name: tool_name.to_string(),
-            description,
-            command_preview,
+            description: describe_call(tool_name, arguments),
         };
 
         match self.prompter.prompt(&request).await {
