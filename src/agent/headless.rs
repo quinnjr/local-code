@@ -120,6 +120,9 @@ pub async fn run_headless(
         eprintln!("warning: {error}");
     }
 
+    // Cheap Arc clones retained so the connections can be closed after the
+    // prompt completes (orderly stdio-server shutdown, matching run_tui).
+    let mcp_tools_for_shutdown = mcp_report.tools.clone();
     let agent = build_agent_with_mcp_tools(
         model,
         gate,
@@ -127,8 +130,9 @@ pub async fn run_headless(
         discovered_skills,
         &system_context,
     )?;
-    let response = agent.prompt(prompt).await?;
-    Ok(response.text().to_string())
+    let response = agent.prompt(prompt).await;
+    crate::mcp::connect::close_all(&mcp_tools_for_shutdown).await;
+    Ok(response?.text().to_string())
 }
 
 #[cfg(test)]

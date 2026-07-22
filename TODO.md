@@ -58,3 +58,11 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    They'd miss a regression where the model returns garbage-but-nonempty text. Intentionally thin
    smoke-test bar, consistent with the pre-existing Phase 2 live tests.
 
+
+11. **MCP connections added at runtime via `/mcp add` are not closed at exit.** `run_tui` retains
+   the startup tool set and closes those server connections in an orderly way after the render
+   loop exits (`mcp::connect::close_all`, added with daimon 0.22.1's `McpToolBridge::close`), but
+   tools discovered by an in-TUI `/mcp add` live in per-pane `mcp_tools_state` inside `App`
+   components, which `run_tui` cannot reach after `ntui::render` returns — those children are
+   reaped by process teardown breaking their pipes, exactly as all connections were before.
+   Revisit if a shared connection registry ever gets threaded through `AppProps`.

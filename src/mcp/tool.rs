@@ -27,6 +27,20 @@ impl NamespacedMcpTool {
             inner: Arc::new(inner),
         }
     }
+
+    /// Closes the live MCP server connection behind this tool (shared by
+    /// every tool from the same server). Safe to call more than once — the
+    /// daimon transports tolerate repeated `close()`.
+    pub async fn close_connection(&self) -> daimon::Result<()> {
+        self.inner.close().await
+    }
+
+    /// True when `other` talks through the same live server connection —
+    /// lets shutdown close each connection exactly once (see
+    /// `mcp::connect::close_all`).
+    pub fn shares_connection_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self.inner.transport(), other.inner.transport())
+    }
 }
 
 impl Tool for NamespacedMcpTool {
@@ -206,5 +220,18 @@ mod tests {
             .unwrap();
         assert!(output.is_error);
         assert!(output.content.contains("tool failed"));
+    }
+
+    #[tokio::test]
+    async fn tools_cloned_for_rebuilds_share_a_connection_and_close_cleanly() {
+        let tool = NamespacedMcpTool::new("filesystem", bridge(false));
+        // The rebuild path (`/model`, `/resume`) clones tools; clones must
+        // compare as the same connection so shutdown closes it once.
+        let clone = tool.clone();
+        assert!(tool.shares_connection_with(&clone));
+        tool.close_connection().await.unwrap();
+        // Distinct servers (fresh transports) must not compare shared.
+        let other = NamespacedMcpTool::new("other", bridge(false));
+        assert!(!tool.shares_connection_with(&other));
     }
 }

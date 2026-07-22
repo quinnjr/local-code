@@ -198,6 +198,11 @@ pub async fn run_tui(
         eprintln!("warning: {error}");
     }
     let mcp_tools = mcp_report.tools;
+    // Cheap Arc clones of the startup tool set, retained so the shutdown
+    // path below can close the server connections after the TUI exits.
+    // (Servers added at runtime via `/mcp add` live in per-pane state and
+    // are reaped by process teardown instead — see TODO.md.)
+    let mcp_tools_for_shutdown = mcp_tools.clone();
 
     let (initial_tier, initial_entries, initial_messages, session_path, created_at) = match resume {
         Some(resumed) => (
@@ -248,7 +253,12 @@ pub async fn run_tui(
         ..AppProps::default()
     };
 
-    ntui::render(ntui::element!(Workspace(template: template))).await?;
+    // Close MCP server connections on the way out — even when the render
+    // loop errors — so stdio children get an orderly shutdown rather than
+    // waiting for process teardown to break their pipes.
+    let render_result = ntui::render(ntui::element!(Workspace(template: template))).await;
+    crate::mcp::connect::close_all(&mcp_tools_for_shutdown).await;
+    render_result?;
     Ok(())
 }
 

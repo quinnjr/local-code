@@ -701,9 +701,9 @@ checksum = "ef8ae57c4978a2acd8b869ce6b9ca1dfe817bff704c220209fdef2c0b75a01b9"
 
 [[package]]
 name = "daimon"
-version = "0.22.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25cd31a58023dab1a56644453b5a7ca960992963668aca16e415bcf7bea655b3"
+checksum = "c60a053f6ccbcd2ec77b09d6ab4e1e51a2cbc3e6209823ebf242eb8bd43d59b1"
 dependencies = [
  "async-stream",
  "daimon-core",
@@ -730,9 +730,9 @@ dependencies = [
 
 [[package]]
 name = "daimon-core"
-version = "0.22.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91b315b69d1131f6e3b18ddfccc2d8dd7db14a42d71c21e7594e0e1b312652ad"
+checksum = "bed5cde20a37fb5e628155000356e018792213a5046bb5203cb35913ae0855d6"
 dependencies = [
  "async-stream",
  "futures",
@@ -746,9 +746,9 @@ dependencies = [
 
 [[package]]
 name = "daimon-macros"
-version = "0.22.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ccbcc6f2922472af2a434a3e07a1c0b1b1041b8ed0d26be8e941a5f7e9e9764b"
+checksum = "ad0984276fc62aa064dd5bf43b7c0756ae3a7be009148d1dcf928ba1cfb51449"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -757,9 +757,9 @@ dependencies = [
 
 [[package]]
 name = "daimon-provider-anthropic"
-version = "0.22.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "557b8228910693126c5e14bfe84473763f761113186bcb9ad9fd8221bd6cb4a2"
+checksum = "3eb6403de2e0a42e1bc0a895a8c56dd6250efc4a392c2e2a0d27c38404e58f74"
 dependencies = [
  "async-stream",
  "daimon-core",
@@ -773,9 +773,9 @@ dependencies = [
 
 [[package]]
 name = "daimon-provider-local"
-version = "0.22.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65e4cff9694346c51d9c800742584a557e13c044eed37dce7a3cc3bca9224527"
+checksum = "23d21ea8fe5a1cc4420bd7189ba1f4d8f08d0146faec17926c405f5322f06f4d"
 dependencies = [
  "async-stream",
  "daimon-core",
@@ -789,9 +789,9 @@ dependencies = [
 
 [[package]]
 name = "daimon-provider-openai"
-version = "0.22.0"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "919517ec935d2b27fcbe82b647c098f4659af2f57528eb2959c776dd8e643f5c"
+checksum = "84edc3d59f48e523ff07eeb2c274a72c878f1ab8a70a2556d1b63a8bcc88f071"
 dependencies = [
  "async-stream",
  "daimon-core",
