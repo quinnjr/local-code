@@ -128,3 +128,21 @@ mod tests {
         assert_eq!(source.repo, "group/sub/project");
     }
 }
+
+#[cfg(test)]
+mod scaffolding_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_body_strips_c0_and_c1_controls_but_keeps_newlines_and_tabs() {
+        // `char::is_control` is Unicode Cc — C0 (incl. ESC, DEL) AND C1
+        // (incl. the raw single-byte CSI U+009B), so both escape-sequence
+        // introducers are stripped before a body reaches the terminal.
+        let hostile = "ok line\n\u{1b}[2Jcleared\u{9b}31mred\ttab\u{7f}";
+        let clean = sanitize_body(hostile.to_string());
+        // Only the control bytes themselves are stripped; the now-inert
+        // printable remainder of a sequence ("[2J", "31m") stays.
+        assert_eq!(clean, "ok line\n[2Jcleared31mred\ttab");
+        assert_eq!(sanitize_body("plain body".into()), "plain body");
+    }
+}

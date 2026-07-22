@@ -63,7 +63,8 @@ impl Tool for NamespacedMcpTool {
 
 /// Test-only bridge factory shared with sibling modules' tests (e.g.
 /// `tui::rebuild`'s duplicate-tool-name failure test): a minimal in-process
-/// `McpTransport` that never answers (none of its consumers execute the
+/// `McpTransport` that answers every request with an empty no-op result
+/// (its consumers only need the bridge's *name*; none ever execute the
 /// tool), wrapped in a real `McpToolBridge` carrying the given tool name.
 #[cfg(test)]
 pub(crate) mod test_support {

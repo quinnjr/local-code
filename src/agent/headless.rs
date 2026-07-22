@@ -76,11 +76,20 @@ fn combined_system_context(project_context: &str, rendered_skill_context: &str) 
     }
 }
 
+/// The headless tier rule, extracted so the FullAuto default is directly
+/// unit-testable — `run_headless` itself needs a live model, so this default
+/// otherwise had no regression signal.
+fn resolve_tier(permission_mode_override: Option<PermissionTier>) -> PermissionTier {
+    permission_mode_override.unwrap_or(PermissionTier::FullAuto)
+}
+
 /// Runs one full ReAct-loop turn headlessly and returns the final text response.
 /// Headless invocations default to `PermissionTier::FullAuto` (there is no TTY to
 /// answer an inline prompt); pass `permission_mode_override` to force a different
-/// tier (the project/user allow/deny list still applies as a hard boundary
-/// regardless of tier).
+/// tier. The project/user allow/deny list still applies regardless of tier —
+/// but note its actual scope: best-effort substring matching against bash
+/// commands only (see the `NOTE(security, v1 limitation)` in
+/// `permissions::gate`), not a hard boundary over every tool.
 pub async fn run_headless(
     paths: &Paths,
     project_root: &Path,
@@ -102,7 +111,7 @@ pub async fn run_headless(
     let model = build_model(&connection, api_key)?;
 
     let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;
-    let tier = permission_mode_override.unwrap_or(PermissionTier::FullAuto);
+    let tier = resolve_tier(permission_mode_override);
     let gate = Arc::new(PermissionGate::new(
         tier,
         settings,
@@ -139,6 +148,12 @@ pub async fn run_headless(
 mod tests {
     use super::*;
     use crate::config::connection::ProviderKind;
+
+    #[test]
+    fn tier_defaults_to_full_auto_without_an_override() {
+        assert_eq!(resolve_tier(None), PermissionTier::FullAuto);
+        assert_eq!(resolve_tier(Some(PermissionTier::Ask)), PermissionTier::Ask);
+    }
 
     fn conn(name: &str) -> Connection {
         Connection {
