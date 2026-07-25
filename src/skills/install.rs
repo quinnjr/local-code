@@ -81,8 +81,6 @@ fn io_err(path: &Path, source: std::io::Error) -> InstallError {
 }
 
 /// Fetches `source` from GitHub and installs it as `name` into `scope`.
-/// Fetches fully into a temp directory first, then renames it into place —
-/// a failed install never leaves a partially-written skill directory behind.
 /// Errors with `AlreadyInstalled` if a skill with this name already exists
 /// in this scope (use `update_skill` to refresh an existing install).
 pub async fn install_skill(
@@ -92,8 +90,9 @@ pub async fn install_skill(
     source: &SkillSource,
     name: &str,
 ) -> Result<(), InstallError> {
-    let target_dir = skills_dir(paths, scope).join(name);
-    if target_dir.exists() {
+    // Fail fast before any network I/O — the tail check in
+    // `install_resolved_files` remains as the authoritative race guard.
+    if skill_is_installed(paths, scope, name) {
         return Err(InstallError::AlreadyInstalled(name.to_string()));
     }
 
@@ -122,7 +121,30 @@ pub async fn install_skill(
         path: source.path.clone(),
         git_ref,
         commit_sha,
+        plugin: None,
     };
+
+    install_resolved_files(paths, scope, name, &files, &manifest)
+}
+
+/// Installs already-fetched skill files as `name` into `scope`, recording
+/// `manifest` alongside them. Fetches fully into a temp directory first,
+/// then renames it into place — a failed install never leaves a
+/// partially-written skill directory behind. This is the shared tail of
+/// `install_skill`, also used by marketplace plugin installs
+/// (`crate::marketplace::install`), which resolve and fetch their content
+/// through the marketplace rather than a single skill source.
+pub fn install_resolved_files(
+    paths: &Paths,
+    scope: Scope,
+    name: &str,
+    files: &[FetchedFile],
+    manifest: &InstalledSkillManifest,
+) -> Result<(), InstallError> {
+    let target_dir = skills_dir(paths, scope).join(name);
+    if target_dir.exists() {
+        return Err(InstallError::AlreadyInstalled(name.to_string()));
+    }
 
     let parent = target_dir.parent().expect("skills dir always has a parent");
     std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
@@ -130,7 +152,7 @@ pub async fn install_skill(
     if temp_dir.exists() {
         std::fs::remove_dir_all(&temp_dir).map_err(|e| io_err(&temp_dir, e))?;
     }
-    write_files(&temp_dir, &files, &manifest)?;
+    write_files(&temp_dir, files, manifest)?;
 
     std::fs::rename(&temp_dir, &target_dir).map_err(|e| io_err(&target_dir, e))?;
     Ok(())
@@ -235,11 +257,44 @@ pub async fn update_skill(
         ..manifest
     };
 
+    swap_skill_files(paths, scope, name, &files, &new_manifest)?;
+    Ok(true)
+}
+
+/// Replaces an installed skill's files with newly-fetched ones, the same way
+/// `update_skill` does but with a weaker atomicity guarantee than
+/// `install_resolved_files`: the new files are written to a temp directory
+/// first (which fails safe, same as install), then the old directory is
+/// renamed aside to a backup path, then the temp directory is renamed into
+/// place, then the backup is removed. A crash after the second rename leaves
+/// the new skill fully installed, with only an orphaned backup directory
+/// left to clean up; a crash before it leaves the old skill untouched (either
+/// still in place, or recoverable from the backup).
+///
+/// Shared tail of `update_skill`, also used by marketplace plugin updates
+/// (`crate::marketplace::install`), which fetch replacement content through
+/// the marketplace rather than by re-resolving the manifest's own source.
+/// Does NOT self-heal the crash window the way `update_skill` does — callers
+/// that need that must restore the backup first, as `update_skill` does.
+pub fn swap_skill_files(
+    paths: &Paths,
+    scope: Scope,
+    name: &str,
+    files: &[FetchedFile],
+    manifest: &InstalledSkillManifest,
+) -> Result<(), InstallError> {
+    let dir = skills_dir(paths, scope).join(name);
+    let parent = dir
+        .parent()
+        .expect("skills dir always has a parent")
+        .to_path_buf();
+    let backup_dir = replaced_backup_dir(&parent, name);
+
     let temp_dir = installing_temp_dir(&parent, name);
     if temp_dir.exists() {
         std::fs::remove_dir_all(&temp_dir).map_err(|e| io_err(&temp_dir, e))?;
     }
-    write_files(&temp_dir, &files, &new_manifest)?;
+    write_files(&temp_dir, files, manifest)?;
 
     if backup_dir.exists() {
         std::fs::remove_dir_all(&backup_dir).map_err(|e| io_err(&backup_dir, e))?;
@@ -247,7 +302,7 @@ pub async fn update_skill(
     std::fs::rename(&dir, &backup_dir).map_err(|e| io_err(&dir, e))?;
     std::fs::rename(&temp_dir, &dir).map_err(|e| io_err(&dir, e))?;
     std::fs::remove_dir_all(&backup_dir).map_err(|e| io_err(&backup_dir, e))?;
-    Ok(true)
+    Ok(())
 }
 
 /// Removes an installed skill's directory entirely.
@@ -257,6 +312,13 @@ pub fn remove_skill(paths: &Paths, scope: Scope, name: &str) -> Result<(), Insta
         return Err(InstallError::NotInstalled(name.to_string()));
     }
     std::fs::remove_dir_all(&dir).map_err(|e| io_err(&dir, e))
+}
+
+/// Whether a skill directory named `name` exists in `scope`. Used by
+/// marketplace plugin installs to pre-check every planned skill before
+/// writing any of them, so a conflicting plugin fails before half-installing.
+pub fn skill_is_installed(paths: &Paths, scope: Scope, name: &str) -> bool {
+    skills_dir(paths, scope).join(name).exists()
 }
 
 /// One row of `local-code skills list` output.
@@ -304,6 +366,17 @@ pub fn list_skills(paths: &Paths) -> Result<Vec<InstalledSkillSummary>, InstallE
                 }
             };
             let name = entry.file_name().to_string_lossy().to_string();
+            // Plugin-installed skills are managed (and updated) through
+            // their marketplace, so their source renders as the plugin they
+            // came from rather than as a `skills install`-style spec.
+            if let Some(plugin) = &manifest.plugin {
+                summaries.push(InstalledSkillSummary {
+                    name,
+                    scope,
+                    source: format!("plugin {}@{}", plugin.plugin, plugin.marketplace),
+                });
+                continue;
+            }
             let path_suffix = if manifest.path.is_empty() {
                 String::new()
             } else {
@@ -335,16 +408,19 @@ pub fn list_skills(paths: &Paths) -> Result<Vec<InstalledSkillSummary>, InstallE
     Ok(summaries)
 }
 
-/// Reads just the `host` field from an installed skill's manifest, without
-/// the rest of `list_skills`' full-scan/format work — used by
-/// `cli::skills::update` to pick the right `SkillClient` per skill before
-/// calling `update_skill`.
-pub fn skill_manifest_host(paths: &Paths, scope: Scope, name: &str) -> Result<Host, InstallError> {
+/// Reads an installed skill's manifest. Used by `cli::skills::update` to
+/// pick the right `SkillClient` per skill (and to skip plugin-managed
+/// skills) and by the marketplace plugin commands to map installed skills
+/// back to the plugin they came from.
+pub fn read_skill_manifest(
+    paths: &Paths,
+    scope: Scope,
+    name: &str,
+) -> Result<InstalledSkillManifest, InstallError> {
     let manifest_path = skills_dir(paths, scope).join(name).join(MANIFEST_FILENAME);
     let manifest_text =
         std::fs::read_to_string(&manifest_path).map_err(|e| io_err(&manifest_path, e))?;
-    let manifest: InstalledSkillManifest = serde_json::from_str(&manifest_text)?;
-    Ok(manifest.host)
+    Ok(serde_json::from_str(&manifest_text)?)
 }
 
 #[cfg(test)]
@@ -535,10 +611,13 @@ mod tests {
 
         // Point the raw-file download at a port nothing is listening on (port 1 is
         // a privileged port no unprivileged process can bind, so it's reliably
-        // unreachable), so the download fails at the connection level (simulating
-        // a mid-fetch failure) rather than merely returning a non-2xx status —
-        // `fetch_directory_files` never checks the raw download's HTTP status, so
-        // a mocked 500 response would be "successfully" downloaded as file content.
+        // unreachable), so the download fails at the connection level. A mocked
+        // non-2xx response would also error these days — `fetch_directory_files`
+        // now checks the raw download's HTTP status and maps non-2xx to
+        // `SkillHostError::Api` (pinned by
+        // `github.rs::fetch_directory_files_errors_when_raw_download_returns_non_2xx`)
+        // — but a connection-level failure remains the cleanest way to simulate
+        // a mid-fetch abort.
         let dead_download_url = "http://127.0.0.1:1/raw/SKILL.md".to_string();
 
         let server = MockServer::start().await;
@@ -721,6 +800,7 @@ mod tests {
             path: "skills/pdf".into(),
             git_ref: "main".into(),
             commit_sha: "abc123".into(),
+            plugin: None,
         };
         std::fs::write(
             backup_dir.join(MANIFEST_FILENAME),
@@ -860,6 +940,7 @@ mod tests {
             path: "skills/pdf".into(),
             git_ref: "main".into(),
             commit_sha: "abc123".into(),
+            plugin: None,
         };
         let files = vec![
             FetchedFile {
@@ -895,6 +976,7 @@ mod tests {
             path: "skills/pdf".into(),
             git_ref: "main".into(),
             commit_sha: "abc123".into(),
+            plugin: None,
         };
         let files = vec![FetchedFile {
             relative_path: PathBuf::from("/etc/passwn"),

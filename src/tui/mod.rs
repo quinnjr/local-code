@@ -222,7 +222,7 @@ pub async fn run_tui(
                 tier,
                 chrono::Utc::now(),
             )
-            .map_err(TuiSessionError::Session)?;
+            .map_err(|e| TuiSessionError::Session(e.source))?;
             (tier, Vec::new(), Vec::new(), path, created_at)
         }
     };

@@ -145,10 +145,8 @@ pub fn save_connections(dir: &Path, connections: &[Connection]) -> Result<(), Co
         connections: connections.to_vec(),
     };
     let text = toml::to_string_pretty(&file).expect("Connection serializes without error");
-    fs::write(dir.join("connections.toml"), text).map_err(|source| ConnectionsError::Write {
-        path: dir.to_path_buf(),
-        source,
-    })
+    let path = dir.join("connections.toml");
+    fs::write(&path, text).map_err(|source| ConnectionsError::Write { path, source })
 }
 
 #[cfg(test)]
@@ -245,6 +243,20 @@ default_model = "m2"
             matches!(err, ConnectionsError::Write { .. }),
             "a save failure must be labeled Write, not Read: {err}"
         );
+    }
+
+    #[test]
+    fn save_connections_write_error_names_the_file_not_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the config FILE should be: fs::write fails.
+        std::fs::create_dir(dir.path().join("connections.toml")).unwrap();
+        let err = save_connections(dir.path(), &[]).unwrap_err();
+        match err {
+            ConnectionsError::Write { path, .. } => {
+                assert_eq!(path, dir.path().join("connections.toml"));
+            }
+            other => panic!("a save failure must be labeled Write, not Read: {other}"),
+        }
     }
 
     #[test]

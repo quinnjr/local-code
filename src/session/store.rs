@@ -86,11 +86,27 @@ fn write_session_json<T: serde::Serialize>(path: &Path, session: &T) -> Result<(
     )
 }
 
+/// `create_fresh_session`'s error: the initial save failed, but the
+/// allocated session path is preserved so a caller that has already
+/// committed to the new session (`/clear`, which has just torn down the old
+/// one) can adopt the path anyway — a transient write failure then
+/// self-heals on the next successful save, instead of stranding subsequent
+/// turns in the session the user just left.
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct CreateSessionError {
+    /// The path the fresh session file was meant to be written to.
+    pub path: PathBuf,
+    #[source]
+    pub source: SessionError,
+}
+
 /// Allocates a fresh session file on disk and returns `(path, created_at)`.
 /// The single shared "birth a session" recipe — used by `run_tui` for the
-/// startup session and by `Workspace` for every new tab/pane, so the two can
-/// never drift field-for-field (they previously open-coded identical
-/// `new_session_path` → `SessionFile::new` → `save_session` sequences).
+/// startup session, by `Workspace` for every new tab/pane, and by `/clear`,
+/// so the three can never drift field-for-field (they previously open-coded
+/// identical `new_session_path` → `SessionFile::new` → `save_session`
+/// sequences).
 pub fn create_fresh_session(
     user_state_dir: &Path,
     project_root: &Path,
@@ -98,7 +114,7 @@ pub fn create_fresh_session(
     model_name: &str,
     tier: PermissionTier,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<(PathBuf, String), SessionError> {
+) -> Result<(PathBuf, String), CreateSessionError> {
     let path = new_session_path(user_state_dir, project_root, now);
     let created_at = now.to_rfc3339();
     let session = SessionFile::new(
@@ -108,7 +124,10 @@ pub fn create_fresh_session(
         tier,
         created_at.clone(),
     );
-    save_session(&path, &session)?;
+    save_session(&path, &session).map_err(|source| CreateSessionError {
+        path: path.clone(),
+        source,
+    })?;
     Ok((path, created_at))
 }
 
@@ -189,6 +208,14 @@ pub fn list_sessions(
         let Ok(session) = load_session(&path) else {
             continue;
         };
+        // A `project_slug` collision can land another project's session
+        // files in this directory; they aren't this project's sessions, so
+        // exclude them — this is the "caught immediately by
+        // `SessionFile::project_root` not matching" check the slug doc
+        // refers to.
+        if session.project_root != project_root {
+            continue;
+        }
         // Sessions with no transcript at all are skipped: every launch and
         // every new workspace tab/pane eagerly writes an (empty) session
         // file, so without this filter a user who opens a few tabs and types
@@ -422,6 +449,55 @@ mod tests {
         assert_eq!(loaded.connection_name, "conn");
         assert_eq!(loaded.model_name, "model");
         assert!(loaded.entries.is_empty());
+    }
+
+    #[test]
+    fn create_fresh_session_error_carries_the_allocated_path() {
+        let dir = tempdir().unwrap();
+        // `user_state_dir` is a regular FILE, so the save fails — and the
+        // error must still carry the path the session was meant to live at,
+        // so callers like `/clear` can adopt it despite the failure.
+        let state_file = dir.path().join("not-a-dir");
+        fs::write(&state_file, "x").unwrap();
+
+        let err = create_fresh_session(
+            &state_file,
+            Path::new("/proj"),
+            "conn",
+            "model",
+            PermissionTier::Ask,
+            chrono::Utc::now(),
+        )
+        .unwrap_err();
+        assert!(
+            err.path.starts_with(&state_file) && err.path.extension().is_some_and(|e| e == "json"),
+            "the allocated session path must be preserved: {}",
+            err.path.display()
+        );
+        assert!(matches!(err.source, SessionError::Write { .. }));
+    }
+
+    #[test]
+    fn list_sessions_excludes_sessions_from_other_projects_on_slug_collision() {
+        let user_state_dir = tempdir().unwrap();
+        let project_root = Path::new("/proj");
+        // Simulate a `project_slug` collision: another project's session
+        // file shares this project's listing directory.
+        let dir = session_dir_for_project(user_state_dir.path(), project_root);
+        fs::create_dir_all(&dir).unwrap();
+
+        save_session(
+            &dir.join("mine.json"),
+            &sample("mine", "2026-07-06T00:00:00Z"),
+        )
+        .unwrap();
+        let mut foreign = sample("foreign", "2026-07-05T00:00:00Z");
+        foreign.project_root = PathBuf::from("/other-proj");
+        save_session(&dir.join("foreign.json"), &foreign).unwrap();
+
+        let sessions = list_sessions(user_state_dir.path(), project_root).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].connection_name, "mine");
     }
 
     #[test]

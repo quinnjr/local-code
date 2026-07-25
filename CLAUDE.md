@@ -59,7 +59,7 @@ cargo test --test live_ollama -- --ignored --nocapture
 ### Module map (`src/`)
 
 - `cli/` — clap `Cli`/`Command` definitions and the non-interactive subcommand handlers
-  (`connections`, `mcp`, `memory`, `skills`, `secret`). `cli::run` is the top-level dispatcher called from
+  (`connections`, `mcp`, `memory`, `skills`, `marketplace`, `plugin`, `secret`). `cli::run` is the top-level dispatcher called from
   `main.rs`: `-p/--prompt` routes to headless mode, a `Command` routes to a CLI subcommand handler,
   and no args/command launches the TUI.
 - `tui/` — the interactive terminal UI, built as an `ntui` component tree.
@@ -145,10 +145,31 @@ cargo test --test live_ollama -- --ignored --nocapture
     written before multi-host support still deserialize as `GitHub`).
   - `install.rs` is host-agnostic: `install_skill`/`update_skill` take `&SkillClient` and never
     branch on which host they're talking to — all host-specific behavior lives inside `SkillClient`
-    and the three client modules.
+    and the three client modules. Their fetch-free tails (`install_resolved_files` /
+    `swap_skill_files`) are shared with marketplace plugin installs, which resolve and fetch
+    through the marketplace instead of a skill spec.
   - `discovery.rs`/`frontmatter.rs`/`agent/skill_tool.rs` operate purely on already-downloaded
     local files and know nothing about hosts — everything upstream of "skill is on disk" is
     host-agnostic by design.
+- `marketplace/` — Claude Code plugin marketplaces (`.claude-plugin/marketplace.json` catalogs):
+  `marketplace add/list/remove` registers sources, `plugin list/install/remove/update` installs
+  plugins' skills from them.
+  - `catalog.rs` parses and validates the catalog schema, including the four plugin source kinds
+    (`./relative`, `github`, `url`, `git-subdir`, `npm` — npm is parsed but rejected at install).
+  - `source.rs` holds the persisted `MarketplaceSource` enum (`Remote` fetched via the skill host
+    clients / `Local` directory read live — the same kebab-case tagged-enum convention as
+    `McpTransportConfig`), the add-spec parser (an existing directory is local; anything else goes
+    through `skills::spec::parse_spec`), and git-URL parsing for `url`/`git-subdir` plugin sources.
+  - `registry.rs` is the user-level `marketplaces.toml` (one marketplace per name, re-adding
+    replaces). Marketplaces are user-level only — they're a discovery mechanism; the skills
+    plugins install land in the normal project/global skill scopes.
+  - `install.rs` fetches catalogs fresh on every operation (no clone/cache like Claude Code's),
+    finds each plugin's `skills/*/SKILL.md` dirs (default scan, or the catalog entry's `skills`
+    paths), and installs them as ordinary skills whose manifests carry a `PluginProvenance`
+    (`skills::types`). That provenance is what makes `skills update` skip plugin-managed skills
+    (they belong to `plugin update`), and lets `plugin remove`/`plugin list` map installed
+    skills back to their plugin. Client construction is injected (a `ClientFor` fn) because a
+    plugin's source host can differ from its marketplace's host.
 - `memory/` — flat-file, cross-session memory (`memory search`/`memory core`/`memory core add`/`memory add`):
   `buffer.rs` (short-term), `rollup.rs` (daily/recent/archive rollup), `search.rs` (keyword search
   across all of it).

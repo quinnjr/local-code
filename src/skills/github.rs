@@ -133,6 +133,17 @@ struct ContentsEntry {
     download_url: Option<String>,
 }
 
+/// True when `url` is `base` plus a path — i.e. the prefix match ends at a
+/// host boundary, so a lookalike host like `https://api.github.com.evil.com`
+/// doesn't pass the token check. Every URL this client requests has a path
+/// after the host (API URLs are `{api_base}/repos/...`, raw downloads are
+/// `https://raw.githubusercontent.com/<owner>/<repo>/...`, and test-mock
+/// download URLs are `server.uri() + "/raw/..."`), so requiring the trailing
+/// `/` works for both production and tests.
+fn under_base(url: &str, base: &str) -> bool {
+    url.starts_with(&format!("{base}/"))
+}
+
 impl GithubClient {
     pub fn new(token: Option<String>) -> Self {
         Self {
@@ -164,9 +175,9 @@ impl GithubClient {
     fn request(&self, url: &str) -> reqwest::RequestBuilder {
         let mut req = self.http.get(url).header("User-Agent", "local-code");
         if let Some(token) = &self.token {
-            let is_github_host = url.starts_with("https://api.github.com")
-                || url.starts_with("https://raw.githubusercontent.com")
-                || url.starts_with(&self.api_base); // covers the test-mock api_base override
+            let is_github_host = under_base(url, "https://api.github.com")
+                || under_base(url, "https://raw.githubusercontent.com")
+                || under_base(url, &self.api_base); // covers the test-mock api_base override
             if is_github_host {
                 req = req.header("Authorization", format!("Bearer {token}"));
             }
@@ -552,6 +563,17 @@ mod github_client_tests {
             "http://127.0.0.1:1".to_string(),
         );
         let request = client.request("https://example.invalid/SKILL.md");
+        let built = request.build().unwrap();
+        assert!(built.headers().get("Authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn does_not_send_bearer_token_to_lookalike_github_host() {
+        let client = GithubClient::new_for_test(
+            Some("test-token".to_string()),
+            "https://api.github.com".to_string(),
+        );
+        let request = client.request("https://api.github.com.evil.com/x");
         let built = request.build().unwrap();
         assert!(built.headers().get("Authorization").is_none());
     }

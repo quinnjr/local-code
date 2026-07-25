@@ -98,3 +98,14 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    other run of the same tree (local runs, PR #14, the #14 merge commit's develop run).
    Revisit by waiting on the notice itself (poll the frame until it appears) instead of a
    fixed tick count if it flakes again.
+
+16. **Plugin marketplaces install skills only, and catalogs are fetched live.** A Claude Code
+    marketplace's plugins are installed by scanning their `skills/*/SKILL.md` dirs (or the catalog
+    entry's `skills` paths); plugin `commands`/`agents`/`hooks`/`mcpServers` and `.claude-plugin/plugin.json`
+    component config are ignored — LocalCode has no command/agent/hook concepts. `npm` plugin
+    sources are unsupported, and `url`/`git-subdir` sources only accept https and SSH URLs on the
+    three known skill hosts (no self-hosted). The marketplace registry is user-level only
+    (`marketplaces.toml` in the user config dir), catalogs are re-fetched on every operation
+    (no offline clone/cache like Claude Code's `~/.claude/plugins/`), and installed plugin skills
+    are picked up only where skills are discovered — TUI startup and each headless run — so
+    installing mid-session takes effect on the next TUI launch, not via `/model` rebuilds.

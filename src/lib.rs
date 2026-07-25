@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 mod fsutil;
 pub mod init;
+pub mod marketplace;
 pub mod mcp;
 pub mod memory;
 pub mod permissions;
