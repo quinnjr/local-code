@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- New `serve_artifacts` built-in tool: serves
+  `<project>/.local-code/artifacts/` over a localhost-only HTTP server
+  (OS-assigned port, unguessable token in the URL, reused across agent
+  rebuilds) so the agent can showcase HTML/CSS/JS mockups and other
+  visual work in your browser.
 - The flat-file memory pipeline now actually runs: `memory add` rolls a
   previous day's buffer into its daily file and ages old daily files into
   `recent.md`/`archive.md`, and the new `memory core add <text>` records

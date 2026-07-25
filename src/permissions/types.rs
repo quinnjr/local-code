@@ -29,12 +29,23 @@ pub enum ToolKind {
 ///
 /// Unknown tool names (e.g. future MCP-provided tools) intentionally classify as
 /// [`ToolKind::Edit`] rather than [`ToolKind::ReadOnly`] — the safe default is to
-/// prompt for anything we don't explicitly know is read-only.
+/// prompt for anything we don't explicitly know is read-only. Known built-ins whose
+/// risk profile doesn't match that default (`serve_artifacts`) get an explicit arm
+/// above the catch-all rather than riding it.
 pub fn classify_tool(name: &str) -> ToolKind {
     match name {
         "read_file" | "grep" | "glob" => ToolKind::ReadOnly,
         "write_file" | "edit_file" => ToolKind::Edit,
         "bash" => ToolKind::Bash,
+        // Starting a persistent network listener has a bash-like risk profile —
+        // a side-effecting capability the user should approve — so it classifies
+        // as `Bash` rather than riding the `Edit` catch-all (which auto-approves
+        // in `AutoAcceptEdits`). As `Bash` it prompts in both `Ask` and
+        // `AutoAcceptEdits` and stays automatic in `FullAuto` (see the tier match
+        // in `permissions::gate::check`). The gate's Bash-specific
+        // always_allow/always_deny command-substring handling is a no-op here
+        // because `serve_artifacts` takes no `command` argument.
+        "serve_artifacts" => ToolKind::Bash,
         _ => ToolKind::Edit,
     }
 }
@@ -88,6 +99,15 @@ mod tests {
     #[test]
     fn bash_classifies_as_bash() {
         assert_eq!(classify_tool("bash"), ToolKind::Bash);
+    }
+
+    #[test]
+    fn serve_artifacts_classifies_as_bash() {
+        // Starting a persistent network listener must prompt outside FullAuto,
+        // so it classifies as Bash — pinned here so a future refactor can't
+        // silently drop the explicit arm and reclassify it back to the
+        // auto-approving (in AutoAcceptEdits) Edit catch-all.
+        assert_eq!(classify_tool("serve_artifacts"), ToolKind::Bash);
     }
 
     #[test]
