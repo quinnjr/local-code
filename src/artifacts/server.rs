@@ -821,6 +821,10 @@ mod tests {
         assert!(!response.text().await.unwrap().contains("top secret"));
     }
 
+    // `std::os::unix::fs::symlink` is unix-only (and Windows symlink creation
+    // needs privileges anyway), so the symlink-escape tests are gated to unix;
+    // the containment check they cover is platform-agnostic.
+    #[cfg(unix)]
     #[tokio::test]
     async fn symlinks_escaping_the_served_dir_are_a_404() {
         let dir = tempdir().unwrap();
@@ -836,6 +840,7 @@ mod tests {
         assert!(!response.text().await.unwrap().contains("top secret"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn symlinked_index_html_pointing_outside_is_not_served() {
         let dir = tempdir().unwrap();
