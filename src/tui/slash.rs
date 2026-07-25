@@ -7,7 +7,7 @@ pub enum SlashCommand {
     Model,
     ConnectionsList,
     ConnectionsRemove { name: String },
-    ConnectionsAddUnsupported,
+    ConnectionsAdd,
     McpList,
     McpRemove { name: String },
     McpAdd,
@@ -41,7 +41,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
             ["remove", name] => SlashCommand::ConnectionsRemove {
                 name: name.to_string(),
             },
-            ["add"] => SlashCommand::ConnectionsAddUnsupported,
+            ["add"] => SlashCommand::ConnectionsAdd,
             _ => SlashCommand::Unknown {
                 raw: trimmed.to_string(),
             },
@@ -96,7 +96,7 @@ mod tests {
         );
         assert_eq!(
             parse_slash_command("/connections add"),
-            Some(SlashCommand::ConnectionsAddUnsupported)
+            Some(SlashCommand::ConnectionsAdd)
         );
         assert_eq!(parse_slash_command("/init"), Some(SlashCommand::Init));
         assert_eq!(

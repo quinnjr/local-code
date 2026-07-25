@@ -62,10 +62,10 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
 11. **MCP connections added at runtime via `/mcp add` are not closed at exit.** `run_tui` retains
    the startup tool set and closes those server connections in an orderly way after the render
    loop exits (`mcp::connect::close_all`, added with daimon 0.22.1's `McpToolBridge::close`), but
-   tools discovered by an in-TUI `/mcp add` live in per-pane `mcp_tools_state` inside `App`
-   components, which `run_tui` cannot reach after `ntui::render` returns — those children are
-   reaped by process teardown breaking their pipes, exactly as all connections were before.
-   Revisit if a shared connection registry ever gets threaded through `AppProps`.
+    tools discovered by an in-TUI `/mcp add` live in per-pane `mcp_tools_state` inside `App`
+    components, which `run_tui` cannot reach after `ntui::render` returns — those children are
+    reaped by process teardown breaking their pipes, exactly as all connections were before.
+    Revisit if a shared connection registry ever gets threaded through `AppProps`.
 
 12. **The `serve_artifacts` HTTP server has no shutdown and is of limited use headless.** Once
    started it serves until process exit — deliberate, so URLs survive agent rebuilds and every
@@ -109,3 +109,17 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
     (no offline clone/cache like Claude Code's `~/.claude/plugins/`), and installed plugin skills
     are picked up only where skills are discovered — TUI startup and each headless run — so
     installing mid-session takes effect on the next TUI launch, not via `/model` rebuilds.
+
+17. **Pasting into the input box or a wizard works only for single-line content, and pasted
+    newlines act as Enter.** ntui 0.2.0 doesn't enable bracketed paste, so a paste arrives as
+    ordinary key events: chars insert fine, but every pasted newline submits the current
+    input/wizard step (a trailing newline usually does the right thing by accident; embedded
+    newlines cascade answers). Atomic, newline-safe paste lands with ntui's
+    `feat/bracketed-paste` branch (`use_paste` hook, `TestTerminal::send_paste`): once a
+    release with it is published and the dependency bumped, wire `use_paste` into `App`'s
+    input handler to push pasted text into `input_buffer` whole — sanitizing newlines to
+    spaces while a wizard is active (single-line fields), inserting verbatim in the normal
+    input box. The same ntui branch adds programmatic copy (`AppHandle::copy_to_clipboard`,
+    OSC 52): after the bump, also wire a keybinding (e.g. Ctrl+Y) that yanks the last
+    assistant message to the system clipboard. (Mouse-selection copy already works today —
+    ntui never captures the mouse.)

@@ -4,12 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`local-code` is a Claude-Code-style terminal coding agent that talks exclusively to local and
-local-network OpenAI-compatible LLM servers (llama.cpp, vLLM, LM Studio, Ollama) — no cloud calls,
-no API keys required for inference. It's a Rust binary (`local-code`) built on top of two sibling
+`local-code` is a Claude-Code-style terminal coding agent that talks primarily to local and
+local-network OpenAI-compatible LLM servers (llama.cpp, vLLM, LM Studio, Ollama) — no cloud
+calls, no API keys required for local inference — with optional hosted access to any model
+through OpenRouter. It's a Rust binary (`local-code`) built on top of two sibling
 crates: `ntui` (a custom Ink-style TUI framework, flexbox layout via `taffy`) and `daimon` (the
 agent framework providing `Agent`/`AgentBuilder`, model providers, MCP transports, tool-calling).
-Both are external dependencies pulled from crates.io, not part of this repo.
+Both are external dependencies pulled from crates.io, not part of this repo. OpenRouter
+connections are served by daimon's own `daimon-provider-openrouter` (the `openrouter`
+cargo feature); there is no in-repo provider code.
 
 ## Workflow
 
@@ -71,7 +74,16 @@ cargo test --test live_ollama -- --ignored --nocapture
     every rebuild site constructs an agent the same way.
   - `mcp_wizard.rs` is a pure state machine for the `/mcp add` in-TUI stepper (transport selection,
     prompts, `Advance` enum) — kept side-effect-free and unit-testable separately from `app.rs`'s
-    wiring of it.
+    wiring of it. `connections_wizard.rs` is the same pattern for `/connections add`
+    (name → provider → base URL → default model → API key); its `Finalize` task stores the key
+    in the keyring, fetches OpenRouter's model catalog into `Connection.models` for the `/model`
+    picker (OpenRouter connections only), and saves to the project-level connections.toml.
+    Connection API keys live ONLY in the OS keyring — never in connections.toml, session files,
+    or any other on-disk state (guarded by
+    `connections_add_api_key_lands_only_in_the_keyring_never_on_disk`). Note the CLI
+    `connections add` does NOT fetch the OpenRouter catalog (it's synchronous — no runtime
+    context for the HTTP call), so CLI-created OpenRouter connections keep `models = []`
+    until filled by hand or re-added in-TUI.
   - `theme.rs` — the app-wide `ntui::widgets::Theme` (`local_code_theme()`), the brand
     gradient endpoints (`BRAND_FROM`/`BRAND_TO`) and semantic consts (`TOOL_ACCENT`,
     `WARN`/`ON_WARN`), and the shared `chip()` helper. Provided once via `ContextProvider` at
