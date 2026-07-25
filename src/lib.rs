@@ -2,6 +2,7 @@ pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod context;
+mod fsutil;
 pub mod init;
 pub mod mcp;
 pub mod memory;

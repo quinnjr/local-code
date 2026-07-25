@@ -61,6 +61,21 @@
   secrets (API keys, tokens) don't need to be stored in the file itself.
 - Added SSE and WebSocket MCP transports.
 
+- **Breaking (Windows)**: per-user session state moved from the roaming
+  profile (`%APPDATA%\local-code\local-code\data`) to the machine-local
+  profile (`%LOCALAPPDATA%\local-code\local-code\data`). Existing sessions
+  are migrated automatically on first run (one-time rename of the
+  `sessions` dir when the new location doesn't exist yet); if migration
+  can't happen — e.g. the two locations are on different volumes — move
+  `%APPDATA%\local-code\local-code\data\sessions` to
+  `%LOCALAPPDATA%\local-code\local-code\data\sessions` by hand to keep
+  `--resume` history.
+- Per-turn session saves are now crash-atomic: written to a temp file in
+  the same directory, fsynced, then renamed into place — a crash or kill
+  mid-turn can no longer corrupt a session file.
+- CI now compile-checks all targets on windows-latest and macos-latest and
+  runs the per-OS directory/session-store tests natively on those platforms.
+
 ## v0.1.0
 
 Initial release.

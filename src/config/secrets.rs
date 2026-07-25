@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -162,16 +161,9 @@ pub fn list_secret_names(user_config_dir: &Path) -> Result<Vec<String>, SecretsE
     Ok(file.names)
 }
 
-/// Returns a per-process-unique suffix for temp file names, so concurrent
-/// `write_index` calls within the same process never race on the same temp
-/// path.
-fn next_tmp_suffix() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Writes `names` to the index atomically: the new contents are written to a
-/// temp file in the same directory, then renamed over `secret-names.toml`.
+/// Writes `names` to the index atomically via the shared helper
+/// (`fsutil::write_atomically`): the new contents are written to a temp
+/// file in the same directory, then renamed over `secret-names.toml`.
 /// `rename` within one filesystem is atomic, so a crash or a concurrent
 /// writer can never observe a truncated or partially-written index — the
 /// file that exists at `secret-names.toml` is always either the old
@@ -186,16 +178,19 @@ fn write_index(user_config_dir: &Path, names: &[String]) -> Result<(), SecretsEr
     };
     let text = toml::to_string_pretty(&file).expect("SecretNamesFile serializes without error");
     let path = index_path(user_config_dir);
-    let tmp_path = user_config_dir.join(format!(
-        "secret-names.toml.tmp-{}-{}",
-        std::process::id(),
-        next_tmp_suffix()
-    ));
-    std::fs::write(&tmp_path, text).map_err(|source| SecretsError::Index {
-        path: tmp_path.clone(),
-        source,
-    })?;
-    std::fs::rename(&tmp_path, &path).map_err(|source| SecretsError::Index { path, source })
+    crate::fsutil::write_atomically(
+        &path,
+        |w| {
+            std::io::Write::write_all(w, text.as_bytes()).map_err(|source| SecretsError::Index {
+                path: path.clone(),
+                source,
+            })
+        },
+        |source| SecretsError::Index {
+            path: path.clone(),
+            source,
+        },
+    )
 }
 
 /// Validates `name`, stores the value in the OS keyring, and records the name
