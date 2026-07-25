@@ -89,3 +89,12 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    files into it directly, so the race buys them nothing. Revisit if the artifacts dir is ever
    writable by a less-trusted principal than the one reading via HTTP, or if
    `openat2(RESOLVE_BENEATH)`-style APIs become practical via the existing dep tree.
+
+15. **`tui::app::tests::model_switch_updates_the_model_compact_uses` is flaky under CI load.**
+   The paused-time (`start_paused`) test drives a real reqwest call to a dead port
+   (`127.0.0.1:1`) behind a fixed 60×10ms tick budget; on a loaded runner the connection
+   error can surface after the budget is exhausted, failing the assertion on the
+   "compact failed" notice. Observed once on PR #15's CI; it passed on re-run and on every
+   other run of the same tree (local runs, PR #14, the #14 merge commit's develop run).
+   Revisit by waiting on the notice itself (poll the frame until it appears) instead of a
+   fixed tick count if it flakes again.
