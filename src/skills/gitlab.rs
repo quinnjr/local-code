@@ -258,24 +258,9 @@ impl GitlabClient {
 /// `/`), unlike the ref-encoding helper below which only needs to escape `/`.
 fn urlencoding_path(path: &str) -> String {
     path.split('/')
-        .map(percent_encode_segment)
+        .map(crate::url::encode_path_segment)
         .collect::<Vec<_>>()
         .join("%2F")
-}
-
-fn percent_encode_segment(segment: &str) -> String {
-    // Minimal percent-encoding sufficient for path segments used here (no
-    // spaces or unicode expected in practice, but encode defensively).
-    let mut out = String::new();
-    for byte in segment.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 /// Parses the `rel="next"` URL out of GitLab's `Link` response header, if

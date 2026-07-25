@@ -92,10 +92,21 @@ cargo test --test live_ollama -- --ignored --nocapture
     `GatedTool` (see `permissions/`), so permission enforcement is identical across all tool
     sources and both `Agent::prompt`/`Agent::prompt_stream`. Both TUI and headless mode call
     through this same function; don't add a parallel registration path.
-  - `tools.rs` — the six built-in tools (`ReadFile`, `WriteFile`, `EditFile`, `Bash`, `Grep`,
-    `Glob`).
+  - `tools.rs` — the six `#[tool_fn]` built-in tools (`ReadFile`, `WriteFile`, `EditFile`,
+    `Bash`, `Grep`, `Glob`). The remaining built-ins are struct impls elsewhere: `SkillTool`
+    (`agent/skill_tool.rs`, holds the discovered skill list) and `ServeArtifacts`
+    (`artifacts/tool.rs`, stateless — server state lives in `artifacts::server`'s process-wide
+    registry).
   - `headless.rs` — the `-p/--prompt` non-interactive path (`run_headless`), used by both the CLI
     and by `local-code`'s own live integration tests.
+- `artifacts/` — localhost HTTP serving of agent-created artifacts (HTML/CSS/JS mockups and more)
+  so the agent can showcase visual work in the user's browser. `server.rs` is a hand-rolled HTTP/1.1
+  static-file server (tokio only, no new deps) bound to 127.0.0.1 on an OS-assigned port; URLs
+  404 without an unguessable per-server token path component, the `Host` header is validated
+  (anti-DNS-rebinding), and dotfiles are never served or listed. A canonical-dir-keyed process-wide
+  registry lets each rebuild's fresh tool instance reuse the running server. `tool.rs` is the
+  `serve_artifacts` built-in: starts/reuses the server for `<project>/.local-code/artifacts/` and
+  returns the base URL; the agent drops files there with `write_file` and shares the links.
 - `permissions/` — the permission-tier system (`Ask` / `AutoAcceptEdits` / `FullAuto`).
   `gate::PermissionGate` is the single enforcement point every tool call passes through
   (`agent::gated_tool::GatedTool` wraps a tool and checks the gate before executing). `settings.rs`
@@ -163,7 +174,8 @@ cargo test --test live_ollama -- --ignored --nocapture
   `buffer.rs` (short-term), `rollup.rs` (daily/recent/archive rollup), `search.rs` (keyword search
   across all of it).
 - `session/` — session persistence (`store.rs` load/save, `types.rs::SessionFile`); every TUI turn
-  is saved so `local-code --resume` (or in-TUI `/resume`) can reopen it later.
+  is saved (atomically — temp file in the same dir, then rename — so a crash mid-turn can't
+  corrupt a session) so `local-code --resume` (or in-TUI `/resume`) can reopen it later.
 - `context/mod.rs::load_project_context` — loads and concatenates project `AGENTS.md`/`CLAUDE.md`
   and user-level `AGENTS.md`/`CLAUDE.md` (in that order) into the system prompt. Both the TUI
   (`tui::run_tui`) and headless mode (`agent::headless::run_headless`) load this context.
@@ -178,10 +190,16 @@ cargo test --test live_ollama -- --ignored --nocapture
 - **One tool-registration path.** Never add tools to an `Agent` outside
   `agent::build::register_all_tools` — TUI and headless mode must always end up with the same tool
   set built the same way.
-- **`Paths`** (`config::paths::Paths`) is the single source of truth for where config/state live:
-  `user_config_dir` (OS config dir via `directories`), `project_config_dir` (`.local-code/` under
-  the project root), `user_state_dir` (OS state dir, sessions live here). Always resolve via
-  `Paths::resolve(project_root)`, don't hand-roll path joins elsewhere.
+- **`Paths`** (`config::paths::Paths`) is the single source of truth for where config/state live,
+  resolved per-OS via the `directories` crate: `user_config_dir` (XDG config dir on Linux & the
+  BSDs, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows), `project_config_dir`
+  (`.local-code/` under the project root), `user_state_dir` (XDG state dir on Linux & the BSDs,
+  `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows — machine-local, never
+  the roaming profile; sessions live here). Always resolve via `Paths::resolve(project_root)`,
+  don't hand-roll path joins elsewhere. Temporary/staging files are written via the shared
+  `fsutil::write_atomically` helper (temp file next to the final target, fsync, atomic rename —
+  never a hardcoded `/tmp`); tests use the `tempfile` dev-dependency, which honors the OS temp
+  dir on every platform.
 - **`mcp.toml`** supports `${VAR_NAME}` (environment) and `${keyring:<name>}` (OS keyring via
   `SecretStore`, managed by `local-code secret set/rm/ls`) interpolation at load time
   (`config::mcp_servers::load_mcp_servers` interpolates; `load_mcp_servers_raw` does not — used

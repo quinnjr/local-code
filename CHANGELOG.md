@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- New `serve_artifacts` built-in tool: serves
+  `<project>/.local-code/artifacts/` over a localhost-only HTTP server
+  (OS-assigned port, unguessable token in the URL, reused across agent
+  rebuilds) so the agent can showcase HTML/CSS/JS mockups and other
+  visual work in your browser.
 - The flat-file memory pipeline now actually runs: `memory add` rolls a
   previous day's buffer into its daily file and ages old daily files into
   `recent.md`/`archive.md`, and the new `memory core add <text>` records
@@ -60,6 +65,21 @@
 - Added `${VAR_NAME}` environment-variable interpolation in `mcp.toml`, so
   secrets (API keys, tokens) don't need to be stored in the file itself.
 - Added SSE and WebSocket MCP transports.
+
+- **Breaking (Windows)**: per-user session state moved from the roaming
+  profile (`%APPDATA%\local-code\local-code\data`) to the machine-local
+  profile (`%LOCALAPPDATA%\local-code\local-code\data`). Existing sessions
+  are migrated automatically on first run (one-time rename of the
+  `sessions` dir when the new location doesn't exist yet); if migration
+  can't happen — e.g. the two locations are on different volumes — move
+  `%APPDATA%\local-code\local-code\data\sessions` to
+  `%LOCALAPPDATA%\local-code\local-code\data\sessions` by hand to keep
+  `--resume` history.
+- Per-turn session saves are now crash-atomic: written to a temp file in
+  the same directory, fsynced, then renamed into place — a crash or kill
+  mid-turn can no longer corrupt a session file.
+- CI now compile-checks all targets on windows-latest and macos-latest and
+  runs the per-OS directory/session-store tests natively on those platforms.
 
 ## v0.1.0
 
