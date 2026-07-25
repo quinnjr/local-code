@@ -175,6 +175,12 @@ pub async fn close_all(tools: &[NamespacedMcpTool]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use daimon::mcp::protocol::{JsonRpcNotification, JsonRpcResponse, McpToolInfo};
+    use daimon::mcp::{McpToolBridge, McpTransport};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn stdio_transport_reports_a_connect_error_for_a_nonexistent_command() {
@@ -291,5 +297,111 @@ mod tests {
         assert!(
             matches!(result, Err(McpConnectError::Timeout { server, seconds: 0 }) if server == "hung")
         );
+    }
+
+    /// An in-process `McpTransport` that counts `close()` calls (and can be
+    /// made to fail them) — the observation point for `close_all`'s
+    /// exactly-once and failure-tolerance guarantees without a live server.
+    /// `request` is never exercised by these tests, so it simply errors.
+    #[derive(Default)]
+    struct CountingCloseTransport {
+        closes: AtomicUsize,
+        fail_close: bool,
+    }
+
+    impl McpTransport for CountingCloseTransport {
+        fn request<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<serde_json::Value>,
+        ) -> Pin<Box<dyn Future<Output = daimon::Result<JsonRpcResponse>> + Send + 'a>> {
+            Box::pin(async { Err(daimon::DaimonError::Mcp("counting transport".into())) })
+        }
+
+        fn notify<'a>(
+            &'a self,
+            _notification: &'a JsonRpcNotification,
+        ) -> Pin<Box<dyn Future<Output = daimon::Result<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = daimon::Result<()>> + Send + 'a>> {
+            self.closes.fetch_add(1, Ordering::Relaxed);
+            let fail_close = self.fail_close;
+            Box::pin(async move {
+                if fail_close {
+                    Err(daimon::DaimonError::Mcp("close failed".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    /// Builds a tool over `transport` the way `McpClient::tools()` does:
+    /// every tool from one server is a separate bridge over a clone of the
+    /// *same* transport `Arc`, which is what makes them compare as sharing
+    /// one connection.
+    fn tool_on(
+        transport: &Arc<CountingCloseTransport>,
+        server: &str,
+        tool_name: &str,
+    ) -> NamespacedMcpTool {
+        let erased: Arc<dyn McpTransport> = transport.clone();
+        let info = McpToolInfo {
+            name: tool_name.into(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        NamespacedMcpTool::new(server, McpToolBridge::new(erased, info))
+    }
+
+    #[tokio::test]
+    async fn close_all_closes_each_distinct_connection_exactly_once() {
+        let alpha = Arc::new(CountingCloseTransport::default());
+        let beta = Arc::new(CountingCloseTransport::default());
+
+        // Two tools from server `alpha` (bridges over clones of one
+        // transport Arc), a rebuild-style clone of one of them, and one
+        // tool from a second server `beta`.
+        let alpha_read = tool_on(&alpha, "alpha", "read_file");
+        let tools = vec![
+            alpha_read.clone(),
+            alpha_read,
+            tool_on(&alpha, "alpha", "write_file"),
+            tool_on(&beta, "beta", "list_things"),
+        ];
+
+        close_all(&tools).await;
+
+        assert_eq!(alpha.closes.load(Ordering::Relaxed), 1);
+        assert_eq!(beta.closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn close_all_continues_past_a_failing_close() {
+        let flaky = Arc::new(CountingCloseTransport {
+            fail_close: true,
+            ..CountingCloseTransport::default()
+        });
+        let steady = Arc::new(CountingCloseTransport::default());
+
+        // The failing connection comes first: `close_all` must return
+        // normally (failures are logged, never propagated) and still
+        // attempt the remaining connection.
+        let tools = vec![
+            tool_on(&flaky, "flaky", "tool_a"),
+            tool_on(&steady, "steady", "tool_b"),
+        ];
+
+        close_all(&tools).await;
+
+        assert_eq!(flaky.closes.load(Ordering::Relaxed), 1);
+        assert_eq!(steady.closes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn close_all_with_no_tools_is_a_no_op() {
+        close_all(&[]).await;
     }
 }

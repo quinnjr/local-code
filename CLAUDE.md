@@ -62,7 +62,7 @@ cargo test --test live_ollama -- --ignored --nocapture
 ### Module map (`src/`)
 
 - `cli/` — clap `Cli`/`Command` definitions and the non-interactive subcommand handlers
-  (`connections`, `mcp`, `memory`, `skills`, `secret`). `cli::run` is the top-level dispatcher called from
+  (`connections`, `mcp`, `memory`, `skills`, `marketplace`, `plugin`, `secret`). `cli::run` is the top-level dispatcher called from
   `main.rs`: `-p/--prompt` routes to headless mode, a `Command` routes to a CLI subcommand handler,
   and no args/command launches the TUI.
 - `tui/` — the interactive terminal UI, built as an `ntui` component tree.
@@ -104,10 +104,21 @@ cargo test --test live_ollama -- --ignored --nocapture
     `GatedTool` (see `permissions/`), so permission enforcement is identical across all tool
     sources and both `Agent::prompt`/`Agent::prompt_stream`. Both TUI and headless mode call
     through this same function; don't add a parallel registration path.
-  - `tools.rs` — the six built-in tools (`ReadFile`, `WriteFile`, `EditFile`, `Bash`, `Grep`,
-    `Glob`).
+  - `tools.rs` — the six `#[tool_fn]` built-in tools (`ReadFile`, `WriteFile`, `EditFile`,
+    `Bash`, `Grep`, `Glob`). The remaining built-ins are struct impls elsewhere: `SkillTool`
+    (`agent/skill_tool.rs`, holds the discovered skill list) and `ServeArtifacts`
+    (`artifacts/tool.rs`, stateless — server state lives in `artifacts::server`'s process-wide
+    registry).
   - `headless.rs` — the `-p/--prompt` non-interactive path (`run_headless`), used by both the CLI
     and by `local-code`'s own live integration tests.
+- `artifacts/` — localhost HTTP serving of agent-created artifacts (HTML/CSS/JS mockups and more)
+  so the agent can showcase visual work in the user's browser. `server.rs` is a hand-rolled HTTP/1.1
+  static-file server (tokio only, no new deps) bound to 127.0.0.1 on an OS-assigned port; URLs
+  404 without an unguessable per-server token path component, the `Host` header is validated
+  (anti-DNS-rebinding), and dotfiles are never served or listed. A canonical-dir-keyed process-wide
+  registry lets each rebuild's fresh tool instance reuse the running server. `tool.rs` is the
+  `serve_artifacts` built-in: starts/reuses the server for `<project>/.local-code/artifacts/` and
+  returns the base URL; the agent drops files there with `write_file` and shares the links.
 - `permissions/` — the permission-tier system (`Ask` / `AutoAcceptEdits` / `FullAuto`).
   `gate::PermissionGate` is the single enforcement point every tool call passes through
   (`agent::gated_tool::GatedTool` wraps a tool and checks the gate before executing). `settings.rs`
@@ -146,15 +157,37 @@ cargo test --test live_ollama -- --ignored --nocapture
     written before multi-host support still deserialize as `GitHub`).
   - `install.rs` is host-agnostic: `install_skill`/`update_skill` take `&SkillClient` and never
     branch on which host they're talking to — all host-specific behavior lives inside `SkillClient`
-    and the three client modules.
+    and the three client modules. Their fetch-free tails (`install_resolved_files` /
+    `swap_skill_files`) are shared with marketplace plugin installs, which resolve and fetch
+    through the marketplace instead of a skill spec.
   - `discovery.rs`/`frontmatter.rs`/`agent/skill_tool.rs` operate purely on already-downloaded
     local files and know nothing about hosts — everything upstream of "skill is on disk" is
     host-agnostic by design.
+- `marketplace/` — Claude Code plugin marketplaces (`.claude-plugin/marketplace.json` catalogs):
+  `marketplace add/list/remove` registers sources, `plugin list/install/remove/update` installs
+  plugins' skills from them.
+  - `catalog.rs` parses and validates the catalog schema, including the four plugin source kinds
+    (`./relative`, `github`, `url`, `git-subdir`, `npm` — npm is parsed but rejected at install).
+  - `source.rs` holds the persisted `MarketplaceSource` enum (`Remote` fetched via the skill host
+    clients / `Local` directory read live — the same kebab-case tagged-enum convention as
+    `McpTransportConfig`), the add-spec parser (an existing directory is local; anything else goes
+    through `skills::spec::parse_spec`), and git-URL parsing for `url`/`git-subdir` plugin sources.
+  - `registry.rs` is the user-level `marketplaces.toml` (one marketplace per name, re-adding
+    replaces). Marketplaces are user-level only — they're a discovery mechanism; the skills
+    plugins install land in the normal project/global skill scopes.
+  - `install.rs` fetches catalogs fresh on every operation (no clone/cache like Claude Code's),
+    finds each plugin's `skills/*/SKILL.md` dirs (default scan, or the catalog entry's `skills`
+    paths), and installs them as ordinary skills whose manifests carry a `PluginProvenance`
+    (`skills::types`). That provenance is what makes `skills update` skip plugin-managed skills
+    (they belong to `plugin update`), and lets `plugin remove`/`plugin list` map installed
+    skills back to their plugin. Client construction is injected (a `ClientFor` fn) because a
+    plugin's source host can differ from its marketplace's host.
 - `memory/` — flat-file, cross-session memory (`memory search`/`memory core`/`memory core add`/`memory add`):
   `buffer.rs` (short-term), `rollup.rs` (daily/recent/archive rollup), `search.rs` (keyword search
   across all of it).
 - `session/` — session persistence (`store.rs` load/save, `types.rs::SessionFile`); every TUI turn
-  is saved so `local-code --resume` (or in-TUI `/resume`) can reopen it later.
+  is saved (atomically — temp file in the same dir, then rename — so a crash mid-turn can't
+  corrupt a session) so `local-code --resume` (or in-TUI `/resume`) can reopen it later.
 - `context/mod.rs::load_project_context` — loads and concatenates project `AGENTS.md`/`CLAUDE.md`
   and user-level `AGENTS.md`/`CLAUDE.md` (in that order) into the system prompt. Both the TUI
   (`tui::run_tui`) and headless mode (`agent::headless::run_headless`) load this context.
@@ -169,10 +202,16 @@ cargo test --test live_ollama -- --ignored --nocapture
 - **One tool-registration path.** Never add tools to an `Agent` outside
   `agent::build::register_all_tools` — TUI and headless mode must always end up with the same tool
   set built the same way.
-- **`Paths`** (`config::paths::Paths`) is the single source of truth for where config/state live:
-  `user_config_dir` (OS config dir via `directories`), `project_config_dir` (`.local-code/` under
-  the project root), `user_state_dir` (OS state dir, sessions live here). Always resolve via
-  `Paths::resolve(project_root)`, don't hand-roll path joins elsewhere.
+- **`Paths`** (`config::paths::Paths`) is the single source of truth for where config/state live,
+  resolved per-OS via the `directories` crate: `user_config_dir` (XDG config dir on Linux & the
+  BSDs, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows), `project_config_dir`
+  (`.local-code/` under the project root), `user_state_dir` (XDG state dir on Linux & the BSDs,
+  `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows — machine-local, never
+  the roaming profile; sessions live here). Always resolve via `Paths::resolve(project_root)`,
+  don't hand-roll path joins elsewhere. Temporary/staging files are written via the shared
+  `fsutil::write_atomically` helper (temp file next to the final target, fsync, atomic rename —
+  never a hardcoded `/tmp`); tests use the `tempfile` dev-dependency, which honors the OS temp
+  dir on every platform.
 - **`mcp.toml`** supports `${VAR_NAME}` (environment) and `${keyring:<name>}` (OS keyring via
   `SecretStore`, managed by `local-code secret set/rm/ls`) interpolation at load time
   (`config::mcp_servers::load_mcp_servers` interpolates; `load_mcp_servers_raw` does not — used

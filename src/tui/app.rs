@@ -357,9 +357,9 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let initial = props.model.clone().expect("AppProps::model is always Some");
         move || initial
     });
-    // Mirrors `current_model`'s Bug 2 fix, but for the `Header`'s displayed
+    // Mirrors `current_model`'s Bug 2 fix, but for the `Dashboard`'s displayed
     // connection/model name: without this, a successful `/model` switch or
-    // `/resume` would correctly rebuild the agent yet leave the Header
+    // `/resume` would correctly rebuild the agent yet leave the Dashboard
     // silently showing the connection/model the process launched with
     // forever. Seeded from `props` at mount, then kept in lockstep with
     // `agent_and_responder`/`current_model` at both switch sites below.
@@ -631,7 +631,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         // keep pointing at the pre-switch model forever.
                         current_model.set(model_for_state);
                         // Kept in lockstep alongside `current_model` above: the
-                        // Header reads from these, not from `props`, so without
+                        // Dashboard reads from these, not from `props`, so without
                         // this it would keep showing the pre-switch connection
                         // and model name forever after a successful `/model`.
                         connection_display.set(connection_name_for_display);
@@ -758,7 +758,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         // pointing at the pre-resume model forever.
                         current_model.set(model_for_state);
                         // Kept in lockstep with `current_model` above,
-                        // mirroring the `/model` fix: the Header reads
+                        // mirroring the `/model` fix: the Dashboard reads
                         // from these, not from `props`, so without this
                         // it would keep showing the pre-resume
                         // connection/model name forever.
@@ -1294,6 +1294,11 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             agent: agent.clone(),
                             model: current_model.get(),
                             background_tasks: background_tasks.get(),
+                            mcp_tools: mcp_tools_state.clone(),
+                            agent_and_responder: agent_and_responder.clone(),
+                            pending_permission: pending_permission.clone(),
+                            skills: skills_snapshot.clone(),
+                            system_context: system_context.clone(),
                         });
                         return;
                     }
@@ -1406,6 +1411,19 @@ struct SlashContext {
     /// Registry the pane aborts on unmount; `/compact` and `/init` push
     /// their spawned task handles here (see the cleanup effect in `App`).
     background_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    // The live tool-set pieces `/mcp remove` needs to prune a removed
+    // server's tools and rebuild the agent — the exact reverse of `/mcp
+    // add`'s finalize task (see its `use_input` arm above), which reads the
+    // same states.
+    mcp_tools: ntui::State<Vec<crate::mcp::tool::NamespacedMcpTool>>,
+    agent_and_responder: ntui::State<(
+        Arc<Agent>,
+        Arc<crate::permissions::gate::PermissionGate>,
+        crate::tui::rebuild::ResponderHandle,
+    )>,
+    pending_permission: ntui::State<Option<crate::permissions::types::PermissionRequest>>,
+    skills: Vec<crate::skills::types::Skill>,
+    system_context: String,
 }
 
 /// Registers a fire-and-forget slash-command task with the pane's abort
@@ -1458,31 +1476,37 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
         }
         SlashCommand::Clear => {
             ctx.transcript.set(Vec::new());
+            // The shared "birth a session" recipe (also used by `run_tui`'s
+            // startup session and `Workspace`'s new tabs/panes), so `/clear`
+            // can't drift field-for-field from the other birth sites.
             let now = chrono::Utc::now();
-            let new_created_at = now.to_rfc3339();
-            let new_path = crate::session::paths::new_session_path(
+            match crate::session::store::create_fresh_session(
                 &ctx.user_state_dir,
                 &ctx.project_root,
-                now,
-            );
-            let fresh = crate::session::types::SessionFile::new(
-                ctx.project_root.clone(),
-                ctx.connection_name.clone(),
-                ctx.model_name.clone(),
+                &ctx.connection_name,
+                &ctx.model_name,
                 ctx.tier.get(),
-                new_created_at.clone(),
-            );
-            if let Err(e) = crate::session::store::save_session(&new_path, &fresh) {
-                ctx.transcript.update(|entries| {
-                    entries.push_entry(TranscriptEntry::SystemNotice {
-                        text: format!(
-                            "cleared transcript, but failed to start a new session file: {e}"
-                        ),
+                now,
+            ) {
+                Ok((new_path, new_created_at)) => {
+                    ctx.session_path.set(new_path);
+                    ctx.created_at.set(new_created_at);
+                }
+                Err(e) => {
+                    // Adopt the new session's path even though the initial
+                    // write failed: the user asked for a fresh session, so
+                    // subsequent turns belong to it (a later save lands them
+                    // there once a transient failure clears) — not to the
+                    // pre-clear file this pane was just detached from.
+                    let notice =
+                        format!("cleared transcript, but failed to start a new session file: {e}");
+                    ctx.session_path.set(e.path);
+                    ctx.created_at.set(now.to_rfc3339());
+                    ctx.transcript.update(|entries| {
+                        entries.push_entry(TranscriptEntry::SystemNotice { text: notice });
                     });
-                });
+                }
             }
-            ctx.session_path.set(new_path);
-            ctx.created_at.set(new_created_at);
         }
         SlashCommand::Model => {
             match crate::config::connection::load_connections(
@@ -1633,14 +1657,92 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 project_config_dir: ctx.project_config_dir.clone(),
                 user_state_dir: ctx.user_state_dir.clone(),
             };
+            // `cli::mcp::remove` reports Ok even when nothing matched (it
+            // prints a "No MCP server named ..." notice), so whether the
+            // live tool set needs to change is decided by the pre-remove
+            // listing instead of the Ok/Err result.
+            let configured = crate::config::mcp_servers::load_mcp_servers_raw(
+                &paths.user_config_dir,
+                &paths.project_config_dir,
+            )
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s.name == name);
             let mut out = Vec::new();
-            let text = match crate::cli::mcp::remove(&paths, &name, &mut out) {
-                Ok(()) => String::from_utf8_lossy(&out).to_string(),
-                Err(e) => format!("failed to remove MCP server: {e}"),
+            let removed = match crate::cli::mcp::remove(&paths, &name, &mut out) {
+                Ok(()) => {
+                    let text = String::from_utf8_lossy(&out).to_string();
+                    ctx.transcript.update(|entries| {
+                        entries.push_entry(TranscriptEntry::SystemNotice { text });
+                    });
+                    configured
+                }
+                Err(e) => {
+                    ctx.transcript.update(|entries| {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
+                            text: format!("failed to remove MCP server: {e}"),
+                        });
+                    });
+                    false
+                }
             };
-            ctx.transcript.update(|entries| {
-                entries.push_entry(TranscriptEntry::SystemNotice { text });
-            });
+            if removed {
+                // Mirror /mcp add's live-reconnect in reverse: drop the
+                // removed server's tools from the live tool state (the same
+                // `{name}__` prefix prune the add path applies before
+                // merging) and rebuild the agent, so the removed server's
+                // tools stop being callable immediately instead of lingering
+                // until restart.
+                let mut tools = ctx.mcp_tools.get();
+                let prefix = format!("{name}__");
+                tools.retain(|t| !t.name().starts_with(prefix.as_str()));
+                ctx.mcp_tools.set(tools.clone());
+
+                let agent_for_history = ctx.agent.clone();
+                let model = ctx.model.clone();
+                let tier_value = ctx.tier.get();
+                let permission_settings = crate::permissions::settings::PermissionSettings {
+                    always_allow: ctx.always_allow.clone(),
+                    always_deny: ctx.always_deny.clone(),
+                };
+                let system_context = ctx.system_context.clone();
+                let skills = ctx.skills.clone();
+                let pending_permission = ctx.pending_permission.clone();
+                let agent_and_responder = ctx.agent_and_responder.clone();
+                let transcript = ctx.transcript.clone();
+                let handle = tokio::spawn(async move {
+                    let rebuilt = crate::tui::rebuild::rebuild_agent_from_history(
+                        &agent_for_history,
+                        model,
+                        tier_value,
+                        permission_settings,
+                        &system_context,
+                        tools,
+                        skills,
+                        pending_permission,
+                    )
+                    .await;
+                    match rebuilt {
+                        Ok(rebuilt) => {
+                            agent_and_responder.set(rebuilt);
+                        }
+                        Err(e) => {
+                            // The old agent stays live; the pruned tool list is
+                            // already in `mcp_tools_state`, so the next successful
+                            // rebuild picks it up (same recovery as /mcp add).
+                            transcript.update(|entries| {
+                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                    text: format!(
+                                        "MCP server '{name}' was removed, but the agent rebuild failed: {e}. \
+                                         Its tools will stay registered until the next successful /model or /resume."
+                                    ),
+                                });
+                            });
+                        }
+                    }
+                });
+                register_background_task(&ctx.background_tasks, handle);
+            }
         }
         SlashCommand::McpAdd => {
             let (wizard, prompt) = crate::tui::mcp_wizard::start();
@@ -2086,7 +2188,7 @@ async fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daimon::model::types::{ChatRequest, ChatResponse, Role};
+    use daimon::model::types::{ChatRequest, ChatResponse, Message, Role, StopReason, Usage};
     use daimon::stream::ResponseStream;
     use ntui::testing::TestTerminal;
     use ntui::{Element, KeyCode};
@@ -2173,6 +2275,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn format_turn_error_diagnoses_timeouts_case_insensitively() {
+        // The diagnosis fires on a case-insensitive "timeout"/"timed out"
+        // substring match, keeping the original error text in parentheses.
+        assert_eq!(
+            format_turn_error("connection timed out"),
+            "error: request timed out — the local model server may be unresponsive (connection timed out)"
+        );
+        assert_eq!(
+            format_turn_error("TIMED OUT"),
+            "error: request timed out — the local model server may be unresponsive (TIMED OUT)"
+        );
+    }
+
+    #[test]
+    fn format_turn_error_wraps_plain_errors_generically() {
+        assert_eq!(
+            format_turn_error("connection refused"),
+            "error: connection refused"
+        );
+    }
+
     /// Throwaway component whose sole job is to hand its `use_state` handle
     /// out to the test (states can't be constructed outside a component) —
     /// same pattern as `src/tui/rebuild.rs`'s own tests.
@@ -2209,6 +2333,165 @@ mod tests {
         );
         gate.set(false);
         assert!(session_may_handle_input(true, &Some(gate), &ev));
+    }
+
+    /// Same slot-handout pattern as `GateHarness`, but for the
+    /// `State<Option<PermissionRequest>>` an `NtuiPermissionPrompter` binds
+    /// to (states can't be constructed outside a component).
+    #[derive(Clone, Default)]
+    struct PendingHarnessProps {
+        slot: Arc<
+            std::sync::Mutex<
+                Option<ntui::State<Option<crate::permissions::types::PermissionRequest>>>,
+            >,
+        >,
+    }
+    impl PartialEq for PendingHarnessProps {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+    #[component]
+    fn PendingHarness(props: &PendingHarnessProps, hooks: &mut Hooks) -> Element {
+        let pending =
+            hooks.use_state(|| Option::<crate::permissions::types::PermissionRequest>::None);
+        *props.slot.lock().unwrap() = Some(pending.clone());
+        element! { View {} }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn respond_returns_false_without_a_pending_prompt_and_resolves_a_pending_one() {
+        let slot: Arc<
+            std::sync::Mutex<
+                Option<ntui::State<Option<crate::permissions::types::PermissionRequest>>>,
+            >,
+        > = Default::default();
+        let _t = TestTerminal::new(
+            10,
+            1,
+            Element::component::<PendingHarness>(PendingHarnessProps { slot: slot.clone() }),
+        )
+        .unwrap();
+        let pending = slot.lock().unwrap().clone().unwrap();
+
+        let prompter = NtuiPermissionPrompter::new(pending);
+        let responder = prompter.responder_handle();
+
+        // A stray decision with nothing pending is a no-op returning false.
+        assert!(!NtuiPermissionPrompter::respond(
+            &responder,
+            PermissionDecision::Allow
+        ));
+
+        // With a prompt() future pending, respond resolves it with the given
+        // decision and returns true.
+        use crate::permissions::types::PermissionPrompter as _;
+        let request = crate::permissions::types::PermissionRequest {
+            description: "run shell command: rm x".into(),
+        };
+        let prompt = tokio::spawn(async move { prompter.prompt(&request).await });
+        // Let the spawned task poll the prompt future once — its first poll
+        // is what registers the responder slot.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if responder.lock().unwrap().is_some() {
+                break;
+            }
+        }
+        assert!(NtuiPermissionPrompter::respond(
+            &responder,
+            PermissionDecision::AllowAlwaysThisSession
+        ));
+        let decision = prompt.await.unwrap();
+        assert_eq!(decision, PermissionDecision::AllowAlwaysThisSession);
+
+        // And once that prompt has resolved, a further respond is a no-op again.
+        assert!(!NtuiPermissionPrompter::respond(
+            &responder,
+            PermissionDecision::Allow
+        ));
+    }
+
+    /// Streams a `write_file` tool call (to `path`) on its first invocation,
+    /// then a plain text reply once the tool result comes back — the
+    /// write-file call is what drives the `Ask`-tier gate into `prompt()`.
+    struct StreamingWriteFileModel {
+        path: String,
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+    impl daimon::model::Model for StreamingWriteFileModel {
+        async fn generate(&self, _request: &ChatRequest) -> daimon::Result<ChatResponse> {
+            unreachable!("prompt_stream only ever calls generate_stream_erased")
+        }
+        async fn generate_stream(&self, _request: &ChatRequest) -> daimon::Result<ResponseStream> {
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if count == 0 {
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::ToolCallStart {
+                        id: "call_1".into(),
+                        name: "write_file".into(),
+                    }),
+                    Ok(StreamEvent::ToolCallDelta {
+                        id: "call_1".into(),
+                        arguments_delta: serde_json::json!({
+                            "path": self.path.as_str(),
+                            "content": "permission round trip",
+                        })
+                        .to_string(),
+                    }),
+                    Ok(StreamEvent::ToolCallEnd {
+                        id: "call_1".into(),
+                    }),
+                    Ok(StreamEvent::Done),
+                ])))
+            } else {
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta("wrote it".into())),
+                    Ok(StreamEvent::Done),
+                ])))
+            }
+        }
+    }
+
+    /// The interactive Ask tier end to end: a turn's `write_file` call gates
+    /// into `prompt()`, the pending card renders, pressing `1` pushes a
+    /// `PermissionResolved` transcript entry and resolves the gate's pending
+    /// future with Allow, so the tool actually executes and the turn
+    /// completes.
+    #[tokio::test(start_paused = true)]
+    async fn permission_prompt_digit_allows_the_gated_call_and_resolves_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.txt");
+
+        let mut props = test_props();
+        props.initial_tier = PermissionTier::Ask;
+        props.model = Some(Arc::new(StreamingWriteFileModel {
+            path: target.display().to_string(),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "write the file").await;
+        let text = tick_until_contains(&mut t, "Permission requested: write file:").await;
+        assert!(text.contains("Permission requested: write file:"), "{text}");
+
+        t.send_key(KeyCode::Char('1')).unwrap();
+        let text = tick_until_contains(&mut t, "wrote it").await;
+        assert!(
+            text.contains("[allowed] write file:"),
+            "the PermissionResolved entry must record an Allow: {text}"
+        );
+        assert!(
+            text.contains("wrote it"),
+            "the turn must complete after the decision resolves: {text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "permission round trip",
+            "Allow must have let the gated write_file call execute"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3039,7 +3322,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn help_command_lists_every_slash_command() {
         // 30 rows: HELP_TEXT grew a workspace-keybindings section and no
-        // longer fits a 24-row frame alongside the header.
+        // longer fits a 24-row frame alongside the dashboard.
         let mut t = TestTerminal::new(80, 30, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/help").await;
         t.tick().await.unwrap();
@@ -3152,6 +3435,56 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there")),
             "original.json should retain the pre-/clear turn history"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clear_adopts_the_new_session_path_when_the_initial_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut props = test_props();
+        // `user_state_dir` is a regular FILE, so `create_fresh_session`'s
+        // create_dir_all(<file>/sessions/…) fails — the /clear save fails.
+        let state_file = dir.path().join("not-a-dir");
+        std::fs::write(&state_file, "x").unwrap();
+        props.user_state_dir = state_file;
+        props.session_path = dir.path().join("original.json");
+        crate::session::store::save_session(
+            &props.session_path,
+            &crate::session::types::SessionFile::new(
+                std::path::PathBuf::from("/proj"),
+                "local-vllm".into(),
+                "m".into(),
+                PermissionTier::FullAuto,
+                "2026-07-06T00:00:00Z".into(),
+            ),
+        )
+        .unwrap();
+
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+        type_and_submit(&mut t, "hi there").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+
+        type_and_submit(&mut t, "/clear").await;
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(
+            text.contains("failed to start a new session file"),
+            "the failure notice must be shown: {text}"
+        );
+        // Even with the failed write, the pane must adopt the NEW session
+        // path (under the unwritable state dir) — the user asked for a
+        // fresh session, so subsequent turns must not be stranded in
+        // original.json.
+        assert!(
+            !text.contains("original.json"),
+            "the old session path must be gone from the dashboard: {text}"
+        );
+        assert!(
+            text.contains("not-a-dir"),
+            "the newly allocated session path must be shown: {text}"
         );
     }
 
@@ -3310,6 +3643,120 @@ mod tests {
             t.frame_text().contains("Server name:"),
             "{}",
             t.frame_text()
+        );
+    }
+
+    /// Records the tool names advertised on each request, so the `/mcp
+    /// remove` test below can assert which tools the *live* agent has
+    /// registered before vs after the removal.
+    struct ToolListRecordingModel {
+        snapshots: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+    impl daimon::model::Model for ToolListRecordingModel {
+        async fn generate(&self, _request: &ChatRequest) -> daimon::Result<ChatResponse> {
+            Ok(ChatResponse {
+                message: Message::assistant("unused"),
+                stop_reason: StopReason::EndTurn,
+                usage: Some(Usage::default()),
+            })
+        }
+        async fn generate_stream(&self, request: &ChatRequest) -> daimon::Result<ResponseStream> {
+            self.snapshots
+                .lock()
+                .unwrap()
+                .push(request.tools.iter().map(|tool| tool.name.clone()).collect());
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::Done),
+            ])))
+        }
+    }
+
+    /// `/mcp remove` must do to the live tool set what `/mcp add` does in
+    /// reverse: edit mcp.toml AND prune the removed server's
+    /// `{server}__{tool}`-namespaced tools from the live agent (the same
+    /// prefix prune + `rebuild_agent_from_history` the add path uses), so
+    /// the removed server's tools stop being callable immediately instead of
+    /// lingering until restart. Unlike `/mcp add`'s success path this needs
+    /// no real server — removal never connects — so it lives here rather
+    /// than in `tests/mcp_add_live_reconnect.rs`.
+    #[tokio::test(start_paused = true)]
+    async fn mcp_remove_prunes_the_servers_tools_from_the_live_agent() {
+        use crate::mcp::tool::{NamespacedMcpTool, test_support::bridge_named};
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::mcp_servers::save_mcp_servers(
+            dir.path(),
+            &[crate::config::mcp_servers::McpServerConfig {
+                name: "fixture".into(),
+                transport: crate::config::mcp_servers::McpTransportConfig::Stdio {
+                    command: "unused".into(),
+                    args: Vec::new(),
+                },
+            }],
+        )
+        .unwrap();
+
+        let snapshots: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+        let mut props = test_props_with_config_dir(dir.path());
+        props.model = Some(Arc::new(ToolListRecordingModel {
+            snapshots: snapshots.clone(),
+        }));
+        props.mcp_tools = vec![
+            NamespacedMcpTool::new("fixture", bridge_named("echo")),
+            NamespacedMcpTool::new("other", bridge_named("keep")),
+        ];
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        // Baseline: the launch agent advertises both servers' tools.
+        type_and_submit(&mut t, "before").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        {
+            let snapshots = snapshots.lock().unwrap();
+            let baseline = snapshots.last().expect("the first turn ran");
+            assert!(
+                baseline.iter().any(|n| n == "fixture__echo"),
+                "{baseline:?}"
+            );
+            assert!(baseline.iter().any(|n| n == "other__keep"), "{baseline:?}");
+        }
+
+        type_and_submit(&mut t, "/mcp remove fixture").await;
+        let text = tick_until_contains(&mut t, "Removed MCP server 'fixture'.").await;
+        assert!(text.contains("Removed MCP server 'fixture'."), "{text}");
+
+        // mcp.toml no longer lists the server either.
+        let saved = crate::config::mcp_servers::load_mcp_servers_raw(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+
+        // Let the spawned prune+rebuild task finish (it does no real I/O),
+        // then run another turn: it must hit the rebuilt agent — the removed
+        // server's tool gone, the other server's tool preserved.
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        type_and_submit(&mut t, "after").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        let snapshots = snapshots.lock().unwrap();
+        let after = snapshots.last().expect("the post-remove turn ran");
+        assert!(
+            !after.iter().any(|n| n == "fixture__echo"),
+            "the removed server's tool must no longer be registered: {after:?}"
+        );
+        assert!(
+            after.iter().any(|n| n == "other__keep"),
+            "the other server's tool must survive the prefix prune: {after:?}"
         );
     }
 
@@ -3979,20 +4426,20 @@ models = ["test-model"]
         );
     }
 
-    /// Header staleness bug found in code review: `Header`'s
+    /// Dashboard staleness bug found in code review: `Dashboard`'s
     /// `connection_name`/`model_name` used to be read directly from
     /// `props.connection_name`/`props.model_name` — a one-time snapshot taken
     /// at mount and never refreshed — so after a successful `/model` switch
     /// (which does correctly rebuild the agent and post a "switched to X · Y"
     /// notice, per `model_switch_updates_the_model_compact_uses` above), the
-    /// Header kept silently showing the connection/model the process
+    /// Dashboard kept silently showing the connection/model the process
     /// launched with. This test proves the fix (`connection_display`/
     /// `model_display`, kept in lockstep with `current_model` at the same
-    /// `/model` digit-press site) by asserting the Header's rendered text
+    /// `/model` digit-press site) by asserting the Dashboard's rendered text
     /// shows the NEW connection/model name after switching, and no longer
     /// shows `test_props()`'s original ones.
     #[tokio::test(start_paused = true)]
-    async fn model_switch_updates_the_header_display() {
+    async fn model_switch_updates_the_dashboard_display() {
         let user_config_dir = tempfile::tempdir().unwrap();
         let project_config_dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -4014,7 +4461,7 @@ models = ["test-model"]
 
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
 
-        // Sanity check: the Header starts out showing test_props()'s
+        // Sanity check: the Dashboard starts out showing test_props()'s
         // original connection/model, exactly as it did before this fix.
         assert!(t.frame_text().contains("local-vllm"), "{}", t.frame_text());
         assert!(
@@ -4041,12 +4488,12 @@ models = ["test-model"]
         let text = t.frame_text();
         assert!(
             text.contains("test-ollama") && text.contains("test-model"),
-            "expected the Header to now show the NEW connection/model after \
+            "expected the Dashboard to now show the NEW connection/model after \
              the switch: {text}"
         );
         assert!(
             !text.contains("local-vllm") && !text.contains("qwen2.5-coder-32b"),
-            "the Header still shows the ORIGINAL (pre-switch) connection/model \
+            "the Dashboard still shows the ORIGINAL (pre-switch) connection/model \
              — this is the staleness bug the fix addresses: {text}"
         );
     }
@@ -4166,13 +4613,13 @@ models = ["test-model"]
     // Closes the coverage gap the test above deliberately leaves open: that
     // test only exercises listing plus the "connection no longer exists"
     // failure branch, since `test_props()` wires up no real connections.toml.
-    // This test follows `model_switch_updates_the_header_display`'s fixture
+    // This test follows `model_switch_updates_the_dashboard_display`'s fixture
     // pattern (a real `connections.toml` under tempdir-backed
     // `user_config_dir`/`project_config_dir`) so the *success* branch of
     // `/resume` — rebuilding the agent, restoring the transcript, and
-    // refreshing the Header — is exercised too.
+    // refreshing the Dashboard — is exercised too.
     #[tokio::test(start_paused = true)]
-    async fn resume_command_success_path_restores_transcript_and_updates_header() {
+    async fn resume_command_success_path_restores_transcript_and_updates_dashboard() {
         let state_dir = tempfile::tempdir().unwrap();
         let user_config_dir = tempfile::tempdir().unwrap();
         let project_config_dir = tempfile::tempdir().unwrap();
@@ -4214,9 +4661,9 @@ models = ["irrelevant-default", "resumed-model"]
         props.project_root = project_root;
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
 
-        // Sanity check: the Header starts out showing test_props()'s
+        // Sanity check: the Dashboard starts out showing test_props()'s
         // original connection/model, exactly as it did before the fix this
-        // guards (Header staleness after in-TUI /model and /resume switches).
+        // guards (Dashboard staleness after in-TUI /model and /resume switches).
         assert!(t.frame_text().contains("local-vllm"), "{}", t.frame_text());
 
         type_and_submit(&mut t, "/resume").await;

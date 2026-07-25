@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::permissions::types::PermissionTier;
 use crate::session::paths::{new_session_path, session_dir_for_project};
@@ -60,26 +61,52 @@ fn write_session_json<T: serde::Serialize>(path: &Path, session: &T) -> Result<(
             source,
         })?;
     }
-    // Streamed via `to_writer_pretty` rather than `to_string_pretty` +
-    // `fs::write`: the latter holds the entire serialized session (which grows
-    // with history) in memory as a String before writing a byte.
-    let file = fs::File::create(path).map_err(|source| SessionError::Write {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let mut writer = std::io::BufWriter::new(file);
-    serde_json::to_writer_pretty(&mut writer, session).map_err(SessionError::Serialize)?;
-    std::io::Write::flush(&mut writer).map_err(|source| SessionError::Write {
-        path: path.to_path_buf(),
-        source,
-    })
+
+    // Atomic write via the shared helper (`fsutil::write_atomically`): the
+    // session JSON goes to a sibling temp file which is then renamed over
+    // `path`, so the file at `path` always holds either the old contents or
+    // the new in full. Process-kill safe by rename atomicity, power-loss
+    // safe for the file's data by the fsync before the rename. This matters
+    // because the TUI saves through here every turn. The temp name appends
+    // `.tmp-<pid>-<n>` to the full file name, so `list_sessions`'s `.json`
+    // extension filter skips any stray a hard kill leaves behind.
+    crate::fsutil::write_atomically(
+        path,
+        |writer| {
+            // Streamed via `to_writer_pretty` rather than `to_string_pretty`
+            // + `fs::write`: the latter holds the entire serialized session
+            // (which grows with history) in memory as a String before
+            // writing a byte.
+            serde_json::to_writer_pretty(writer, session).map_err(SessionError::Serialize)
+        },
+        |source| SessionError::Write {
+            path: path.to_path_buf(),
+            source,
+        },
+    )
+}
+
+/// `create_fresh_session`'s error: the initial save failed, but the
+/// allocated session path is preserved so a caller that has already
+/// committed to the new session (`/clear`, which has just torn down the old
+/// one) can adopt the path anyway — a transient write failure then
+/// self-heals on the next successful save, instead of stranding subsequent
+/// turns in the session the user just left.
+#[derive(Debug, thiserror::Error)]
+#[error("{source}")]
+pub struct CreateSessionError {
+    /// The path the fresh session file was meant to be written to.
+    pub path: PathBuf,
+    #[source]
+    pub source: SessionError,
 }
 
 /// Allocates a fresh session file on disk and returns `(path, created_at)`.
 /// The single shared "birth a session" recipe — used by `run_tui` for the
-/// startup session and by `Workspace` for every new tab/pane, so the two can
-/// never drift field-for-field (they previously open-coded identical
-/// `new_session_path` → `SessionFile::new` → `save_session` sequences).
+/// startup session, by `Workspace` for every new tab/pane, and by `/clear`,
+/// so the three can never drift field-for-field (they previously open-coded
+/// identical `new_session_path` → `SessionFile::new` → `save_session`
+/// sequences).
 pub fn create_fresh_session(
     user_state_dir: &Path,
     project_root: &Path,
@@ -87,7 +114,7 @@ pub fn create_fresh_session(
     model_name: &str,
     tier: PermissionTier,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<(PathBuf, String), SessionError> {
+) -> Result<(PathBuf, String), CreateSessionError> {
     let path = new_session_path(user_state_dir, project_root, now);
     let created_at = now.to_rfc3339();
     let session = SessionFile::new(
@@ -97,7 +124,10 @@ pub fn create_fresh_session(
         tier,
         created_at.clone(),
     );
-    save_session(&path, &session)?;
+    save_session(&path, &session).map_err(|source| CreateSessionError {
+        path: path.clone(),
+        source,
+    })?;
     Ok((path, created_at))
 }
 
@@ -122,6 +152,33 @@ pub fn load_session(path: &Path) -> Result<SessionFile, SessionError> {
     Ok(session)
 }
 
+/// How old a stray `.tmp-*` file must be before `list_sessions` reaps it:
+/// anything younger could belong to a save in flight in another process
+/// (e.g. a second `local-code` instance on the same project), and deleting
+/// a live temp file out from under its writer would corrupt that save.
+const TMP_REAP_GRACE: Duration = Duration::from_secs(60);
+
+/// Best-effort removal of one orphaned atomic-write temp file. A kill -9
+/// mid-save skips `fsutil::write_atomically`'s cleanup branch; without a
+/// sweep the session dir would accumulate one stray per hard kill. Every
+/// failure (metadata, clock, remove) is ignored — sweeping is a courtesy,
+/// never a reason to fail a listing.
+fn reap_stale_tmp_file(entry: &fs::DirEntry) {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else { return };
+    if !name.contains(crate::fsutil::TMP_MARKER) {
+        return;
+    }
+    // Unreadable metadata or a future mtime (clock skew): leave it alone.
+    let Ok(Ok(modified)) = entry.metadata().map(|m| m.modified()) else {
+        return;
+    };
+    let Ok(age) = modified.elapsed() else { return };
+    if age >= TMP_REAP_GRACE {
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
 /// Lists every session recorded for `project_root`, most-recently-updated
 /// first. Unreadable/corrupt files are skipped rather than failing the whole
 /// listing (a hand-edited or partially-written file shouldn't block
@@ -143,11 +200,22 @@ pub fn list_sessions(
     for entry in read_dir.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            // Not a session file: maybe a stray temp file from a killed
+            // save — reap it if it's old enough.
+            reap_stale_tmp_file(&entry);
             continue;
         }
         let Ok(session) = load_session(&path) else {
             continue;
         };
+        // A `project_slug` collision can land another project's session
+        // files in this directory; they aren't this project's sessions, so
+        // exclude them — this is the "caught immediately by
+        // `SessionFile::project_root` not matching" check the slug doc
+        // refers to.
+        if session.project_root != project_root {
+            continue;
+        }
         // Sessions with no transcript at all are skipped: every launch and
         // every new workspace tab/pane eagerly writes an (empty) session
         // file, so without this filter a user who opens a few tabs and types
@@ -207,6 +275,92 @@ mod tests {
         save_session(&path, &session).unwrap();
         let loaded = load_session(&path).unwrap();
         assert_eq!(loaded, session);
+    }
+
+    #[test]
+    fn save_overwrites_an_existing_session_file() {
+        // The temp-file + rename write path must replace the destination on
+        // every platform (std's rename does on Windows); the per-turn save
+        // hits this every turn after the first.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        save_session(&path, &sample("first", "2026-07-06T10:00:00Z")).unwrap();
+        save_session(&path, &sample("second", "2026-07-06T11:00:00Z")).unwrap();
+        let loaded = load_session(&path).unwrap();
+        assert_eq!(loaded.connection_name, "second");
+    }
+
+    #[test]
+    fn save_leaves_no_temp_files_behind() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        save_session(&path, &sample("conn", "2026-07-06T10:00:00Z")).unwrap();
+        save_session(&path, &sample("conn", "2026-07-06T11:00:00Z")).unwrap();
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("session.json")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_an_unwritable_directory_returns_err_and_removes_the_tmp_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        // A pre-existing session file must survive the failed save untouched.
+        let existing = dir.path().join("existing.json");
+        save_session(&existing, &sample("conn", "2026-07-06T10:00:00Z")).unwrap();
+        let before = fs::read(&existing).unwrap();
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+        let result = save_session(
+            &dir.path().join("new.json"),
+            &sample("conn", "2026-07-06T11:00:00Z"),
+        );
+        // Restore write permission first so tempdir cleanup works even if
+        // an assertion below fails.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(matches!(result, Err(SessionError::Write { .. })));
+        let strays: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(crate::fsutil::TMP_MARKER)
+            })
+            .collect();
+        assert!(strays.is_empty(), "failed save must clean up its temp file");
+        assert_eq!(
+            fs::read(&existing).unwrap(),
+            before,
+            "pre-existing session file is intact"
+        );
+    }
+
+    #[test]
+    fn list_sessions_ignores_stray_tmp_files_from_a_killed_save() {
+        let user_state_dir = tempdir().unwrap();
+        let project_root = Path::new("/proj");
+        let dir = session_dir_for_project(user_state_dir.path(), project_root);
+        fs::create_dir_all(&dir).unwrap();
+
+        save_session(&dir.join("s.json"), &sample("conn", "2026-07-06T00:00:00Z")).unwrap();
+
+        // Strays a hard kill could leave behind: one with truncated JSON...
+        fs::write(dir.join("x.json.tmp-1234-0"), "{\"version\": 1, tru").unwrap();
+        // ...and one holding a fully valid serialized session. Both are
+        // fresh (under the sweep's 60s grace window), so only the `.json`
+        // extension filter — not the reaper — keeps them out of the list.
+        let valid = serde_json::to_string_pretty(&sample("stray", "2026-07-06T01:00:00Z")).unwrap();
+        fs::write(dir.join("y.json.tmp-1234-1"), valid).unwrap();
+
+        let sessions = list_sessions(user_state_dir.path(), project_root).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].connection_name, "conn");
     }
 
     #[test]
@@ -295,6 +449,55 @@ mod tests {
         assert_eq!(loaded.connection_name, "conn");
         assert_eq!(loaded.model_name, "model");
         assert!(loaded.entries.is_empty());
+    }
+
+    #[test]
+    fn create_fresh_session_error_carries_the_allocated_path() {
+        let dir = tempdir().unwrap();
+        // `user_state_dir` is a regular FILE, so the save fails — and the
+        // error must still carry the path the session was meant to live at,
+        // so callers like `/clear` can adopt it despite the failure.
+        let state_file = dir.path().join("not-a-dir");
+        fs::write(&state_file, "x").unwrap();
+
+        let err = create_fresh_session(
+            &state_file,
+            Path::new("/proj"),
+            "conn",
+            "model",
+            PermissionTier::Ask,
+            chrono::Utc::now(),
+        )
+        .unwrap_err();
+        assert!(
+            err.path.starts_with(&state_file) && err.path.extension().is_some_and(|e| e == "json"),
+            "the allocated session path must be preserved: {}",
+            err.path.display()
+        );
+        assert!(matches!(err.source, SessionError::Write { .. }));
+    }
+
+    #[test]
+    fn list_sessions_excludes_sessions_from_other_projects_on_slug_collision() {
+        let user_state_dir = tempdir().unwrap();
+        let project_root = Path::new("/proj");
+        // Simulate a `project_slug` collision: another project's session
+        // file shares this project's listing directory.
+        let dir = session_dir_for_project(user_state_dir.path(), project_root);
+        fs::create_dir_all(&dir).unwrap();
+
+        save_session(
+            &dir.join("mine.json"),
+            &sample("mine", "2026-07-06T00:00:00Z"),
+        )
+        .unwrap();
+        let mut foreign = sample("foreign", "2026-07-05T00:00:00Z");
+        foreign.project_root = PathBuf::from("/other-proj");
+        save_session(&dir.join("foreign.json"), &foreign).unwrap();
+
+        let sessions = list_sessions(user_state_dir.path(), project_root).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].connection_name, "mine");
     }
 
     #[test]

@@ -39,7 +39,13 @@ cloud calls or API keys required for local inference.
 - Flat-file cross-session memory (`memory search` / `memory core` /
   `memory core add` / `memory add`) with automatic daily rollover and
   recent/archive rollup
-- GitHub-backed skills (`skills install` / `skills list` / `skills remove` / `skills update`)
+- Skills from GitHub, GitLab, or Bitbucket (`skills install` / `skills list` / `skills remove` / `skills update`)
+- Claude Code plugin marketplaces (`marketplace add` / `marketplace list` / `marketplace remove`,
+  then `plugin list` / `plugin install <name>@<marketplace>` / `plugin update` / `plugin remove`)
+  — installs the skills of plugins from git-hosted or local `.claude-plugin/marketplace.json`
+  catalogs
+- Localhost artifact serving — the `serve_artifacts` tool serves `.local-code/artifacts/` over
+  a token-guarded localhost HTTP server so the agent can show HTML/CSS/JS mockups in the browser
 - Headless mode (`local-code -p "..."`) for scripted, non-interactive use
 
 ## Configuring MCP servers (`mcp.toml`)

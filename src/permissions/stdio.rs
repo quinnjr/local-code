@@ -8,9 +8,9 @@ use crate::permissions::types::{PermissionDecision, PermissionPrompter, Permissi
 
 /// Renders a [`PermissionRequest`] as plain numbered choices over any
 /// `AsyncBufRead`/`AsyncWrite` pair (real stdin/stdout in production, an in-memory
-/// buffer in tests). The TUI phase will supply a different [`PermissionPrompter`]
-/// impl that renders inline in the transcript instead — this type is not reused
-/// there, but the trait it implements is.
+/// buffer in tests). The TUI supplies a different [`PermissionPrompter`] impl
+/// that renders inline in the transcript (see `crate::tui::permission_prompter`)
+/// — this type is not reused there, but the trait it implements is.
 pub struct StdioPrompter<R, W> {
     input: Mutex<R>,
     output: Mutex<W>,

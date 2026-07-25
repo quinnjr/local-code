@@ -67,7 +67,50 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
     reaped by process teardown breaking their pipes, exactly as all connections were before.
     Revisit if a shared connection registry ever gets threaded through `AppProps`.
 
-12. **Pasting into the input box or a wizard works only for single-line content, and pasted
+12. **The `serve_artifacts` HTTP server has no shutdown and is of limited use headless.** Once
+   started it serves until process exit — deliberate, so URLs survive agent rebuilds and every
+   pane's tool instance shares the process-wide registry. In headless mode (`-p`) the returned
+   URL is only reachable while that turn is still running; the TUI is the real showcase
+   surface. Revisit if artifacts ever need to outlive the process.
+
+13. **`serve_artifacts`'s execute-level tests run the real tool against the process CWD.** Same
+   test-hygiene wart class as #6, one notch sharper:
+   `artifacts::tool::tests::execute_runs_against_the_process_cwd` and
+   `agent::build::tests::built_agent_can_call_serve_artifacts` run with no tempdir, so `cargo
+   test` creates and binds a live server to the crate root's real (gitignored)
+   `.local-code/artifacts/` — the same directory a real session in this checkout serves. Keep
+   the suite free of `set_current_dir` mutators or these tests flake or vacuously pass. Revisit
+   if a project-root seam is ever threaded into the tool layer.
+
+14. **The artifact server's path canonicalize+containment check and file open are two syscalls.**
+   Check-then-act: a symlink flipped between the check and the open could theoretically race the
+   server into serving a file outside the artifacts root. Accepted for v1 — the only principals
+   who can write the artifacts dir (the agent itself, same-user processes) could already copy
+   files into it directly, so the race buys them nothing. Revisit if the artifacts dir is ever
+   writable by a less-trusted principal than the one reading via HTTP, or if
+   `openat2(RESOLVE_BENEATH)`-style APIs become practical via the existing dep tree.
+
+15. **`tui::app::tests::model_switch_updates_the_model_compact_uses` is flaky under CI load.**
+   The paused-time (`start_paused`) test drives a real reqwest call to a dead port
+   (`127.0.0.1:1`) behind a fixed 60×10ms tick budget; on a loaded runner the connection
+   error can surface after the budget is exhausted, failing the assertion on the
+   "compact failed" notice. Observed once on PR #15's CI; it passed on re-run and on every
+   other run of the same tree (local runs, PR #14, the #14 merge commit's develop run).
+   Revisit by waiting on the notice itself (poll the frame until it appears) instead of a
+   fixed tick count if it flakes again.
+
+16. **Plugin marketplaces install skills only, and catalogs are fetched live.** A Claude Code
+    marketplace's plugins are installed by scanning their `skills/*/SKILL.md` dirs (or the catalog
+    entry's `skills` paths); plugin `commands`/`agents`/`hooks`/`mcpServers` and `.claude-plugin/plugin.json`
+    component config are ignored — LocalCode has no command/agent/hook concepts. `npm` plugin
+    sources are unsupported, and `url`/`git-subdir` sources only accept https and SSH URLs on the
+    three known skill hosts (no self-hosted). The marketplace registry is user-level only
+    (`marketplaces.toml` in the user config dir), catalogs are re-fetched on every operation
+    (no offline clone/cache like Claude Code's `~/.claude/plugins/`), and installed plugin skills
+    are picked up only where skills are discovered — TUI startup and each headless run — so
+    installing mid-session takes effect on the next TUI launch, not via `/model` rebuilds.
+
+17. **Pasting into the input box or a wizard works only for single-line content, and pasted
     newlines act as Enter.** ntui 0.2.0 doesn't enable bracketed paste, so a paste arrives as
     ordinary key events: chars insert fine, but every pasted newline submits the current
     input/wizard step (a trailing newline usually does the right thing by accident; embedded

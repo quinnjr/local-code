@@ -1,11 +1,15 @@
 pub mod agent;
+pub mod artifacts;
 pub mod cli;
 pub mod config;
 pub mod context;
+mod fsutil;
 pub mod init;
+pub mod marketplace;
 pub mod mcp;
 pub mod memory;
 pub mod permissions;
 pub mod session;
 pub mod skills;
 pub mod tui;
+pub mod url;

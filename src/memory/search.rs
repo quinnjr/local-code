@@ -1,4 +1,6 @@
 use crate::memory::{MemoryError, MemoryPaths};
+use chrono::NaiveDate;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -61,13 +63,36 @@ pub fn search(memory_dir: &Path, query: &str) -> Result<Vec<MemoryHit>, MemoryEr
     // Deliberately excludes paths.core_memories: core memories are always loaded in
     // full by callers (see read_core_memories), never searched on demand.
 
+    // rollup_and_archive copies every in-window daily file into recent.md
+    // (under a `# YYYY-MM-DD` heading) but deletes only archived files, so
+    // afterwards the same line exists both in recent.md and in its
+    // today-YYYY-MM-DD.md file. Dedup on (date, line) — the date taken from
+    // the daily filename or the current `# `-prefixed date heading — so each
+    // copied line is scanned but reported once.
+    let mut seen: HashSet<(NaiveDate, String)> = HashSet::new();
     for file in files {
         let contents = fs::read_to_string(&file).map_err(|source| MemoryError::Read {
             path: file.clone(),
             source,
         })?;
+        let mut current_date = file.file_name().and_then(|n| n.to_str()).and_then(|name| {
+            name.strip_prefix("today-")
+                .and_then(|s| s.strip_suffix(".md"))
+                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        });
         for (idx, line) in contents.lines().enumerate() {
+            if let Some(date) = line
+                .strip_prefix("# ")
+                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            {
+                current_date = Some(date);
+            }
             if matcher.is_match(line) {
+                if let Some(date) = current_date
+                    && !seen.insert((date, line.to_string()))
+                {
+                    continue;
+                }
                 hits.push(MemoryHit {
                     file: file.clone(),
                     line_number: idx + 1,
@@ -128,6 +153,33 @@ mod tests {
 
         let hits = search(&memory_dir, "widgets").unwrap();
         assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn reports_a_line_once_when_it_is_in_both_a_daily_file_and_recent() {
+        let dir = tempdir().unwrap();
+        let memory_dir = dir.path().join("memory");
+        // What rollup_and_archive leaves behind: the in-window daily file
+        // stays on disk and its content is copied into recent.md under a
+        // `# YYYY-MM-DD` heading.
+        write(
+            &memory_dir,
+            "today-2026-07-09.md",
+            "## 09:00:00Z\nWidgets are restocked.\n",
+        );
+        write(
+            &memory_dir,
+            "recent.md",
+            "# 2026-07-09\n\n## 09:00:00Z\nWidgets are restocked.\n",
+        );
+
+        let hits = search(&memory_dir, "widgets").unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a line present in both the daily file and recent.md must be reported once: {hits:?}"
+        );
+        assert_eq!(hits[0].line, "Widgets are restocked.");
     }
 
     #[test]

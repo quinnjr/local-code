@@ -60,7 +60,16 @@ impl GitlabClient {
     fn request(&self, url: &str) -> reqwest::RequestBuilder {
         let mut req = self.http.get(url).header("User-Agent", "local-code");
         if let Some(token) = &self.token {
-            req = req.header("PRIVATE-TOKEN", token);
+            // Only send the token to our own API host — the `Link:
+            // rel="next"` pagination URL is server-supplied, so a
+            // malicious/compromised host could otherwise redirect the token
+            // to a foreign URL. The trailing-`/` path boundary keeps a
+            // same-prefix host from matching; every URL this client builds
+            // (including wiremock test URLs) has a path after the host.
+            let is_own_host = url.starts_with(&format!("{}/", self.api_base));
+            if is_own_host {
+                req = req.header("PRIVATE-TOKEN", token);
+            }
         }
         req
     }
@@ -249,24 +258,9 @@ impl GitlabClient {
 /// `/`), unlike the ref-encoding helper below which only needs to escape `/`.
 fn urlencoding_path(path: &str) -> String {
     path.split('/')
-        .map(percent_encode_segment)
+        .map(crate::url::encode_path_segment)
         .collect::<Vec<_>>()
         .join("%2F")
-}
-
-fn percent_encode_segment(segment: &str) -> String {
-    // Minimal percent-encoding sufficient for path segments used here (no
-    // spaces or unicode expected in practice, but encode defensively).
-    let mut out = String::new();
-    for byte in segment.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
 }
 
 /// Parses the `rel="next"` URL out of GitLab's `Link` response header, if
@@ -587,5 +581,16 @@ mod gitlab_client_tests {
             .join("/");
         let result = client.resolve_project_path(&too_deep).await;
         assert!(matches!(result, Err(SkillHostError::InvalidSpec(_))));
+    }
+
+    #[tokio::test]
+    async fn does_not_send_private_token_to_non_gitlab_host() {
+        let client = GitlabClient::new_for_test(
+            Some("test-token".to_string()),
+            "http://127.0.0.1:1".to_string(),
+        );
+        let request = client.request("https://example.invalid/projects/acme%2Fwidgets");
+        let built = request.build().unwrap();
+        assert!(built.headers().get("PRIVATE-TOKEN").is_none());
     }
 }
