@@ -15,9 +15,10 @@
  ~---~~~~----~~~~             ~~
 ```
 
-A Claude-Code-style terminal coding agent that talks exclusively to local and
+A Claude-Code-style terminal coding agent that talks to local and
 local-network OpenAI-compatible LLM servers — llama.cpp, vLLM, LM Studio, and
-Ollama. No cloud calls, no API keys required.
+Ollama — with optional hosted access to any model through OpenRouter. No
+cloud calls or API keys required for local inference.
 
 ## Features
 
@@ -115,8 +116,8 @@ The backend is chosen once per run, at the first secret access.
 ## Getting started
 
 ```bash
-local-code connections add   # configure a local server (base URL + model)
-local-code                   # launch the TUI
+local-code connections add   # configure a server (local base URL + model, or OpenRouter)
+local-code                   # launch the TUI (/connections add works there too)
 ```
 
 See `TODO.md` for known v1 limitations.

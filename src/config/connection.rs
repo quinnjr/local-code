@@ -1,11 +1,20 @@
 use serde::{Deserialize, Serialize};
 
+/// OpenRouter's canonical API endpoint, including the `/api/v1` prefix every
+/// endpoint hangs off. Offered as the default base URL by the `connections
+/// add` wizards for `openrouter` connections (blank accepts it).
+pub const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
     Ollama,
+    // One word, matching OpenRouter's own branding (kebab-case would
+    // otherwise produce "open-router").
+    #[serde(rename = "openrouter")]
+    OpenRouter,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,18 +50,30 @@ name = "home-ollama"
 provider = "ollama"
 base_url = "http://localhost:11434"
 default_model = "llama3.1"
+
+[[connection]]
+name = "openrouter"
+provider = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+default_model = "anthropic/claude-sonnet-4"
 "#;
 
     #[test]
     fn parses_multiple_connections_from_toml() {
         let file: ConnectionsFile = toml::from_str(TOML_FIXTURE).expect("valid toml");
-        assert_eq!(file.connections.len(), 2);
+        assert_eq!(file.connections.len(), 3);
         assert_eq!(file.connections[0].name, "local-vllm");
         assert_eq!(file.connections[0].provider, ProviderKind::OpenAiCompatible);
         assert_eq!(
             file.connections[0].models,
             vec!["qwen2.5-coder-32b", "llama-3.1-70b"]
         );
+    }
+
+    #[test]
+    fn parses_openrouter_provider_kind() {
+        let file: ConnectionsFile = toml::from_str(TOML_FIXTURE).expect("valid toml");
+        assert_eq!(file.connections[2].provider, ProviderKind::OpenRouter);
     }
 
     #[test]

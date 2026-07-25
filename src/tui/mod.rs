@@ -1,5 +1,6 @@
 pub mod app;
 pub mod components;
+pub mod connections_wizard;
 pub mod gated_tool;
 pub mod mcp_wizard;
 pub mod memory_seed;

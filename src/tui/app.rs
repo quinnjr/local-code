@@ -244,6 +244,13 @@ enum PendingMenu {
     /// blocked (like `streaming`) until the task resolves and resets this to
     /// `None`.
     McpAddConnecting,
+    /// A `/connections add` wizard is mid-flow, waiting for the next line of
+    /// free-text input. Same `Esc`-to-cancel affordance as `McpAddWizard`.
+    /// There is no `Connecting` counterpart here: finalization touches only
+    /// the keyring and connections.toml (no shared agent state to rebuild),
+    /// so the save task runs in the background while the input loop stays
+    /// live and posts a notice when it lands.
+    ConnectionsAddWizard(crate::tui::connections_wizard::ConnectionsAddWizard),
 }
 
 /// The TUI's single stateful root component. Owns the transcript, the input
@@ -288,6 +295,16 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let pending_permission =
         hooks.use_state(|| Option::<crate::permissions::types::PermissionRequest>::None);
     let pending_menu = hooks.use_state(|| PendingMenu::None);
+    // Names of connections whose `/connections add` finalize task is still
+    // running (keyring write + catalog fetch + toml save). `/connections
+    // remove` refuses to act on one of these — removing mid-save would
+    // silently no-op (nothing on disk yet) and the in-flight save would then
+    // land anyway, resurrecting a connection the user just deleted.
+    let connections_saving = hooks.use_state(|| {
+        std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ))
+    });
 
     // Fire-and-forget slash-command tasks (`/compact`, `/init`) register
     // their handles here so pane unmount aborts them, mirroring `run_turn`'s
@@ -765,7 +782,16 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         });
                         return;
                     }
-                    if let KeyCode::Char(c) = ev.code {
+                    // Same modifier guard as the connections wizard:
+                    // Ctrl/Alt+key combos are commands, not input — and on
+                    // the masked bearer steps an inserted letter would be
+                    // invisible. SHIFT still types uppercase.
+                    if let KeyCode::Char(c) = ev.code
+                        && !ev.modifiers.intersects(
+                            ntui::hooks::input::KeyModifiers::CONTROL
+                                | ntui::hooks::input::KeyModifiers::ALT,
+                        )
+                    {
                         input_buffer.update(|b| b.push(c));
                         return;
                     }
@@ -1004,6 +1030,214 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     }
                     return;
                 }
+                PendingMenu::ConnectionsAddWizard(wizard) => {
+                    if ev.code == KeyCode::Esc {
+                        pending_menu.set(PendingMenu::None);
+                        input_buffer.set(String::new());
+                        transcript.update(|entries| {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
+                                text: "cancelled /connections add.".to_string(),
+                            });
+                        });
+                        return;
+                    }
+                    // Modifier-combos (Ctrl/Alt+key) are commands, not text —
+                    // swallow them rather than insert the letter into the
+                    // buffer (invisible corruption on the masked API-key
+                    // step). SHIFT is fine: it types uppercase.
+                    if let KeyCode::Char(c) = ev.code
+                        && !ev.modifiers.intersects(
+                            ntui::hooks::input::KeyModifiers::CONTROL
+                                | ntui::hooks::input::KeyModifiers::ALT,
+                        )
+                    {
+                        input_buffer.update(|b| b.push(c));
+                        return;
+                    }
+                    if ev.code == KeyCode::Backspace {
+                        input_buffer.update(|b| {
+                            b.pop();
+                        });
+                        return;
+                    }
+                    if ev.code == KeyCode::Enter {
+                        let line = input_buffer.get();
+                        input_buffer.set(String::new());
+                        match crate::tui::connections_wizard::advance(wizard, &line) {
+                            crate::tui::connections_wizard::Advance::Continue(
+                                next_wizard,
+                                prompt,
+                            ) => {
+                                pending_menu.set(PendingMenu::ConnectionsAddWizard(next_wizard));
+                                transcript.update(|entries| {
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text: prompt });
+                                });
+                            }
+                            crate::tui::connections_wizard::Advance::Invalid(
+                                same_wizard,
+                                message,
+                            ) => {
+                                pending_menu.set(PendingMenu::ConnectionsAddWizard(same_wizard));
+                                transcript.update(|entries| {
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text: message });
+                                });
+                            }
+                            crate::tui::connections_wizard::Advance::Finalize(output) => {
+                                let crate::tui::connections_wizard::WizardOutput {
+                                    mut connection,
+                                    pending_api_key,
+                                } = output;
+                                // No blocking `Saving` state (unlike McpAddConnecting):
+                                // the finalize task touches only the keyring and
+                                // connections.toml — no shared agent state — so the
+                                // input loop stays live and notices land when it
+                                // finishes.
+                                pending_menu.set(PendingMenu::None);
+                                let transcript_for_task = transcript.clone();
+                                let user_config_dir_for_task = user_config_dir.clone();
+                                let project_config_dir_for_task = project_config_dir.clone();
+                                let connections_saving_for_task = connections_saving.get();
+                                tokio::spawn(async move {
+                                    let name = connection.name.clone();
+                                    connections_saving_for_task
+                                        .lock()
+                                        .expect("connections-saving set poisoned")
+                                        .insert(name.clone());
+                                    let entered_key = pending_api_key.map(|k| k.value);
+
+                                    // Store the wizard-captured API key in the OS
+                                    // keyring BEFORE saving connections.toml: a
+                                    // failure here must not leave a connection whose
+                                    // key was never stored (the reverse — a stored
+                                    // key with no connection using it — is harmless).
+                                    // On the blocking pool: the keyring write is a
+                                    // synchronous Secret Service D-Bus round trip
+                                    // (or gpg subprocess with the pass fallback),
+                                    // which would otherwise freeze the whole
+                                    // single-threaded UI while the user keeps
+                                    // typing. Same convention as /model and
+                                    // /resume's keyring reads.
+                                    if let Some(key) = &entered_key {
+                                        let name_for_keyring = name.clone();
+                                        let key_for_keyring = key.clone();
+                                        let store_result = tokio::task::spawn_blocking(move || {
+                                            crate::config::secrets::SecretStore::set_api_key(
+                                                &name_for_keyring,
+                                                &key_for_keyring,
+                                            )
+                                        })
+                                        .await
+                                        .expect("keyring write task panicked");
+                                        if let Err(e) = store_result {
+                                            transcript_for_task.update(|entries| {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                                    text: format!(
+                                                        "failed to store the API key in the OS keyring: {e}. Connection '{name}' was NOT saved."
+                                                    ),
+                                                });
+                                            });
+                                            connections_saving_for_task
+                                                .lock()
+                                                .expect("connections-saving set poisoned")
+                                                .remove(&name);
+                                            return;
+                                        }
+                                    }
+
+                                    // Populate the /model picker with what the
+                                    // OpenRouter account can actually use
+                                    // (best-effort: a fetch failure leaves
+                                    // `models` empty and the picker offers just
+                                    // the default). The entered key wins, then
+                                    // the same OPENROUTER_API_KEY env fallback
+                                    // `build_model` uses.
+                                    if connection.provider
+                                        == crate::config::connection::ProviderKind::OpenRouter
+                                    {
+                                        let key = entered_key
+                                            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                                            .filter(|k| !k.is_empty());
+                                        match crate::agent::provider::list_models(
+                                            &connection.base_url,
+                                            key.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(models) if !models.is_empty() => {
+                                                transcript_for_task.update(|entries| {
+                                                    entries.push_entry(TranscriptEntry::SystemNotice {
+                                                        text: format!(
+                                                            "fetched {} OpenRouter models for the /model picker.",
+                                                            models.len()
+                                                        ),
+                                                    });
+                                                });
+                                                connection.models = models;
+                                            }
+                                            Ok(_) => {}
+                                            Err(e) => {
+                                                transcript_for_task.update(|entries| {
+                                                    entries.push_entry(TranscriptEntry::SystemNotice {
+                                                        text: format!(
+                                                            "couldn't fetch the OpenRouter model catalog: {e}. \
+                                                             The /model picker will only offer the default until \
+                                                             `models` is filled in connections.toml."
+                                                        ),
+                                                    });
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    // Replace a same-name connection (same rule as
+                                    // the CLI wizard and `connections remove`):
+                                    // user-level first, project entry wins.
+                                    let mut merged = crate::config::connection::load_connections(
+                                        &user_config_dir_for_task,
+                                        &project_config_dir_for_task,
+                                    )
+                                    .unwrap_or_default();
+                                    let replacing = merged.iter().any(|c| c.name == name);
+                                    merged.retain(|c| c.name != name);
+                                    merged.push(connection);
+                                    match crate::config::connection::save_connections(
+                                        &project_config_dir_for_task,
+                                        &merged,
+                                    ) {
+                                        Ok(()) => {
+                                            let overwrite = if replacing {
+                                                " (overwrote an existing connection with the same name)"
+                                            } else {
+                                                ""
+                                            };
+                                            transcript_for_task.update(|entries| {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                                    text: format!(
+                                                        "saved connection '{name}'{overwrite}. Use /model to switch to it."
+                                                    ),
+                                                });
+                                            });
+                                        }
+                                        Err(e) => {
+                                            transcript_for_task.update(|entries| {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                                    text: format!(
+                                                        "connection '{name}' failed to save to connections.toml: {e}"
+                                                    ),
+                                                });
+                                            });
+                                        }
+                                    }
+                                    connections_saving_for_task
+                                        .lock()
+                                        .expect("connections-saving set poisoned")
+                                        .remove(&name);
+                                });
+                            }
+                        }
+                    }
+                    return;
+                }
                 PendingMenu::None => {}
             }
 
@@ -1054,6 +1288,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             user_config_dir: user_config_dir.clone(),
                             project_config_dir: project_config_dir.clone(),
                             pending_menu: pending_menu.clone(),
+                            connections_saving: connections_saving.get(),
                             always_allow: always_allow_snapshot.clone(),
                             always_deny: always_deny_snapshot.clone(),
                             agent: agent.clone(),
@@ -1114,6 +1349,14 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         {
             "•".repeat(input_buffer.get().chars().count())
         }
+        PendingMenu::ConnectionsAddWizard(w)
+            if matches!(
+                w.step,
+                crate::tui::connections_wizard::ConnectionsAddStep::AskApiKey { .. }
+            ) =>
+        {
+            "•".repeat(input_buffer.get().chars().count())
+        }
         _ => input_buffer.get(),
     };
     body.push(
@@ -1153,6 +1396,9 @@ struct SlashContext {
     user_config_dir: std::path::PathBuf,
     project_config_dir: std::path::PathBuf,
     pending_menu: ntui::State<PendingMenu>,
+    /// In-flight `/connections add` saves (see the `connections_saving`
+    /// state in `App`); `/connections remove` refuses to act on these.
+    connections_saving: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     always_allow: Vec<String>,
     always_deny: Vec<String>,
     agent: Arc<Agent>,
@@ -1177,7 +1423,7 @@ const HELP_TEXT: &str = "\
 /model                     switch the active connection/model (history is kept)
 /connections list          list configured connections
 /connections remove <name> remove a configured connection
-/connections add           not supported in-TUI; run `local-code connections add` in a separate terminal
+/connections add           add a connection via a step-by-step wizard (Esc to cancel)
 /mcp list                  list configured MCP servers
 /mcp remove <name>         remove a configured MCP server
 /mcp add                   add an MCP server via a step-by-step wizard (Esc to cancel)
@@ -1329,6 +1575,21 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             });
         }
         SlashCommand::ConnectionsRemove { name } => {
+            if ctx
+                .connections_saving
+                .lock()
+                .expect("connections-saving set poisoned")
+                .contains(&name)
+            {
+                ctx.transcript.update(|entries| {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
+                        text: format!(
+                            "connection '{name}' is still being saved by /connections add — try again in a moment."
+                        ),
+                    });
+                });
+                return;
+            }
             let paths = crate::config::paths::Paths {
                 user_config_dir: ctx.user_config_dir.clone(),
                 project_config_dir: ctx.project_config_dir.clone(),
@@ -1343,17 +1604,13 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
-        SlashCommand::ConnectionsAddUnsupported => {
+        SlashCommand::ConnectionsAdd => {
+            let (wizard, prompt) = crate::tui::connections_wizard::start();
             ctx.transcript.update(|entries| {
-                entries.push_entry(TranscriptEntry::SystemNotice {
-                    text: "adding a connection interactively isn't supported inside the TUI\n\
-                           (the wizard needs multi-step line-by-line stdin, which the raw-mode\n\
-                           TUI input loop doesn't support). Exit and run\n\
-                           `local-code connections add` in a separate terminal, then use /model\n\
-                           to switch to it."
-                        .to_string(),
-                });
+                entries.push_entry(TranscriptEntry::SystemNotice { text: prompt });
             });
+            ctx.pending_menu
+                .set(PendingMenu::ConnectionsAddWizard(wizard));
         }
         SlashCommand::McpList => {
             let paths = crate::config::paths::Paths {
@@ -2088,6 +2345,54 @@ mod tests {
         )
         .unwrap();
         assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    /// Same modifier guard as the connections wizard: Ctrl-combos are
+    /// commands, not input; SHIFT still types uppercase.
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_ignores_ctrl_modified_chars_but_allows_shift() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        for c in "ab".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.send_key_event(ntui::KeyEvent::new(
+            KeyCode::Char('c'),
+            ntui::hooks::input::KeyModifiers::CONTROL,
+        ))
+        .unwrap();
+        t.send_key_event(ntui::KeyEvent::new(
+            KeyCode::Char('D'),
+            ntui::hooks::input::KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        t.send_key(KeyCode::Enter).unwrap();
+        t.tick().await.unwrap();
+
+        type_and_submit(&mut t, "4").await; // HTTP
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "http://127.0.0.1:1").await; // nothing listens here
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await; // no token
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        let saved = crate::config::mcp_servers::load_mcp_servers_raw(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].name, "abD",
+            "Ctrl+C must not insert 'c'; Shift+D must insert 'D'"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3009,14 +3314,504 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn connections_add_explains_it_is_unsupported_in_tui() {
+    async fn connections_add_starts_the_wizard_and_prompts_for_a_name() {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/connections add").await;
         t.tick().await.unwrap();
         assert!(
-            t.frame_text().contains("local-code connections add"),
+            t.frame_text().contains("Connection name:"),
             "{}",
             t.frame_text()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connections_add_esc_cancels_mid_flow_without_saving_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "partial-name").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Choose a provider"),
+            "{}",
+            t.frame_text()
+        );
+
+        t.send_key(KeyCode::Esc).unwrap();
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("cancelled /connections add"),
+            "{}",
+            t.frame_text()
+        );
+
+        // Esc cancelled the wizard, so ordinary chat input works again —
+        // and nothing was written to connections.toml.
+        type_and_submit(&mut t, "hello after cancel").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("hello after cancel"));
+        let saved = crate::config::connection::load_connections(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(saved.is_empty());
+    }
+
+    /// NOT `start_paused`: the finalize task does a real HTTP round trip to
+    /// the wiremock catalog server, which needs wall-clock progress.
+    #[tokio::test]
+    async fn connections_add_openrouter_branch_saves_connection_with_fetched_models() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer sk-or-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "anthropic/claude-sonnet-4"},
+                    {"id": "openai/gpt-4o"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "or").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Choose a provider"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "3").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Base URL [blank ="),
+            "{}",
+            t.frame_text()
+        );
+        // Enter the mock catalog's URL explicitly (blank would aim the
+        // finalize task at the real openrouter.ai).
+        type_and_submit(&mut t, &server.uri()).await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("anthropic/claude-sonnet-4"),
+            "the openrouter model-slug hint: {}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "anthropic/claude-sonnet-4").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("OPENROUTER_API_KEY"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "sk-or-test").await;
+
+        // Poll until the finalize task (keyring write → catalog fetch →
+        // toml save) lands.
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        let conn = &saved[0];
+        assert_eq!(
+            conn.provider,
+            crate::config::connection::ProviderKind::OpenRouter
+        );
+        assert_eq!(conn.base_url, server.uri());
+        assert_eq!(conn.default_model, "anthropic/claude-sonnet-4");
+        assert_eq!(
+            conn.models,
+            vec!["anthropic/claude-sonnet-4", "openai/gpt-4o"],
+            "the fetched OpenRouter catalog must land in connection.models"
+        );
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_api_key("or").unwrap(),
+            Some("sk-or-test".to_string())
+        );
+        assert!(
+            t.frame_text().contains("saved connection 'or'"),
+            "{}",
+            t.frame_text()
+        );
+
+        // …and those models are what /model offers for the connection.
+        type_and_submit(&mut t, "/model").await;
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("or · anthropic/claude-sonnet-4"), "{text}");
+        assert!(text.contains("or · openai/gpt-4o"), "{text}");
+    }
+
+    /// Terminals deliver a paste as a burst of ordinary key events (ntui
+    /// doesn't enable bracketed paste, so there is no atomic paste event) —
+    /// a single-line paste must therefore land in the wizard buffer exactly
+    /// like typed input. Multi-line pastes are a known limitation: each
+    /// pasted newline arrives as an Enter and submits the current step.
+    #[tokio::test]
+    async fn connections_add_accepts_a_single_line_paste_into_the_api_key_step() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PASTED_KEY: &str = "sk-or-pasted-AbC_123-xyz";
+
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "m"}]
+            })))
+            .mount(&server)
+            .await;
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "or-paste").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "3").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, &server.uri()).await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "m").await;
+        t.tick().await.unwrap();
+
+        // Simulate the paste as the terminal delivers it: one Char key event
+        // per byte, no interleaved ticks.
+        for c in PASTED_KEY.chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.send_key(KeyCode::Enter).unwrap();
+
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_api_key("or-paste").unwrap(),
+            Some(PASTED_KEY.to_string()),
+            "the pasted key must land in the keyring intact"
+        );
+    }
+
+    /// Ctrl/Alt-modified keys are commands, not wizard input: they must not
+    /// land in the buffer (invisible corruption on the masked key step).
+    /// SHIFT must still type uppercase, though — names are case-sensitive.
+    #[tokio::test]
+    async fn connections_add_wizard_ignores_ctrl_modified_chars_but_allows_shift() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        for c in "ab".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.send_key_event(ntui::KeyEvent::new(
+            KeyCode::Char('c'),
+            ntui::hooks::input::KeyModifiers::CONTROL,
+        ))
+        .unwrap();
+        t.send_key_event(ntui::KeyEvent::new(
+            KeyCode::Char('D'),
+            ntui::hooks::input::KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        t.send_key(KeyCode::Enter).unwrap();
+        t.tick().await.unwrap();
+
+        // Walk the rest of the ollama branch to the save.
+        type_and_submit(&mut t, "2").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "http://localhost:11434").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "m").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await;
+
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].name, "abD",
+            "Ctrl+C must not insert 'c'; Shift+D must insert 'D'"
+        );
+    }
+
+    /// `/connections remove` submitted while the wizard's finalize task is
+    /// still fetching the catalog must be refused (not silently no-op and
+    /// then have the save land anyway), and must work again once the save
+    /// completes.
+    #[tokio::test]
+    async fn connections_remove_during_in_flight_save_is_refused_then_works() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        let server = MockServer::start().await;
+        // Slow catalog fetch, so the remove below lands mid-save.
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(500))
+                    .set_body_json(serde_json::json!({"data": [{"id": "m"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "or-race").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "3").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, &server.uri()).await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "m").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await; // blank key → no keyring write
+
+        // Let the spawned finalize task start (it marks the save in-flight
+        // before its first await), then try to remove mid-flight.
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        type_and_submit(&mut t, "/connections remove or-race").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("still being saved"),
+            "{}",
+            t.frame_text()
+        );
+
+        // The save then lands intact…
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "or-race");
+
+        // …and once it's done, remove works again.
+        type_and_submit(&mut t, "/connections remove or-race").await;
+        t.tick().await.unwrap();
+        let saved = crate::config::connection::load_connections(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    /// The wizard's API key must exist ONLY in the OS keyring: never in
+    /// connections.toml, never in the session file (wizard prompts/notices
+    /// are transcript entries, and every turn persists the transcript), and
+    /// never in any other file under the config/state dirs.
+    #[tokio::test]
+    async fn connections_add_api_key_lands_only_in_the_keyring_never_on_disk() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const KEY: &str = "sk-or-must-never-touch-disk-9f3b2c71";
+
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let mut props = test_props_with_config_dir(dir.path());
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        props.user_state_dir = state_dir.clone();
+        props.session_path = state_dir.join("session.json");
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "anthropic/claude-sonnet-4"}]
+            })))
+            .mount(&server)
+            .await;
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "or-keysafe").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "3").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, &server.uri()).await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "anthropic/claude-sonnet-4").await;
+        t.tick().await.unwrap();
+
+        // While typing the key, the input box must show only mask bullets.
+        for c in KEY.chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.tick().await.unwrap();
+        let frame = t.frame_text();
+        assert!(
+            !frame.contains(KEY),
+            "key visible on screen while typing: {frame}"
+        );
+        assert!(frame.contains("•"), "expected mask bullets: {frame}");
+        t.send_key(KeyCode::Enter).unwrap();
+
+        // Let the finalize task land, then run one ordinary turn so the
+        // transcript (with all the wizard notices) is persisted to the
+        // session file. Poll until BOTH the connection save and the session
+        // save have landed — the finalize task's real HTTP fetch can finish
+        // after the (instant) echo-model turn.
+        type_and_submit(&mut t, "an ordinary message").await;
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            let session_saved = state_dir.join("session.json").exists()
+                && std::fs::read_to_string(state_dir.join("session.json"))
+                    .map(|c| c.contains("an ordinary message"))
+                    .unwrap_or(false);
+            if !saved.is_empty() && session_saved {
+                break;
+            }
+        }
+
+        // The key is in the keyring…
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_api_key("or-keysafe").unwrap(),
+            Some(KEY.to_string())
+        );
+        // …the connection was saved…
+        assert_eq!(saved.len(), 1);
+        // …and no file anywhere under the config/state root contains it.
+        for entry in walkdir::WalkDir::new(dir.path())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+        {
+            let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            assert!(
+                !content.contains(KEY),
+                "the API key leaked into {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    /// NOT `start_paused`: shares the finalize task's wall-clock needs with
+    /// the OpenRouter test above (no catalog fetch here, but the save still
+    /// runs on a spawned task).
+    #[tokio::test]
+    async fn connections_add_ollama_branch_saves_without_a_model_fetch() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "home").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "2").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "http://localhost:11434").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "llama3.1").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await; // blank key: unkeyed local server
+
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].provider,
+            crate::config::connection::ProviderKind::Ollama
+        );
+        assert!(saved[0].models.is_empty());
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_api_key("home").unwrap(),
+            None
         );
     }
 

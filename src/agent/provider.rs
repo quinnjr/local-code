@@ -1,5 +1,6 @@
 use daimon::model::SharedModel;
 use daimon::model::local::{Ollama, OpenAiCompatible};
+use daimon::model::openrouter::OpenRouter;
 
 use crate::config::connection::{Connection, ProviderKind};
 
@@ -7,13 +8,16 @@ use crate::config::connection::{Connection, ProviderKind};
 pub enum ProviderError {
     #[error("connection '{0}' has an empty base_url")]
     EmptyBaseUrl(String),
+    #[error("failed to fetch the model catalog: {0}")]
+    Catalog(String),
 }
 
 /// Builds a `daimon` `Model` (erased behind `SharedModel`) from a resolved `Connection`
 /// and its (optional) API key. `OpenAiCompatible` connections use
 /// `daimon-provider-local`'s generic OpenAI-compatible provider pointed at
-/// `connection.base_url`; `Ollama` connections use the dedicated Ollama provider.
-/// Later phases (`/model` switching) call this directly.
+/// `connection.base_url`; `Ollama` connections use the dedicated Ollama provider;
+/// `OpenRouter` connections use `daimon-provider-openrouter` (the `openrouter`
+/// feature). Later phases (`/model` switching) call this directly.
 pub fn build_model(
     connection: &Connection,
     api_key: Option<String>,
@@ -42,6 +46,21 @@ pub fn build_model(
             Ollama::new(connection.default_model.clone())
                 .with_base_url(connection.base_url.clone()),
         ),
+        ProviderKind::OpenRouter => {
+            // A stored keyring key wins; without one, `OpenRouter::new`
+            // falls back to the OPENROUTER_API_KEY environment variable (the
+            // crate warns if that is unset too — OpenRouter requires a key,
+            // so requests would then fail with a 401 naming the problem).
+            let m = match api_key.filter(|k| !k.is_empty()) {
+                Some(key) => OpenRouter::with_api_key(connection.default_model.clone(), key),
+                None => OpenRouter::new(connection.default_model.clone()),
+            };
+            std::sync::Arc::new(
+                m.with_base_url(connection.base_url.clone())
+                    .with_app_name("local-code")
+                    .with_timeout(std::time::Duration::from_secs(300)),
+            )
+        }
     };
 
     Ok(model)
@@ -60,6 +79,109 @@ fn normalize_openai_compatible_base_url(base_url: &str) -> String {
         .unwrap_or(trimmed)
         .trim_end_matches('/')
         .to_string()
+}
+
+/// Fetches the model catalog (`GET {base_url}/models`) of an OpenAI-compatible
+/// server — OpenRouter's catalog, or a local server's loaded models —
+/// returning the ids the `/model` picker offers. Used by the `/connections
+/// add` wizard to populate a new connection's `models` list.
+///
+/// The catalog is public on OpenRouter, so `api_key` is optional (pass the
+/// key when one is known — authenticated calls don't share the anonymous
+/// rate limit). Deliberately short-timeout: callers treat an error as "no
+/// listing available", never as fatal.
+pub async fn list_models(
+    base_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>, ProviderError> {
+    #[derive(serde::Deserialize)]
+    struct ModelList {
+        data: Vec<ModelEntry>,
+    }
+    #[derive(serde::Deserialize)]
+    struct ModelEntry {
+        id: String,
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| ProviderError::Catalog(format!("HTTP client build failed: {e}")))?;
+    let url = format!("{}/models", base_url.trim().trim_end_matches('/'));
+    let api_key = api_key.filter(|k| !k.is_empty());
+    ensure_not_plaintext_remote(&url, api_key.is_some())?;
+    let mut request = client.get(&url);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ProviderError::Catalog(format!("HTTP error: {e}")))?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(ProviderError::Catalog(format!(
+            "API error ({status}): {}",
+            extract_error_message(&text)
+        )));
+    }
+    let list = response
+        .json::<ModelList>()
+        .await
+        .map_err(|e| ProviderError::Catalog(format!("response parse error: {e}")))?;
+    Ok(list.data.into_iter().map(|m| m.id).collect())
+}
+
+/// Refuses to send an API key over plaintext `http://` to a non-loopback
+/// host — the same guard `daimon`'s providers apply to chat requests,
+/// applied here to the catalog fetch (loopback is exempt: test servers and
+/// keyed local deployments are normally plaintext).
+fn ensure_not_plaintext_remote(base_url: &str, has_key: bool) -> Result<(), ProviderError> {
+    if !has_key {
+        return Ok(());
+    }
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        // Not parseable as a URL; reqwest's send error will name the problem.
+        return Ok(());
+    };
+    if url.scheme() != "http" {
+        return Ok(());
+    }
+    let host = url.host_str().unwrap_or_default();
+    let loopback = host == "localhost"
+        || host.ends_with(".localhost")
+        || host.starts_with("127.")
+        || host == "::1"
+        || host == "[::1]";
+    if loopback {
+        return Ok(());
+    }
+    Err(ProviderError::Catalog(format!(
+        "refusing to send the API key over plaintext http:// to '{host}'; \
+         use https:// or remove the key"
+    )))
+}
+
+/// OpenAI-style servers return errors as `{"error": {"message": "...", ...}}`.
+/// Extract the human message so error strings don't dump the raw JSON
+/// envelope; fall back to the raw body for non-conforming responses (e.g. an
+/// HTML error page from a proxy).
+fn extract_error_message(body: &str) -> String {
+    #[derive(serde::Deserialize)]
+    struct ErrorEnvelope {
+        error: ErrorBody,
+    }
+    #[derive(serde::Deserialize)]
+    struct ErrorBody {
+        message: String,
+    }
+
+    match serde_json::from_str::<ErrorEnvelope>(body) {
+        Ok(envelope) => envelope.error.message,
+        Err(_) => body.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -82,6 +204,16 @@ mod tests {
             provider: ProviderKind::Ollama,
             base_url: "http://localhost:11434".into(),
             default_model: "llama3.1".into(),
+            models: vec![],
+        }
+    }
+
+    fn openrouter_connection() -> Connection {
+        Connection {
+            name: "openrouter".into(),
+            provider: ProviderKind::OpenRouter,
+            base_url: "https://openrouter.ai/api/v1".into(),
+            default_model: "anthropic/claude-sonnet-4".into(),
             models: vec![],
         }
     }
@@ -111,6 +243,21 @@ mod tests {
     #[test]
     fn builds_ollama_model() {
         let result = build_model(&ollama_connection(), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builds_openrouter_model_with_key() {
+        let result = build_model(&openrouter_connection(), Some("sk-or-test".into()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn builds_openrouter_model_without_key_falls_back_to_env() {
+        // No keyring key: construction still succeeds — the crate reads
+        // OPENROUTER_API_KEY (unset in tests, so it just warns) and any
+        // failure surfaces later as a 401 from OpenRouter itself.
+        let result = build_model(&openrouter_connection(), None);
         assert!(result.is_ok());
     }
 
@@ -156,5 +303,32 @@ mod tests {
             normalize_openai_compatible_base_url("http://host:8080/serve"),
             "http://host:8080/serve"
         );
+    }
+
+    #[test]
+    fn plaintext_guard_allows_https_and_loopback_with_a_key() {
+        assert!(ensure_not_plaintext_remote("https://openrouter.ai/api/v1/models", true).is_ok());
+        assert!(ensure_not_plaintext_remote("http://localhost:8000/v1/models", true).is_ok());
+        assert!(ensure_not_plaintext_remote("http://127.0.0.1:8000/v1/models", true).is_ok());
+        // No key: plaintext to a remote host is fine (nothing to leak).
+        assert!(ensure_not_plaintext_remote("http://example.com/v1/models", false).is_ok());
+    }
+
+    #[test]
+    fn plaintext_guard_refuses_keyed_plaintext_to_a_remote_host() {
+        let err = ensure_not_plaintext_remote("http://openrouter.example.com/api/v1/models", true)
+            .unwrap_err();
+        assert!(
+            matches!(err, ProviderError::Catalog(ref msg) if msg.contains("plaintext")),
+            "expected a plaintext-refusal Catalog error, got {err}"
+        );
+    }
+
+    #[test]
+    fn extract_error_message_reads_the_openai_error_envelope() {
+        let body = r#"{"error": {"message": "Invalid API key", "code": 401}}"#;
+        assert_eq!(extract_error_message(body), "Invalid API key");
+        // Non-conforming bodies (proxy HTML pages, plain text) pass through.
+        assert_eq!(extract_error_message("gateway timeout"), "gateway timeout");
     }
 }

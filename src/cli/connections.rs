@@ -50,22 +50,47 @@ pub fn add<R: BufRead, W: Write>(
     out.flush()?;
     let name = read_line(&mut input)?;
 
-    write!(out, "Provider type (1=openai-compatible, 2=ollama): ")?;
+    write!(
+        out,
+        "Provider type (1=openai-compatible, 2=ollama, 3=openrouter): "
+    )?;
     out.flush()?;
     let provider = match read_line(&mut input)?.trim() {
         "2" => ProviderKind::Ollama,
+        "3" => ProviderKind::OpenRouter,
         _ => ProviderKind::OpenAiCompatible,
     };
 
-    write!(out, "Base URL: ")?;
-    out.flush()?;
-    let base_url = read_line(&mut input)?;
+    // OpenRouter has a single canonical endpoint; offer it as the default so
+    // the common case is name → 3 → Enter → model → key.
+    let base_url = if provider == ProviderKind::OpenRouter {
+        write!(
+            out,
+            "Base URL [{}]: ",
+            crate::config::connection::OPENROUTER_DEFAULT_BASE_URL
+        )?;
+        out.flush()?;
+        let entered = read_line(&mut input)?;
+        if entered.is_empty() {
+            crate::config::connection::OPENROUTER_DEFAULT_BASE_URL.to_string()
+        } else {
+            entered
+        }
+    } else {
+        write!(out, "Base URL: ")?;
+        out.flush()?;
+        read_line(&mut input)?
+    };
 
     write!(out, "Default model: ")?;
     out.flush()?;
     let default_model = read_line(&mut input)?;
 
-    write!(out, "API key (leave blank if none): ")?;
+    if provider == ProviderKind::OpenRouter {
+        write!(out, "API key (blank = OPENROUTER_API_KEY env var): ")?;
+    } else {
+        write!(out, "API key (leave blank if none): ")?;
+    }
     out.flush()?;
     let api_key = read_line(&mut input)?;
 
@@ -232,5 +257,30 @@ mod tests {
 
         assert_eq!(connection.provider, ProviderKind::Ollama);
         assert_eq!(SecretStore::get_api_key(&connection.name).unwrap(), None);
+    }
+
+    #[test]
+    fn add_openrouter_defaults_the_base_url_when_blank() {
+        use_mock_keyring();
+        let dir = tempdir().unwrap();
+        let paths = test_paths(dir.path());
+
+        // Provider 3 with an empty base-URL line accepts the canonical
+        // OpenRouter endpoint instead of storing an empty string (which
+        // `build_model` would reject).
+        let transcript = "or\n3\n\nanthropic/claude-sonnet-4\nsk-or-test\n";
+        let mut out = Vec::new();
+        let connection = add(&paths, transcript.as_bytes(), &mut out).unwrap();
+
+        assert_eq!(connection.provider, ProviderKind::OpenRouter);
+        assert_eq!(
+            connection.base_url,
+            crate::config::connection::OPENROUTER_DEFAULT_BASE_URL
+        );
+        assert_eq!(connection.default_model, "anthropic/claude-sonnet-4");
+        assert_eq!(
+            SecretStore::get_api_key(&connection.name).unwrap(),
+            Some("sk-or-test".to_string())
+        );
     }
 }
