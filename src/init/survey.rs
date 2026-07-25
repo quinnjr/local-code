@@ -35,7 +35,10 @@ const MAX_FILES_LISTED: usize = 500;
 /// Walks `project_root`, respecting `.gitignore` (via `ignore::WalkBuilder`,
 /// the same traversal semantics ripgrep uses), collecting up to
 /// `MAX_FILES_LISTED` relative file paths and the full contents of any
-/// top-level file matching `RECOGNIZED_MANIFESTS`.
+/// recognized build-manifest file found — matched by file name at any depth,
+/// so nested manifests (e.g. `crates/foo/Cargo.toml`) are included. Manifest
+/// contents are read uncapped here; truncation happens later in
+/// `build_init_prompt`.
 pub fn survey_project(project_root: &Path) -> ProjectSurvey {
     let mut survey = ProjectSurvey::default();
 

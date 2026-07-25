@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod context;
 pub mod init;
+pub mod marketplace;
 pub mod mcp;
 pub mod memory;
 pub mod permissions;

@@ -84,7 +84,16 @@ impl BitbucketClient {
     fn request(&self, url: &str) -> reqwest::RequestBuilder {
         let mut req = self.http.get(url).header("User-Agent", "local-code");
         if let Some((user, pass)) = &self.credentials {
-            req = req.basic_auth(user, Some(pass));
+            // Scope credentials to our own API host: the `next` pagination
+            // link and each entry's `links.self.href` are server-supplied
+            // URLs, so Basic auth must never leak to a foreign host. The
+            // trailing slash is a path boundary — every URL this client
+            // builds has a path after the host (as do the wiremock test
+            // URLs, which are `server.uri()`-based with paths).
+            let is_bitbucket_host = url.starts_with(&format!("{}/", self.api_base));
+            if is_bitbucket_host {
+                req = req.basic_auth(user, Some(pass));
+            }
         }
         req
     }
@@ -434,5 +443,16 @@ mod bitbucket_client_tests {
             result,
             Err(SkillHostError::Api { status: 404, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn does_not_send_basic_auth_to_non_bitbucket_host() {
+        let client = BitbucketClient::new_for_test(
+            Some(("user".to_string(), "pass".to_string())),
+            "http://127.0.0.1:1".to_string(),
+        );
+        let request = client.request("https://example.invalid/SKILL.md");
+        let built = request.build().unwrap();
+        assert!(built.headers().get("Authorization").is_none());
     }
 }

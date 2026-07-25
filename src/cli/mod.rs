@@ -1,6 +1,8 @@
 pub mod connections;
+pub mod marketplace;
 pub mod mcp;
 pub mod memory;
+pub mod plugin;
 pub mod secret;
 pub mod skills;
 
@@ -53,10 +55,20 @@ pub enum Command {
         #[command(subcommand)]
         action: MemoryAction,
     },
-    /// Manage skills (install/list/remove/update from GitHub)
+    /// Manage skills (install/list/remove/update from GitHub, GitLab, or Bitbucket)
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
+    },
+    /// Manage plugin marketplaces (add/list/remove Claude Code marketplaces)
+    Marketplace {
+        #[command(subcommand)]
+        action: MarketplaceAction,
+    },
+    /// Install plugins from registered marketplaces (list/install/remove/update)
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
     },
     /// Manage named secrets in the OS keyring, referenced from mcp.toml as ${keyring:<name>}
     Secret {
@@ -102,7 +114,7 @@ pub enum CoreAction {
 
 #[derive(Subcommand, Debug)]
 pub enum SkillsAction {
-    /// Install a skill from GitHub: owner/repo[/path][@ref]
+    /// Install a skill: owner/repo[/path][@ref], a gh:/gl:/bb: spec, or a full URL
     Install {
         spec: String,
         /// Install into the global (user-level) scope instead of this project
@@ -136,6 +148,43 @@ pub enum SecretAction {
     Rm { name: String },
     /// List stored secret names (never values)
     Ls,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MarketplaceAction {
+    /// Register a Claude Code marketplace: owner/repo[/path][@ref], a
+    /// gh:/gl:/bb: spec or URL, or a local directory containing
+    /// .claude-plugin/marketplace.json
+    Add { spec: String },
+    /// List registered marketplaces
+    List,
+    /// Unregister a marketplace (installed plugin skills stay installed)
+    Remove { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PluginAction {
+    /// List plugins offered by the registered marketplaces
+    List,
+    /// Install a plugin's skills: <plugin>@<marketplace>
+    Install {
+        spec: String,
+        /// Install into the global (user-level) scope instead of this project
+        #[arg(long)]
+        global: bool,
+    },
+    /// Remove all skills installed from a plugin
+    Remove {
+        name: String,
+        #[arg(long)]
+        global: bool,
+    },
+    /// Re-fetch a plugin's skills from its marketplace
+    Update {
+        name: String,
+        #[arg(long)]
+        global: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -240,6 +289,31 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             }
             SkillsAction::Update { name, global } => {
                 skills::update(&paths, name.as_deref(), global, stdout()).await?;
+            }
+        },
+        Some(Command::Marketplace { action }) => match action {
+            MarketplaceAction::Add { spec } => {
+                marketplace::add(&paths, &spec, stdout()).await?;
+            }
+            MarketplaceAction::List => {
+                marketplace::list(&paths, stdout())?;
+            }
+            MarketplaceAction::Remove { name } => {
+                marketplace::remove(&paths, &name, stdout())?;
+            }
+        },
+        Some(Command::Plugin { action }) => match action {
+            PluginAction::List => {
+                plugin::list(&paths, stdout()).await?;
+            }
+            PluginAction::Install { spec, global } => {
+                plugin::install(&paths, &spec, global, stdout()).await?;
+            }
+            PluginAction::Remove { name, global } => {
+                plugin::remove(&paths, &name, global, stdout())?;
+            }
+            PluginAction::Update { name, global } => {
+                plugin::update(&paths, &name, global, stdout()).await?;
             }
         },
         Some(Command::Secret { action }) => match action {
@@ -601,6 +675,83 @@ mod skills_cli_tests {
         } else {
             panic!("expected Some(Command::Skills)");
         }
+    }
+}
+
+#[cfg(test)]
+mod marketplace_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_marketplace_add_list_remove() {
+        let cli = Cli::parse_from(["local-code", "marketplace", "add", "acme/plugins"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Marketplace {
+                action: MarketplaceAction::Add { ref spec }
+            }) if spec == "acme/plugins"
+        ));
+
+        let cli = Cli::parse_from(["local-code", "marketplace", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Marketplace {
+                action: MarketplaceAction::List
+            })
+        ));
+
+        let cli = Cli::parse_from(["local-code", "marketplace", "remove", "acme-tools"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Marketplace {
+                action: MarketplaceAction::Remove { ref name }
+            }) if name == "acme-tools"
+        ));
+    }
+
+    #[test]
+    fn parses_plugin_install_with_global() {
+        let cli = Cli::parse_from([
+            "local-code",
+            "plugin",
+            "install",
+            "code-formatter@acme-tools",
+            "--global",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                action: PluginAction::Install { ref spec, global: true }
+            }) if spec == "code-formatter@acme-tools"
+        ));
+    }
+
+    #[test]
+    fn parses_plugin_list_remove_update() {
+        let cli = Cli::parse_from(["local-code", "plugin", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                action: PluginAction::List
+            })
+        ));
+
+        let cli = Cli::parse_from(["local-code", "plugin", "remove", "foo", "--global"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                action: PluginAction::Remove { ref name, global: true }
+            }) if name == "foo"
+        ));
+
+        let cli = Cli::parse_from(["local-code", "plugin", "update", "foo"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                action: PluginAction::Update { ref name, global: false }
+            }) if name == "foo"
+        ));
     }
 }
 

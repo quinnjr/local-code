@@ -726,6 +726,42 @@ args = ["--root=${MCP_TEST_ROOT}/sub"]
     }
 
     #[test]
+    fn resolve_server_refs_resolves_env_refs_in_an_in_hand_config() {
+        // The /mcp add wizard builds its config from user input rather than
+        // loading it from disk, so resolve_server_refs is its only reference
+        // resolution before connect_one — drive that entry point directly.
+        // SAFETY: test-only, single-threaded within this process's test harness
+        // for this specific var name; no other test reads or writes it.
+        unsafe { std::env::set_var("MCP_TEST_RESOLVE_TOKEN", "resolved-tok") };
+        let server = McpServerConfig {
+            name: "wizard-built".into(),
+            transport: McpTransportConfig::Http {
+                url: "http://localhost:9000/mcp?key=${MCP_TEST_RESOLVE_TOKEN}".into(),
+                headers: HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer ${MCP_TEST_RESOLVE_TOKEN}".to_string(),
+                )]),
+            },
+        };
+
+        let resolved = resolve_server_refs(server);
+
+        assert_eq!(resolved.name, "wizard-built");
+        assert_eq!(
+            resolved.transport,
+            McpTransportConfig::Http {
+                url: "http://localhost:9000/mcp?key=resolved-tok".into(),
+                headers: HashMap::from([(
+                    "Authorization".to_string(),
+                    "Bearer resolved-tok".to_string()
+                )]),
+            }
+        );
+
+        unsafe { std::env::remove_var("MCP_TEST_RESOLVE_TOKEN") };
+    }
+
+    #[test]
     fn parses_sse_transport_with_headers() {
         let toml_text = r#"
 [[server]]

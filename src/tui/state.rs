@@ -37,9 +37,9 @@ pub struct ToolCallEntry {
     pub name: String,
     pub arguments_json: String,
     pub result: Option<ToolCallResult>,
-    /// Whether the card renders its arguments/result body. Toggled by the
-    /// Transcript component's Tab handler (Task 6); defaults to expanded so a
-    /// freshly-arriving card is immediately readable.
+    /// Whether the card renders its arguments/result body. Toggled by App's
+    /// Tab key handler; defaults to expanded so a freshly-arriving card is
+    /// immediately readable.
     pub expanded: bool,
 }
 
@@ -107,7 +107,7 @@ pub fn find_tool_call_mut<'a>(
 }
 
 /// Toggles `expanded` on the most recently appended `ToolCall` entry, if any.
-/// Used by the Transcript component's Tab key handler.
+/// Used by App's Tab key handler.
 pub fn toggle_last_tool_call_expanded(entries: &mut [Arc<TranscriptEntry>]) {
     let last_call = entries
         .iter()

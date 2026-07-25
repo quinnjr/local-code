@@ -86,11 +86,12 @@ pub async fn rebuild_agent_from_history(
     skills: Vec<Skill>,
     pending_permission: ntui::State<Option<PermissionRequest>>,
 ) -> daimon::Result<(Arc<Agent>, Arc<PermissionGate>, ResponderHandle)> {
-    let history = old_agent
-        .memory()
-        .get_messages_erased()
-        .await
-        .unwrap_or_default();
+    // A failed history read must propagate as `Err` (both call sites keep
+    // the old agent live and post a notice) — never default to an empty
+    // history, which would silently drop the whole conversation while the
+    // switch reports success. Same `DaimonError` type as the return, so
+    // plain `?` matches `rebuild_agent`'s propagation style above.
+    let history = old_agent.memory().get_messages_erased().await?;
     rebuild_agent(
         model,
         initial_tier,
@@ -212,6 +213,83 @@ mod tests {
             *saw_err.lock().unwrap(),
             Some(true),
             "duplicate namespaced tool names must surface as Err, not a panic"
+        );
+    }
+
+    /// A `Memory` backend whose reads always fail — pins that
+    /// `rebuild_agent_from_history` propagates a history-read failure as
+    /// `Err` instead of silently rebuilding with an empty history (the call
+    /// sites' keep-old-agent recovery depends on this being an `Err`, same
+    /// as the duplicate-tool-name case above).
+    struct FailMemory;
+    impl daimon::memory::Memory for FailMemory {
+        async fn add_message(&self, _message: &Message) -> daimon::Result<()> {
+            Ok(())
+        }
+        async fn get_messages(&self) -> daimon::Result<Vec<Message>> {
+            Err(daimon::DaimonError::storage("injected read failure"))
+        }
+        async fn clear(&self) -> daimon::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FailMemoryProps {
+        saw_err: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+    impl PartialEq for FailMemoryProps {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+
+    #[component]
+    fn FailMemoryHarness(props: &FailMemoryProps, hooks: &mut ntui::Hooks) -> ntui::Element {
+        let pending = hooks.use_state(|| Option::<PermissionRequest>::None);
+        hooks.use_effect((), {
+            let saw_err = props.saw_err.clone();
+            let pending = pending.clone();
+            move || {
+                let model: SharedModel = Arc::new(EchoModel);
+                let old_agent = daimon::agent::AgentBuilder::new()
+                    .shared_model(model.clone())
+                    .memory(FailMemory)
+                    .build()
+                    .expect("static test agent never fails to build");
+                tokio::spawn(async move {
+                    let result = rebuild_agent_from_history(
+                        &old_agent,
+                        model,
+                        PermissionTier::FullAuto,
+                        PermissionSettings::default(),
+                        "",
+                        Vec::new(),
+                        Vec::new(),
+                        pending,
+                    )
+                    .await;
+                    *saw_err.lock().unwrap() = Some(result.is_err());
+                });
+            }
+        });
+        element! { View {} }
+    }
+
+    #[tokio::test]
+    async fn rebuild_agent_from_history_propagates_a_memory_read_failure() {
+        let props = FailMemoryProps::default();
+        let saw_err = props.saw_err.clone();
+        let mut t =
+            TestTerminal::new(10, 1, Element::component::<FailMemoryHarness>(props)).unwrap();
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+        assert_eq!(
+            *saw_err.lock().unwrap(),
+            Some(true),
+            "a failed history read must surface as Err, not a silent empty history"
         );
     }
 

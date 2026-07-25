@@ -105,6 +105,16 @@ pub struct Skill {
     pub load_mode: LoadMode,
 }
 
+/// Which marketplace plugin a skill was installed from, recorded in the
+/// skill's manifest so `plugin remove`/`plugin update` can find every skill
+/// belonging to a plugin and `skills update` can leave plugin-managed skills
+/// to `plugin update`. `None` for plain `skills install` installs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PluginProvenance {
+    pub marketplace: String,
+    pub plugin: String,
+}
+
 /// Sidecar manifest written alongside a skill's files at
 /// `<skill_dir>/.skill-manifest.json`, recording where it came from so
 /// `crate::skills::install::update_skill` can re-resolve and detect changes.
@@ -123,6 +133,10 @@ pub struct InstalledSkillManifest {
     pub git_ref: String,
     /// The commit SHA that `git_ref` resolved to at install/update time.
     pub commit_sha: String,
+    /// Missing in manifests written before marketplace plugin support —
+    /// `#[serde(default)]` treats them as plain (non-plugin) installs.
+    #[serde(default)]
+    pub plugin: Option<PluginProvenance>,
 }
 
 #[cfg(test)]
@@ -134,6 +148,13 @@ mod host_backcompat_tests {
         let json = r#"{"owner":"acme","repo":"widgets","path":"skills/pdf","git_ref":"main","commit_sha":"abc123"}"#;
         let manifest: InstalledSkillManifest = serde_json::from_str(json).unwrap();
         assert_eq!(manifest.host, Host::GitHub);
+    }
+
+    #[test]
+    fn manifest_without_plugin_field_deserializes_as_plain_install() {
+        let json = r#"{"owner":"acme","repo":"widgets","path":"skills/pdf","git_ref":"main","commit_sha":"abc123"}"#;
+        let manifest: InstalledSkillManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(manifest.plugin, None);
     }
 
     #[test]
