@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod artifacts;
 pub mod cli;
 pub mod config;
 pub mod context;
@@ -10,3 +11,4 @@ pub mod permissions;
 pub mod session;
 pub mod skills;
 pub mod tui;
+pub mod url;

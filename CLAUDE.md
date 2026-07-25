@@ -92,10 +92,21 @@ cargo test --test live_ollama -- --ignored --nocapture
     `GatedTool` (see `permissions/`), so permission enforcement is identical across all tool
     sources and both `Agent::prompt`/`Agent::prompt_stream`. Both TUI and headless mode call
     through this same function; don't add a parallel registration path.
-  - `tools.rs` — the six built-in tools (`ReadFile`, `WriteFile`, `EditFile`, `Bash`, `Grep`,
-    `Glob`).
+  - `tools.rs` — the six `#[tool_fn]` built-in tools (`ReadFile`, `WriteFile`, `EditFile`,
+    `Bash`, `Grep`, `Glob`). The remaining built-ins are struct impls elsewhere: `SkillTool`
+    (`agent/skill_tool.rs`, holds the discovered skill list) and `ServeArtifacts`
+    (`artifacts/tool.rs`, stateless — server state lives in `artifacts::server`'s process-wide
+    registry).
   - `headless.rs` — the `-p/--prompt` non-interactive path (`run_headless`), used by both the CLI
     and by `local-code`'s own live integration tests.
+- `artifacts/` — localhost HTTP serving of agent-created artifacts (HTML/CSS/JS mockups and more)
+  so the agent can showcase visual work in the user's browser. `server.rs` is a hand-rolled HTTP/1.1
+  static-file server (tokio only, no new deps) bound to 127.0.0.1 on an OS-assigned port; URLs
+  404 without an unguessable per-server token path component, the `Host` header is validated
+  (anti-DNS-rebinding), and dotfiles are never served or listed. A canonical-dir-keyed process-wide
+  registry lets each rebuild's fresh tool instance reuse the running server. `tool.rs` is the
+  `serve_artifacts` built-in: starts/reuses the server for `<project>/.local-code/artifacts/` and
+  returns the base URL; the agent drops files there with `write_file` and shares the links.
 - `permissions/` — the permission-tier system (`Ask` / `AutoAcceptEdits` / `FullAuto`).
   `gate::PermissionGate` is the single enforcement point every tool call passes through
   (`agent::gated_tool::GatedTool` wraps a tool and checks the gate before executing). `settings.rs`

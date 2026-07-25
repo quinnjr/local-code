@@ -6,6 +6,7 @@ use daimon::model::SharedModel;
 use crate::agent::gated_tool::GatedTool;
 use crate::agent::skill_tool::SkillTool;
 use crate::agent::tools::{Bash, EditFile, Glob, Grep, ReadFile, WriteFile};
+use crate::artifacts::tool::ServeArtifacts;
 use crate::mcp::tool::NamespacedMcpTool;
 use crate::permissions::gate::PermissionGate;
 use crate::skills::types::Skill;
@@ -52,6 +53,7 @@ pub fn register_all_tools(
         .tool(GatedTool::new(Bash, gate.clone()))
         .tool(GatedTool::new(Grep, gate.clone()))
         .tool(GatedTool::new(Glob, gate.clone()))
+        .tool(GatedTool::new(ServeArtifacts, gate.clone()))
         .tool(GatedTool::new(SkillTool::new(skills), gate.clone()));
 
     for tool in mcp_tools {
@@ -61,8 +63,10 @@ pub fn register_all_tools(
     builder
 }
 
-/// Builds a `daimon::agent::Agent` wired with the six built-in tools plus any
-/// MCP-server-discovered tools passed in `mcp_tools`, via [`register_all_tools`]
+/// Builds a `daimon::agent::Agent` wired with the built-in tools (the six
+/// `#[tool_fn]` tools in `agent::tools`, plus `SkillTool` and `ServeArtifacts`)
+/// and any MCP-server-discovered tools passed in `mcp_tools`, via
+/// [`register_all_tools`]
 /// — every tool, built-in or MCP, is `GatedTool`-wrapped there, so there is no
 /// separate registry or enforcement path for MCP tools.
 pub fn build_agent_with_mcp_tools(
@@ -79,7 +83,7 @@ pub fn build_agent_with_mcp_tools(
     register_all_tools(builder, gate, mcp_tools, skills).build()
 }
 
-/// Builds an agent with only the six built-in tools (no MCP servers
+/// Builds an agent with only the built-in tools (no MCP servers
 /// configured/connected). Kept as its own function, with its original Phase 2
 /// signature, so existing callers are unaffected by this plan.
 pub fn build_agent(model: SharedModel, gate: Arc<PermissionGate>) -> daimon::Result<Agent> {
@@ -139,7 +143,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_successfully_with_all_six_tools_registered() {
+    fn builds_successfully_with_all_builtin_tools_registered() {
         let model: SharedModel = Arc::new(EchoModel);
         let agent = build_agent(model, test_gate());
         assert!(agent.is_ok());
@@ -196,5 +200,66 @@ mod tests {
         let model: SharedModel = Arc::new(EchoModel);
         let agent = build_agent(model, test_gate());
         assert!(agent.is_ok());
+    }
+
+    /// Proves `serve_artifacts` is actually registered by `register_all_tools`:
+    /// the stub model requests it on turn one, then echoes back whatever the
+    /// tool returned — which must include a live base URL. (Runs the real
+    /// tool against the test CWD; the artifacts dir it creates under the
+    /// crate root's gitignored `.local-code/` is the same one a real
+    /// invocation there would create.)
+    #[tokio::test]
+    async fn built_agent_can_call_serve_artifacts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ToolCallingModel {
+            call_count: AtomicUsize,
+        }
+
+        impl daimon::model::Model for ToolCallingModel {
+            async fn generate(&self, request: &ChatRequest) -> daimon::Result<ChatResponse> {
+                let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    Ok(ChatResponse {
+                        message: Message::assistant_with_tool_calls(vec![daimon::tool::ToolCall {
+                            id: "call_1".into(),
+                            name: "serve_artifacts".into(),
+                            arguments: serde_json::json!({}),
+                        }]),
+                        stop_reason: StopReason::ToolUse,
+                        usage: Some(Usage::default()),
+                    })
+                } else {
+                    let tool_result = request
+                        .messages
+                        .last()
+                        .and_then(|m| m.content.clone())
+                        .unwrap_or_default();
+                    Ok(ChatResponse {
+                        message: Message::assistant(format!("tool said: {tool_result}")),
+                        stop_reason: StopReason::EndTurn,
+                        usage: Some(Usage::default()),
+                    })
+                }
+            }
+
+            async fn generate_stream(
+                &self,
+                _request: &ChatRequest,
+            ) -> daimon::Result<ResponseStream> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+
+        let model: SharedModel = Arc::new(ToolCallingModel {
+            call_count: AtomicUsize::new(0),
+        });
+        let agent = build_agent(model, test_gate()).unwrap();
+        let response = agent.prompt("start the artifact server").await.unwrap();
+        assert!(
+            response.text().contains("http://127.0.0.1:"),
+            "expected the tool's base URL to flow through the agent, got: {}",
+            response.text()
+        );
     }
 }

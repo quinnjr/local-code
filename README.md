@@ -39,6 +39,8 @@ Ollama. No cloud calls, no API keys required.
   `memory core add` / `memory add`) with automatic daily rollover and
   recent/archive rollup
 - GitHub-backed skills (`skills install` / `skills list` / `skills remove` / `skills update`)
+- Localhost artifact serving — the `serve_artifacts` tool serves `.local-code/artifacts/` over
+  a token-guarded localhost HTTP server so the agent can show HTML/CSS/JS mockups in the browser
 - Headless mode (`local-code -p "..."`) for scripted, non-interactive use
 
 ## Configuring MCP servers (`mcp.toml`)

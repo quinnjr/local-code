@@ -66,3 +66,26 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
    components, which `run_tui` cannot reach after `ntui::render` returns — those children are
    reaped by process teardown breaking their pipes, exactly as all connections were before.
    Revisit if a shared connection registry ever gets threaded through `AppProps`.
+
+12. **The `serve_artifacts` HTTP server has no shutdown and is of limited use headless.** Once
+   started it serves until process exit — deliberate, so URLs survive agent rebuilds and every
+   pane's tool instance shares the process-wide registry. In headless mode (`-p`) the returned
+   URL is only reachable while that turn is still running; the TUI is the real showcase
+   surface. Revisit if artifacts ever need to outlive the process.
+
+13. **`serve_artifacts`'s execute-level tests run the real tool against the process CWD.** Same
+   test-hygiene wart class as #6, one notch sharper:
+   `artifacts::tool::tests::execute_runs_against_the_process_cwd` and
+   `agent::build::tests::built_agent_can_call_serve_artifacts` run with no tempdir, so `cargo
+   test` creates and binds a live server to the crate root's real (gitignored)
+   `.local-code/artifacts/` — the same directory a real session in this checkout serves. Keep
+   the suite free of `set_current_dir` mutators or these tests flake or vacuously pass. Revisit
+   if a project-root seam is ever threaded into the tool layer.
+
+14. **The artifact server's path canonicalize+containment check and file open are two syscalls.**
+   Check-then-act: a symlink flipped between the check and the open could theoretically race the
+   server into serving a file outside the artifacts root. Accepted for v1 — the only principals
+   who can write the artifacts dir (the agent itself, same-user processes) could already copy
+   files into it directly, so the race buys them nothing. Revisit if the artifacts dir is ever
+   writable by a less-trusted principal than the one reading via HTTP, or if
+   `openat2(RESOLVE_BENEATH)`-style APIs become practical via the existing dep tree.
