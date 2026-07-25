@@ -142,7 +142,8 @@ cargo test --test live_ollama -- --ignored --nocapture
   `buffer.rs` (short-term), `rollup.rs` (daily/recent/archive rollup), `search.rs` (keyword search
   across all of it).
 - `session/` — session persistence (`store.rs` load/save, `types.rs::SessionFile`); every TUI turn
-  is saved so `local-code --resume` (or in-TUI `/resume`) can reopen it later.
+  is saved (atomically — temp file in the same dir, then rename — so a crash mid-turn can't
+  corrupt a session) so `local-code --resume` (or in-TUI `/resume`) can reopen it later.
 - `context/mod.rs::load_project_context` — loads and concatenates project `AGENTS.md`/`CLAUDE.md`
   and user-level `AGENTS.md`/`CLAUDE.md` (in that order) into the system prompt. Both the TUI
   (`tui::run_tui`) and headless mode (`agent::headless::run_headless`) load this context.
@@ -157,10 +158,16 @@ cargo test --test live_ollama -- --ignored --nocapture
 - **One tool-registration path.** Never add tools to an `Agent` outside
   `agent::build::register_all_tools` — TUI and headless mode must always end up with the same tool
   set built the same way.
-- **`Paths`** (`config::paths::Paths`) is the single source of truth for where config/state live:
-  `user_config_dir` (OS config dir via `directories`), `project_config_dir` (`.local-code/` under
-  the project root), `user_state_dir` (OS state dir, sessions live here). Always resolve via
-  `Paths::resolve(project_root)`, don't hand-roll path joins elsewhere.
+- **`Paths`** (`config::paths::Paths`) is the single source of truth for where config/state live,
+  resolved per-OS via the `directories` crate: `user_config_dir` (XDG config dir on Linux & the
+  BSDs, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows), `project_config_dir`
+  (`.local-code/` under the project root), `user_state_dir` (XDG state dir on Linux & the BSDs,
+  `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows — machine-local, never
+  the roaming profile; sessions live here). Always resolve via `Paths::resolve(project_root)`,
+  don't hand-roll path joins elsewhere. Temporary/staging files are written via the shared
+  `fsutil::write_atomically` helper (temp file next to the final target, fsync, atomic rename —
+  never a hardcoded `/tmp`); tests use the `tempfile` dev-dependency, which honors the OS temp
+  dir on every platform.
 - **`mcp.toml`** supports `${VAR_NAME}` (environment) and `${keyring:<name>}` (OS keyring via
   `SecretStore`, managed by `local-code secret set/rm/ls`) interpolation at load time
   (`config::mcp_servers::load_mcp_servers` interpolates; `load_mcp_servers_raw` does not — used

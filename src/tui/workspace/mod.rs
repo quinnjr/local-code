@@ -218,7 +218,7 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
             };
             pane_els.push(
                 element! {
-                    View(flex_grow: 1.0, border_style: border_style, border_color: border_color) {
+                    View(flex_grow: 1.0_f32, border_style: border_style, border_color: border_color) {
                         #(vec![Element::component::<App>(app_props)])
                     }
                 }
@@ -231,7 +231,7 @@ pub fn Workspace(props: &WorkspaceProps, hooks: &mut Hooks) -> Element {
         };
         let window_el = if is_active {
             element! {
-                View(flex_grow: 1.0, flex_direction: direction, width: Dimension::Percent(100.0)) {
+                View(flex_grow: 1.0_f32, flex_direction: direction, width: Dimension::Percent(100.0)) {
                     #(pane_els)
                 }
             }
