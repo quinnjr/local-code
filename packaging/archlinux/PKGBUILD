@@ -1,7 +1,7 @@
 # Maintainer: Joseph R. Quinn <quinn.josephr@gmail.com>
 
 pkgname=local-code
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Claude-Code-style terminal coding agent for local OpenAI-compatible LLM servers (llama.cpp, vLLM, LM Studio, Ollama), with optional OpenRouter access"
 arch=('x86_64' 'aarch64')
@@ -21,7 +21,7 @@ optdepends=(
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
         LICENSE-MIT
         LICENSE-APACHE)
-sha256sums=('8d60eaae200a3f22216b69878b4766a6fa6e3ba8f524e39bbc6b93517e695b88'
+sha256sums=('5da4b9a0a982a2553681f00cded3a3b921864e6111ec037aba281d95541c8a51'
             'dc51ca6634394df53bd15a4cd589d13cc2fd5b6b9ed3dfe2b7a44cfeec2977bd'
             'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30')
 
