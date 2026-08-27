@@ -1,7 +1,20 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-08-27
 
+- Selectable reasoning effort: `/effort low|medium|high|off` in the TUI
+  (a digit menu when bare), `--effort` on the CLI (TUI and `-p`), or a
+  per-connection default via `effort = "high"` in `connections.toml`.
+  The session override is shown in the dashboard, saved in the session
+  file, and restored by `/resume`. Sent as the OpenAI-standard
+  `reasoning_effort` field to openai-compatible connections (llama.cpp,
+  vLLM, LM Studio); Ollama/OpenRouter connections report that it is
+  remembered but not sent.
+- Arch Linux packaging: `packaging/archlinux/PKGBUILD` builds the tagged
+  release with `makepkg` (`dbus` runtime dep, `pass`/keyring backends as
+  optdepends).
+- The project is now dual-licensed under MIT OR Apache-2.0
+  (`LICENSE-MIT`, `LICENSE-APACHE`).
 - New `serve_artifacts` built-in tool: serves
   `<project>/.local-code/artifacts/` over a localhost-only HTTP server
   (OS-assigned port, unguessable token in the URL, reused across agent
