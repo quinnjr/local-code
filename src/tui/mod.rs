@@ -1,20 +1,26 @@
-// src/tui/mod.rs
-
 pub mod app;
 pub mod components;
+pub mod connections_wizard;
 pub mod gated_tool;
+pub mod mcp_wizard;
 pub mod memory_seed;
 pub mod permission_prompter;
 pub mod rebuild;
 pub mod slash;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub mod theme;
+pub mod workspace;
 
 pub use app::{App, AppProps};
+pub use workspace::{Workspace, WorkspaceProps};
 
 use std::path::Path;
 
+use crate::agent::effort::{ReasoningEffort, supports_effort};
 use crate::agent::provider::build_model;
-use crate::config::connection::{load_connections, Connection};
+use crate::config::connection::{Connection, load_connections};
 use crate::config::mcp_servers::load_mcp_servers;
 use crate::config::paths::Paths;
 use crate::config::secrets::SecretStore;
@@ -22,8 +28,7 @@ use crate::context::load_project_context;
 use crate::mcp::connect::connect_all;
 use crate::permissions::settings::load_settings;
 use crate::permissions::types::PermissionTier;
-use crate::session::paths::new_session_path;
-use crate::session::types::SessionFile;
+use crate::skills::discovery::{discover_skills, render_skill_context, resolve_skill_context};
 use daimon::model::types::Message;
 
 #[derive(Debug, thiserror::Error)]
@@ -46,7 +51,7 @@ pub enum TuiSessionError {
     Tui(#[from] ntui::Error),
     #[error("failed to persist session: {0}")]
     Session(#[from] crate::session::store::SessionError),
-    #[error("failed to load mcp-servers.toml: {0}")]
+    #[error("failed to load mcp.toml: {0}")]
     LoadMcpServers(crate::config::mcp_servers::McpServersError),
 }
 
@@ -66,6 +71,9 @@ pub struct ResumedSession {
     /// falling back to `--connection`/the single-connection default.
     pub connection_name: String,
     pub model_name: String,
+    /// The session-level `/effort` override in force when the session was
+    /// last saved (`SessionFile::effort`); re-applied on resume.
+    pub effort: Option<ReasoningEffort>,
     /// The session's original creation timestamp (`SessionFile::created_at`),
     /// carried through so `run_tui` can seed `App`'s `created_at` state
     /// without re-reading the session file it already loaded here.
@@ -144,10 +152,11 @@ pub async fn run_tui(
     project_root: &Path,
     connection_name: Option<&str>,
     permission_mode_override: Option<PermissionTier>,
+    effort_override: Option<ReasoningEffort>,
     resume: Option<ResumedSession>,
 ) -> Result<(), TuiSessionError> {
     let connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
-    let connection = match &resume {
+    let mut connection = match &resume {
         Some(resumed) => resolve_connection_for_resume(
             &connections,
             &resumed.connection_name,
@@ -155,13 +164,31 @@ pub async fn run_tui(
         )?,
         None => select_connection(&connections, connection_name)?,
     };
+    // Precedence: `--effort` > the resumed session's `/effort` override >
+    // the connection's configured default. `session_effort` is what `App`
+    // tracks (and persists) as the session-level override; the connection
+    // default stays on `Connection.effort` and is reloaded on every switch.
+    let session_effort = effort_override.or(resume.as_ref().and_then(|r| r.effort));
+    if let Some(effort) = session_effort {
+        if !supports_effort(connection.provider) {
+            eprintln!(
+                "warning: effort is only sent to openai-compatible connections; '{}' is {:?}, so it is ignored",
+                connection.name, connection.provider
+            );
+        }
+        connection.effort = Some(effort);
+    }
 
-    let api_key = SecretStore::get_api_key(&connection.name)?;
-    let model = build_model(&connection, api_key)?;
-
-    let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;
-    let system_context = load_project_context(paths, project_root);
-
+    // Kick off the two slow, independent initializations first — the keyring
+    // read (a blocking Secret Service/DBus round trip, on the blocking pool
+    // so a locked backend can't stall the runtime) and the MCP network
+    // connect (up to 15s per server) — then do the filesystem/CPU work below
+    // while they're in flight, so time-to-first-frame pays max(network, fs)
+    // instead of their sum. Everything is still awaited before rendering.
+    let keyring_task = {
+        let connection_name = connection.name.clone();
+        tokio::task::spawn_blocking(move || SecretStore::get_api_key(&connection_name))
+    };
     // Discover MCP-server tools once at startup, exactly like run_headless
     // (Phase 5) does — a broken server is logged and skipped, never fatal,
     // and the resulting tools are threaded through every later agent rebuild
@@ -169,11 +196,33 @@ pub async fn run_tui(
     // present in headless mode.
     let mcp_server_configs = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)
         .map_err(TuiSessionError::LoadMcpServers)?;
-    let mcp_report = connect_all(&mcp_server_configs).await;
+    let mcp_task = tokio::spawn(async move { connect_all(&mcp_server_configs).await });
+
+    let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;
+    let system_context = load_project_context(paths, project_root);
+    let discovered_skills = discover_skills(paths);
+    let skill_context = resolve_skill_context(&discovered_skills, project_root);
+    let rendered_skill_context = render_skill_context(&skill_context);
+    let system_context = if rendered_skill_context.is_empty() {
+        system_context
+    } else if system_context.is_empty() {
+        rendered_skill_context
+    } else {
+        format!("{system_context}\n\n{rendered_skill_context}")
+    };
+
+    let api_key = keyring_task.await.expect("keyring lookup task panicked")?;
+    let model = build_model(&connection, api_key)?;
+    let mcp_report = mcp_task.await.expect("MCP connect task panicked");
     for error in &mcp_report.errors {
         eprintln!("warning: {error}");
     }
     let mcp_tools = mcp_report.tools;
+    // Cheap Arc clones of the startup tool set, retained so the shutdown
+    // path below can close the server connections after the TUI exits.
+    // (Servers added at runtime via `/mcp add` live in per-pane state and
+    // are reaped by process teardown instead — see TODO.md.)
+    let mcp_tools_for_shutdown = mcp_tools.clone();
 
     let (initial_tier, initial_entries, initial_messages, session_path, created_at) = match resume {
         Some(resumed) => (
@@ -184,27 +233,30 @@ pub async fn run_tui(
             resumed.created_at,
         ),
         None => {
-            let now = chrono::Utc::now();
-            let path = new_session_path(&paths.user_state_dir, project_root, now);
             let tier = permission_mode_override.unwrap_or(PermissionTier::Ask);
-            let created_at = now.to_rfc3339();
-            let session = SessionFile::new(
-                project_root.to_path_buf(),
-                connection.name.clone(),
-                connection.default_model.clone(),
+            let (path, created_at) = crate::session::store::create_fresh_session(
+                &paths.user_state_dir,
+                project_root,
+                &connection.name,
+                &connection.default_model,
                 tier,
-                created_at.clone(),
-            );
-            crate::session::store::save_session(&path, &session)
-                .map_err(TuiSessionError::Session)?;
+                chrono::Utc::now(),
+            )
+            .map_err(|e| TuiSessionError::Session(e.source))?;
             (tier, Vec::new(), Vec::new(), path, created_at)
         }
     };
 
-    let props = AppProps {
+    // The initial session's props double as the template `Workspace` stamps
+    // new tabs/panes from (fresh transcript + fresh session file, everything
+    // else inherited). `focused`/`input_gate`/`session_tag`/`streaming_flags`
+    // keep their defaults here — `Workspace` overrides them per pane on every
+    // render.
+    let template = AppProps {
         model: Some(model),
         connection_name: connection.name.clone(),
         model_name: connection.default_model.clone(),
+        effort: session_effort,
         always_allow: settings.always_allow,
         always_deny: settings.always_deny,
         initial_tier,
@@ -212,33 +264,22 @@ pub async fn run_tui(
         initial_messages,
         system_context,
         mcp_tools,
+        skills: discovered_skills,
         session_path,
         user_state_dir: paths.user_state_dir.clone(),
         user_config_dir: paths.user_config_dir.clone(),
         project_config_dir: paths.project_config_dir.clone(),
         project_root: project_root.to_path_buf(),
         created_at,
+        ..AppProps::default()
     };
 
-    ntui::render(ntui::element!(App(
-        model: props.model,
-        connection_name: props.connection_name,
-        model_name: props.model_name,
-        always_allow: props.always_allow,
-        always_deny: props.always_deny,
-        initial_tier: props.initial_tier,
-        initial_entries: props.initial_entries,
-        initial_messages: props.initial_messages,
-        system_context: props.system_context,
-        mcp_tools: props.mcp_tools,
-        session_path: props.session_path,
-        user_state_dir: props.user_state_dir,
-        user_config_dir: props.user_config_dir,
-        project_config_dir: props.project_config_dir,
-        project_root: props.project_root,
-        created_at: props.created_at
-    )))
-    .await?;
+    // Close MCP server connections on the way out — even when the render
+    // loop errors — so stdio children get an orderly shutdown rather than
+    // waiting for process teardown to break their pipes.
+    let render_result = ntui::render(ntui::element!(Workspace(template: template))).await;
+    crate::mcp::connect::close_all(&mcp_tools_for_shutdown).await;
+    render_result?;
     Ok(())
 }
 
@@ -254,6 +295,7 @@ mod tests {
             base_url: "http://localhost:8000/v1".into(),
             default_model: "m".into(),
             models: vec![],
+            effort: None,
         }
     }
 
@@ -274,7 +316,10 @@ mod tests {
     fn select_connection_errors_when_ambiguous_without_a_name() {
         let connections = vec![conn("a"), conn("b")];
         let result = select_connection(&connections, None);
-        assert!(matches!(result, Err(TuiSessionError::AmbiguousConnection(_))));
+        assert!(matches!(
+            result,
+            Err(TuiSessionError::AmbiguousConnection(_))
+        ));
     }
 
     #[test]

@@ -1,5 +1,3 @@
-// src/init/survey.rs
-
 use std::path::Path;
 
 use ignore::WalkBuilder;
@@ -37,7 +35,10 @@ const MAX_FILES_LISTED: usize = 500;
 /// Walks `project_root`, respecting `.gitignore` (via `ignore::WalkBuilder`,
 /// the same traversal semantics ripgrep uses), collecting up to
 /// `MAX_FILES_LISTED` relative file paths and the full contents of any
-/// top-level file matching `RECOGNIZED_MANIFESTS`.
+/// recognized build-manifest file found — matched by file name at any depth,
+/// so nested manifests (e.g. `crates/foo/Cargo.toml`) are included. Manifest
+/// contents are read uncapped here; truncation happens later in
+/// `build_init_prompt`.
 pub fn survey_project(project_root: &Path) -> ProjectSurvey {
     let mut survey = ProjectSurvey::default();
 
@@ -53,7 +54,9 @@ pub fn survey_project(project_root: &Path) -> ProjectSurvey {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
-        let Ok(relative) = entry.path().strip_prefix(project_root) else { continue };
+        let Ok(relative) = entry.path().strip_prefix(project_root) else {
+            continue;
+        };
         let relative_str = relative.to_string_lossy().to_string();
 
         survey.total_files_seen += 1;
@@ -61,12 +64,11 @@ pub fn survey_project(project_root: &Path) -> ProjectSurvey {
             survey.file_paths.push(relative_str.clone());
         }
 
-        if let Some(name) = entry.path().file_name().and_then(|n| n.to_str()) {
-            if RECOGNIZED_MANIFESTS.contains(&name) {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    survey.manifests.push((relative_str, content));
-                }
-            }
+        if let Some(name) = entry.path().file_name().and_then(|n| n.to_str())
+            && RECOGNIZED_MANIFESTS.contains(&name)
+            && let Ok(content) = std::fs::read_to_string(entry.path())
+        {
+            survey.manifests.push((relative_str, content));
         }
     }
 

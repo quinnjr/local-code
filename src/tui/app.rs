@@ -1,25 +1,26 @@
-// src/tui/app.rs
-
 use std::sync::Arc;
 
 use daimon::agent::Agent;
 use daimon::model::SharedModel;
 use daimon::stream::StreamEvent;
+use daimon::tool::Tool;
 use futures::StreamExt;
 use ntui::props::{Dimension, FlexDirection};
-use ntui::style::Color;
-use ntui::{component, element, Cleanup, Element, KeyCode};
+use ntui::{Cleanup, Element, KeyCode, component, element};
 
 use crate::permissions::types::{PermissionDecision, PermissionTier};
 use crate::tui::components::transcript::{Transcript, TranscriptProps};
-use crate::tui::components::{Footer, FooterProps, Header, HeaderProps, InputBox, InputBoxProps};
+use crate::tui::components::{
+    Dashboard, DashboardProps, Footer, FooterProps, InputBox, InputBoxProps,
+};
 use crate::tui::permission_prompter::NtuiPermissionPrompter;
 use crate::tui::state::{
-    find_tool_call_mut, toggle_last_tool_call_expanded, ToolCallEntry, ToolCallResult,
-    TranscriptEntry, UsageSummary,
+    PushEntry as _, ToolCallEntry, ToolCallResult, TranscriptEntries, TranscriptEntry,
+    UsageSummary, find_tool_call_mut, toggle_last_tool_call_expanded,
 };
 
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AppProps {
     /// Wrapped in `Option` only so `AppProps: Default` (required by
     /// `ntui::Component::Props`) is satisfiable — `daimon::model::SharedModel`
@@ -29,6 +30,11 @@ pub struct AppProps {
     pub model: Option<SharedModel>,
     pub connection_name: String,
     pub model_name: String,
+    /// The session-level reasoning-effort override in force at launch
+    /// (`--effort`, or a resumed session's saved `/effort`). `None` means
+    /// "use the connection's configured default". Seeds `App`'s `effort`
+    /// state, which `/effort` mutates and every turn persists.
+    pub effort: Option<crate::agent::effort::ReasoningEffort>,
     pub always_allow: Vec<String>,
     pub always_deny: Vec<String>,
     pub initial_tier: PermissionTier,
@@ -53,6 +59,10 @@ pub struct AppProps {
     /// to a rebuilt agent reuses the same live connections rather than
     /// reconnecting to every configured server on every rebuild.
     pub mcp_tools: Vec<crate::mcp::tool::NamespacedMcpTool>,
+    /// Skills discovered once at `run_tui` startup (`skills::discovery::discover_skills`).
+    /// Threaded through every agent rebuild exactly like `mcp_tools`, so
+    /// `/model`/`/resume` never drop skills that were available at launch.
+    pub skills: Vec<crate::skills::types::Skill>,
     /// The session file this instance persists to after every turn.
     pub session_path: std::path::PathBuf,
     /// Needed only so `/clear` and future commands can resolve a fresh
@@ -77,6 +87,32 @@ pub struct AppProps {
     /// full session-file read+parse on every turn just to recover this one
     /// already-known field (see `run_turn`'s `created_at` state).
     pub created_at: String,
+    /// Whether this session's pane has keyboard focus. `Workspace` mounts
+    /// many `App`s at once (tmux-style windows/panes); only the focused one
+    /// may react to input, so the `use_input` handler below early-returns
+    /// (without stopping propagation) when this is false. Note `App` is a
+    /// pane child of `Workspace`, which owns app lifecycle (Ctrl+C exit) —
+    /// a bare `App` mount is a test-only configuration.
+    pub focused: bool,
+    /// Set to `true` by `Workspace` while a `C-b` prefix chord is armed —
+    /// the next key is a workspace command, so even the focused session must
+    /// let it bubble up untouched. `None` (tests only) behaves as "never
+    /// armed".
+    pub input_gate: Option<ntui::State<bool>>,
+    /// This session's workspace id, used only as the key it reports its
+    /// streaming status under in `streaming_flags`. 0 in tests.
+    pub session_tag: u64,
+    /// Shared map of session id → "a turn is streaming", written by every
+    /// mounted session and read by the workspace tab bar so a background
+    /// window can show a busy indicator. `None` (tests only) disables
+    /// reporting.
+    pub streaming_flags: Option<ntui::State<std::collections::HashMap<u64, bool>>>,
+    /// Shared map of session id → "a permission prompt is waiting for a
+    /// decision", mirrored like `streaming_flags`. The tab bar renders this
+    /// as a distinct `!` marker: a background pane blocked on a permission
+    /// prompt would otherwise be indistinguishable from one that is making
+    /// progress (`✻`), leaving its turn silently stuck until focused.
+    pub permission_flags: Option<ntui::State<std::collections::HashMap<u64, bool>>>,
 }
 
 impl Default for AppProps {
@@ -85,6 +121,7 @@ impl Default for AppProps {
             model: None,
             connection_name: String::new(),
             model_name: String::new(),
+            effort: None,
             always_allow: Vec::new(),
             always_deny: Vec::new(),
             initial_tier: PermissionTier::Ask,
@@ -92,25 +129,57 @@ impl Default for AppProps {
             initial_messages: Vec::new(),
             system_context: String::new(),
             mcp_tools: Vec::new(),
+            skills: Vec::new(),
             session_path: std::path::PathBuf::new(),
             user_state_dir: std::path::PathBuf::new(),
             user_config_dir: std::path::PathBuf::new(),
             project_config_dir: std::path::PathBuf::new(),
             project_root: std::path::PathBuf::new(),
             created_at: String::new(),
+            focused: true,
+            input_gate: None,
+            session_tag: 0,
+            streaming_flags: None,
+            permission_flags: None,
         }
     }
 }
 
 impl PartialEq for AppProps {
-    /// `App` is mounted exactly once, at the TUI's root (`run_tui` calls
-    /// `ntui::render(element!(App(...)))` a single time), so its props never
-    /// actually change between renders — this impl exists only to satisfy the
-    /// `Component::Props: PartialEq` bound, and always reports "unchanged" to
-    /// skip pointless prop-diffing work.
-    fn eq(&self, _other: &Self) -> bool {
-        true
+    /// Everything except `focused` is fixed for the lifetime of a mount
+    /// (`Workspace` builds a session's props once and never mutates them),
+    /// so only `focused` is compared: when the workspace moves focus, the
+    /// affected sessions must re-render so their `use_input` closures
+    /// recapture the new value. `input_gate` is deliberately not compared —
+    /// handlers read it through the shared `ntui::State` at event time, so a
+    /// gate flip needs no re-render here.
+    fn eq(&self, other: &Self) -> bool {
+        self.focused == other.focused
     }
+}
+
+/// Gate applied at the top of `App`'s `use_input` handler. A session may
+/// only react to a key when its pane is focused, no `C-b` prefix chord is
+/// armed (`input_gate`), and the key isn't the prefix itself — in all other
+/// cases the handler returns without consuming, letting the event bubble up
+/// to `Workspace`'s root handler (dispatch is deepest-first). The same
+/// predicate (minus the prefix-key clause) gates `Transcript`'s scroll
+/// handler via its own `focused`/`input_gate` props.
+fn session_may_handle_input(
+    focused: bool,
+    input_gate: &Option<ntui::State<bool>>,
+    ev: &ntui::KeyEvent,
+) -> bool {
+    if !focused {
+        return false;
+    }
+    if input_gate.as_ref().is_some_and(|gate| gate.get()) {
+        return false;
+    }
+    !(ev.code == KeyCode::Char('b')
+        && ev
+            .modifiers
+            .contains(ntui::hooks::input::KeyModifiers::CONTROL))
 }
 
 /// Maps a numeric key press to a validated 0-based index, bounded by `max`
@@ -123,12 +192,12 @@ impl PartialEq for AppProps {
 /// digit-matching boilerplate across what was then three (now four)
 /// near-identical blocks.
 fn digit_key_to_index(code: KeyCode, max: usize) -> Option<usize> {
-    if let KeyCode::Char(c) = code {
-        if let Some(digit) = c.to_digit(10) {
-            if digit >= 1 && (digit as usize) <= max {
-                return Some(digit as usize - 1);
-            }
-        }
+    if let KeyCode::Char(c) = code
+        && let Some(digit) = c.to_digit(10)
+        && digit >= 1
+        && (digit as usize) <= max
+    {
+        return Some(digit as usize - 1);
     }
     None
 }
@@ -166,8 +235,30 @@ fn tier_label(tier: PermissionTier) -> &'static str {
 enum PendingMenu {
     None,
     ModelChoice(Vec<(crate::config::connection::Connection, String)>),
+    /// `/effort` with no argument: 1) low 2) medium 3) high 4) off.
+    EffortChoice,
     PermissionsMenu,
     ResumeChoice(Vec<crate::session::types::SessionSummary>),
+    /// A `/mcp add` wizard is mid-flow, waiting for the next line of free-text
+    /// input. Unlike the three variants above, this one supports `Esc` to
+    /// cancel — free-text entry has no other natural "back out" keystroke,
+    /// unlike a digit-only menu where an out-of-range digit is unambiguous.
+    McpAddWizard(crate::tui::mcp_wizard::McpAddWizard),
+    /// The wizard finished (`Advance::Finalize`) and its `connect_one` +
+    /// save + agent-rebuild is running in a spawned task, bounded by its own
+    /// connect timeout. `Esc` here frees the input loop immediately without
+    /// waiting for the timeout (the background task keeps running and posts
+    /// its own notice when it finishes either way). All input is otherwise
+    /// blocked (like `streaming`) until the task resolves and resets this to
+    /// `None`.
+    McpAddConnecting,
+    /// A `/connections add` wizard is mid-flow, waiting for the next line of
+    /// free-text input. Same `Esc`-to-cancel affordance as `McpAddWizard`.
+    /// There is no `Connecting` counterpart here: finalization touches only
+    /// the keyring and connections.toml (no shared agent state to rebuild),
+    /// so the save task runs in the background while the input loop stays
+    /// live and posts a notice when it lands.
+    ConnectionsAddWizard(crate::tui::connections_wizard::ConnectionsAddWizard),
 }
 
 /// The TUI's single stateful root component. Owns the transcript, the input
@@ -177,12 +268,24 @@ enum PendingMenu {
 pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let transcript = hooks.use_state({
         let initial_entries = props.initial_entries.clone();
-        move || initial_entries
+        move || {
+            initial_entries
+                .into_iter()
+                .map(Arc::new)
+                .collect::<TranscriptEntries>()
+        }
     });
     let input_buffer = hooks.use_state(String::new);
     let turn_id = hooks.use_state(|| 0u64);
     let pending_turn_input = hooks.use_state(|| Option::<String>::None);
     let streaming = hooks.use_state(|| false);
+    // The current turn's in-flight streamed assistant text, kept OUT of
+    // `transcript` so each `TextDelta` re-render clones only this one growing
+    // `String` instead of the whole transcript Vec (streaming an N-byte reply
+    // through the transcript was O(N²) transient copying). `run_turn` folds
+    // it into `transcript` as a normal `AssistantText` entry whenever the
+    // streamed block completes (tool call, error, or end of turn).
+    let stream_text = hooks.use_state(String::new);
     let usage = hooks.use_state(UsageSummary::default);
     let tier = hooks.use_state(|| props.initial_tier);
     let session_path = hooks.use_state({
@@ -200,10 +303,58 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     let pending_permission =
         hooks.use_state(|| Option::<crate::permissions::types::PermissionRequest>::None);
     let pending_menu = hooks.use_state(|| PendingMenu::None);
+    // Names of connections whose `/connections add` finalize task is still
+    // running (keyring write + catalog fetch + toml save). `/connections
+    // remove` refuses to act on one of these — removing mid-save would
+    // silently no-op (nothing on disk yet) and the in-flight save would then
+    // land anyway, resurrecting a connection the user just deleted.
+    let connections_saving = hooks.use_state(|| {
+        std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashSet::<String>::new(),
+        ))
+    });
+
+    // Fire-and-forget slash-command tasks (`/compact`, `/init`) register
+    // their handles here so pane unmount aborts them, mirroring `run_turn`'s
+    // abort-on-cleanup. Without this they would run to completion holding
+    // their captured agent/transcript state after the pane closed.
+    let background_tasks = hooks.use_state(|| {
+        std::sync::Arc::new(std::sync::Mutex::new(
+            Vec::<tokio::task::JoinHandle<()>>::new(),
+        ))
+    });
+    hooks.use_effect((), {
+        let background_tasks = background_tasks.get();
+        move || {
+            Cleanup::from(move || {
+                for handle in background_tasks
+                    .lock()
+                    .expect("background task registry poisoned")
+                    .drain(..)
+                {
+                    handle.abort();
+                }
+            })
+        }
+    });
 
     let always_allow_snapshot = props.always_allow.clone();
     let always_deny_snapshot = props.always_deny.clone();
-    let mcp_tools_snapshot = props.mcp_tools.clone();
+    // A `State` (not a plain snapshot, unlike `always_allow_snapshot`/
+    // `always_deny_snapshot` above) because a later task's `/mcp add`
+    // live-reconnect needs to *append* newly discovered tools at runtime
+    // and have every subsequent `/model`/`/resume` rebuild see them — a
+    // plain `Vec` clone captured once at mount would silently drop
+    // anything added this way.
+    let mcp_tools_state = hooks.use_state({
+        let initial = props.mcp_tools.clone();
+        move || initial
+    });
+    // Plain snapshot (not a `State`) is fine for skills, unlike `mcp_tools`
+    // above — there is no in-TUI "add a skill" flow analogous to `/mcp add`
+    // that needs to mutate this at runtime; skills are only ever installed
+    // via the `local-code skills` CLI, outside a running TUI session.
+    let skills_snapshot = props.skills.clone();
     // Tracks the currently-active model, kept in sync with `agent_and_responder`
     // on every `/model` switch (see the digit-press handler below) so
     // `SlashContext.model` (used by `/compact`'s summarization call) never
@@ -214,9 +365,9 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let initial = props.model.clone().expect("AppProps::model is always Some");
         move || initial
     });
-    // Mirrors `current_model`'s Bug 2 fix, but for the `Header`'s displayed
+    // Mirrors `current_model`'s Bug 2 fix, but for the `Dashboard`'s displayed
     // connection/model name: without this, a successful `/model` switch or
-    // `/resume` would correctly rebuild the agent yet leave the Header
+    // `/resume` would correctly rebuild the agent yet leave the Dashboard
     // silently showing the connection/model the process launched with
     // forever. Seeded from `props` at mount, then kept in lockstep with
     // `agent_and_responder`/`current_model` at both switch sites below.
@@ -228,27 +379,44 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let initial = props.model_name.clone();
         move || initial
     });
+    // The session-level reasoning-effort override (`/effort`), kept in
+    // lockstep with `current_model` at every switch site (the value is baked
+    // into the model at build time) and persisted by `run_turn` so `/resume`
+    // restores it. `None` = the connection's configured default.
+    let effort = hooks.use_state({
+        let initial = props.effort;
+        move || initial
+    });
 
     let agent_and_responder = hooks.use_state({
         let model = props.model.clone().expect("AppProps::model is always Some");
-        let always_allow = props.always_allow.clone();
-        let always_deny = props.always_deny.clone();
+        let permission_settings = crate::permissions::settings::PermissionSettings {
+            always_allow: props.always_allow.clone(),
+            always_deny: props.always_deny.clone(),
+        };
         let initial_tier = props.initial_tier;
         let initial_messages = props.initial_messages.clone();
         let system_context = props.system_context.clone();
         let mcp_tools = props.mcp_tools.clone();
+        let skills = props.skills.clone();
         let pending_permission = pending_permission.clone();
         move || {
             crate::tui::rebuild::rebuild_agent(
                 model,
                 initial_tier,
-                always_allow,
-                always_deny,
+                permission_settings,
                 initial_messages,
                 &system_context,
                 mcp_tools,
+                skills,
                 pending_permission,
             )
+            // A `use_state` initializer has no error channel; mount-time
+            // construction uses the startup-validated tool set, so a failure
+            // here means the process couldn't have run a single turn anyway.
+            // The switch sites (`/model`, `/resume`, `/mcp add`) handle the
+            // `Err` gracefully instead.
+            .expect("initial agent construction failed")
         }
     });
     let (agent, gate, responder) = agent_and_responder.get();
@@ -263,16 +431,57 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         }
     });
 
+    // Mirror this session's streaming state into the workspace-shared map so
+    // the tab bar can mark busy background windows. Keyed on the value so it
+    // re-runs exactly on transitions.
+    hooks.use_effect(streaming.get(), {
+        let streaming_flags = props.streaming_flags.clone();
+        let session_tag = props.session_tag;
+        let is_streaming = streaming.get();
+        move || {
+            if let Some(flags) = streaming_flags {
+                flags.update(|map| {
+                    map.insert(session_tag, is_streaming);
+                });
+            }
+        }
+    });
+
+    // Same mirror for "blocked on a permission decision" — the tab bar shows
+    // this as `!` so a hidden pane waiting on input is never mistaken for one
+    // that is streaming (its prompt only accepts digits while focused, so
+    // without this the turn would sit stuck behind a generic busy marker).
+    hooks.use_effect(pending_permission.get().is_some(), {
+        let permission_flags = props.permission_flags.clone();
+        let session_tag = props.session_tag;
+        let is_waiting = pending_permission.get().is_some();
+        move || {
+            if let Some(flags) = permission_flags {
+                flags.update(|map| {
+                    map.insert(session_tag, is_waiting);
+                });
+            }
+        }
+    });
+
     hooks.use_effect(turn_id.get(), {
         let pending_turn_input = pending_turn_input.clone();
         let transcript = transcript.clone();
+        let stream_text = stream_text.clone();
         let usage = usage.clone();
         let streaming = streaming.clone();
         let agent = agent.clone();
         let session_path = session_path.clone();
         let created_at = created_at.clone();
-        let connection_name = props.connection_name.clone();
-        let model_name = props.model_name.clone();
+        // The *states*, not `props` snapshots: `/model` and in-TUI `/resume`
+        // update `connection_display`/`model_display` when they switch, and
+        // `run_turn` persists whatever they hold at save time — a props
+        // snapshot here made every post-switch turn write the launch
+        // connection/model into the session file, so resuming it later
+        // rebuilt against the wrong provider.
+        let connection_name = connection_display.clone();
+        let model_name = model_display.clone();
+        let effort = effort.clone();
         let tier = tier.clone();
         let project_root = props.project_root.clone();
         move || {
@@ -283,6 +492,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 agent,
                 input,
                 transcript,
+                stream_text,
                 usage,
                 streaming,
                 pending_turn_input,
@@ -290,6 +500,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 created_at.clone(),
                 connection_name.clone(),
                 model_name.clone(),
+                effort.clone(),
                 tier.get(),
                 project_root.clone(),
             ));
@@ -309,8 +520,6 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let tier = tier.clone();
         let session_path = session_path.clone();
         let created_at = created_at.clone();
-        let connection_name = props.connection_name.clone();
-        let model_name = props.model_name.clone();
         let user_state_dir = props.user_state_dir.clone();
         let user_config_dir = props.user_config_dir.clone();
         let project_config_dir = props.project_config_dir.clone();
@@ -319,13 +528,21 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let agent_and_responder = agent_and_responder.clone();
         let always_allow_snapshot = always_allow_snapshot.clone();
         let always_deny_snapshot = always_deny_snapshot.clone();
-        let mcp_tools_snapshot = mcp_tools_snapshot.clone();
+        let mcp_tools_state = mcp_tools_state.clone();
+        let skills_snapshot = skills_snapshot.clone();
         let system_context = props.system_context.clone();
         let current_model = current_model.clone();
         let connection_display = connection_display.clone();
         let model_display = model_display.clone();
+        let effort = effort.clone();
+        let focused = props.focused;
+        let input_gate = props.input_gate.clone();
+        let background_tasks = background_tasks.clone();
         move |ev, _ctx| {
-            if pending_permission.get().is_some() {
+            if !session_may_handle_input(focused, &input_gate, &ev) {
+                return;
+            }
+            if let Some(request) = pending_permission.get() {
                 let decision = digit_key_to_index(ev.code, 3).map(|idx| match idx {
                     0 => PermissionDecision::Allow,
                     1 => PermissionDecision::AllowAlwaysThisSession,
@@ -335,14 +552,12 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 });
                 if let Some(decision) = decision {
                     let allowed = !matches!(decision, PermissionDecision::Deny { .. });
-                    if let Some(request) = pending_permission.get() {
-                        transcript.update(|entries| {
-                            entries.push(TranscriptEntry::PermissionResolved {
-                                description: request.description.clone(),
-                                allowed,
-                            });
+                    transcript.update(|entries| {
+                        entries.push_entry(TranscriptEntry::PermissionResolved {
+                            description: request.description.clone(),
+                            allowed,
                         });
-                    }
+                    });
                     NtuiPermissionPrompter::respond(&responder, decision);
                 }
                 return;
@@ -350,81 +565,70 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
 
             match pending_menu.get() {
                 PendingMenu::ModelChoice(choices) => {
-                    if let Some(idx) = digit_key_to_index(ev.code, choices.len()) {
-                        let (connection, model_name) = choices[idx].clone();
-                        pending_menu.set(PendingMenu::None);
-                        let api_key =
-                            crate::config::secrets::SecretStore::get_api_key(&connection.name)
-                                .ok()
-                                .flatten();
-                        match crate::agent::provider::build_model(&connection, api_key) {
-                            Ok(new_model) => {
-                                let agent_for_history = agent.clone();
-                                let pending_permission_for_rebuild = pending_permission.clone();
-                                let agent_and_responder = agent_and_responder.clone();
-                                let current_model = current_model.clone();
-                                let model_for_state = new_model.clone();
-                                let transcript_for_notice = transcript.clone();
-                                let tier_value = tier.get();
-                                let always_allow = always_allow_snapshot.clone();
-                                let always_deny = always_deny_snapshot.clone();
-                                let system_context = system_context.clone();
-                                let mcp_tools = mcp_tools_snapshot.clone();
-                                let connection_display = connection_display.clone();
-                                let model_display = model_display.clone();
-                                let connection_name_for_display = connection.name.clone();
-                                let model_name_for_display = model_name.clone();
-                                tokio::spawn(async move {
-                                    let history = agent_for_history
-                                        .memory()
-                                        .get_messages_erased()
-                                        .await
-                                        .unwrap_or_default();
-                                    let rebuilt = crate::tui::rebuild::rebuild_agent(
-                                        new_model,
-                                        tier_value,
-                                        always_allow,
-                                        always_deny,
-                                        history,
-                                        &system_context,
-                                        mcp_tools,
-                                        pending_permission_for_rebuild,
-                                    );
-                                    // Last-write-wins: if multiple `/model` selections somehow
-                                    // overlap in flight, whichever `set` call completes last
-                                    // wins regardless of submission order. Narrow window today
-                                    // since rebuild does no real I/O, but worth revisiting if it grows any.
-                                    agent_and_responder.set(rebuilt);
-                                    // Kept in lockstep with `agent_and_responder` above (Bug 2
-                                    // fix): without this, `SlashContext.model` (built from
-                                    // `current_model.get()` in the `Enter` branch below) would
-                                    // keep pointing at the pre-switch model forever.
-                                    current_model.set(model_for_state);
-                                    // Kept in lockstep alongside `current_model` above: the
-                                    // Header reads from these, not from `props`, so without
-                                    // this it would keep showing the pre-switch connection
-                                    // and model name forever after a successful `/model`.
-                                    connection_display.set(connection_name_for_display);
-                                    model_display.set(model_name_for_display);
-                                    transcript_for_notice.update(|entries| {
-                                        entries.push(TranscriptEntry::SystemNotice {
-                                            text: format!(
-                                                "switched to {} · {}",
-                                                connection.name, model_name
-                                            ),
-                                        });
-                                    });
-                                });
-                            }
-                            Err(e) => {
-                                transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice {
-                                        text: format!("failed to switch model: {e}"),
-                                    });
-                                });
-                            }
-                        }
-                    }
+                    let Some(idx) = digit_key_to_index(ev.code, choices.len()) else {
+                        return;
+                    };
+                    let (connection, model_name) = choices[idx].clone();
+                    pending_menu.set(PendingMenu::None);
+                    let notice = format!("switched to {} · {}", connection.name, model_name);
+                    spawn_model_switch(
+                        ModelSwitchContext {
+                            agent: agent.clone(),
+                            pending_permission: pending_permission.clone(),
+                            agent_and_responder: agent_and_responder.clone(),
+                            current_model: current_model.clone(),
+                            transcript: transcript.clone(),
+                            tier: tier.get(),
+                            always_allow: always_allow_snapshot.clone(),
+                            always_deny: always_deny_snapshot.clone(),
+                            system_context: system_context.clone(),
+                            mcp_tools: mcp_tools_state.get(),
+                            skills: skills_snapshot.clone(),
+                            connection_display: connection_display.clone(),
+                            model_display: model_display.clone(),
+                            effort: effort.clone(),
+                        },
+                        connection,
+                        model_name,
+                        // A `/model` switch keeps the session's `/effort`
+                        // override; only `/effort` itself changes it.
+                        effort.get(),
+                        notice,
+                    );
+                    return;
+                }
+                PendingMenu::EffortChoice => {
+                    let Some(idx) = digit_key_to_index(ev.code, 4) else {
+                        return;
+                    };
+                    pending_menu.set(PendingMenu::None);
+                    let new_effort = match idx {
+                        0 => Some(crate::agent::effort::ReasoningEffort::Low),
+                        1 => Some(crate::agent::effort::ReasoningEffort::Medium),
+                        2 => Some(crate::agent::effort::ReasoningEffort::High),
+                        _ => None,
+                    };
+                    apply_effort(
+                        ModelSwitchContext {
+                            agent: agent.clone(),
+                            pending_permission: pending_permission.clone(),
+                            agent_and_responder: agent_and_responder.clone(),
+                            current_model: current_model.clone(),
+                            transcript: transcript.clone(),
+                            tier: tier.get(),
+                            always_allow: always_allow_snapshot.clone(),
+                            always_deny: always_deny_snapshot.clone(),
+                            system_context: system_context.clone(),
+                            mcp_tools: mcp_tools_state.get(),
+                            skills: skills_snapshot.clone(),
+                            connection_display: connection_display.clone(),
+                            model_display: model_display.clone(),
+                            effort: effort.clone(),
+                        },
+                        &user_config_dir,
+                        &project_config_dir,
+                        new_effort,
+                    );
                     return;
                 }
                 PendingMenu::PermissionsMenu => {
@@ -437,7 +641,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         tier.set(new_tier);
                         pending_menu.set(PendingMenu::None);
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("permission tier set to {new_tier:?}"),
                             });
                         });
@@ -445,82 +649,579 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     return;
                 }
                 PendingMenu::ResumeChoice(sessions) => {
-                    if let Some(idx) = digit_key_to_index(ev.code, sessions.len()) {
-                        let summary = sessions[idx].clone();
-                        pending_menu.set(PendingMenu::None);
-                        match crate::session::store::load_session(&summary.path) {
-                            Ok(session) => {
-                                let paths_lookup = crate::config::connection::load_connections(
-                                    &user_config_dir,
-                                    &project_config_dir,
-                                );
-                                let resolved_connection = paths_lookup
+                    let Some(idx) = digit_key_to_index(ev.code, sessions.len()) else {
+                        return;
+                    };
+                    let summary = sessions[idx].clone();
+                    pending_menu.set(PendingMenu::None);
+                    let transcript = transcript.clone();
+                    let agent_and_responder = agent_and_responder.clone();
+                    let current_model = current_model.clone();
+                    let connection_display = connection_display.clone();
+                    let model_display = model_display.clone();
+                    let effort = effort.clone();
+                    let tier = tier.clone();
+                    let session_path = session_path.clone();
+                    let created_at = created_at.clone();
+                    let pending_permission = pending_permission.clone();
+                    let mcp_tools = mcp_tools_state.get();
+                    let skills = skills_snapshot.clone();
+                    let system_context = system_context.clone();
+                    let always_allow = always_allow_snapshot.clone();
+                    let always_deny = always_deny_snapshot.clone();
+                    let user_config_dir = user_config_dir.clone();
+                    let project_config_dir = project_config_dir.clone();
+                    tokio::spawn(async move {
+                        // Session load, connection lookup, keyring read, and
+                        // the rebuild are all blocking (fs + Secret
+                        // Service/DBus) — keep them off the event thread,
+                        // same as the startup path in `tui::run_tui`.
+                        let path = summary.path.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let session = crate::session::store::load_session(&path)
+                                .map_err(|e| format!("failed to load session: {e}"))?;
+                            let mut connection = crate::config::connection::load_connections(
+                                &user_config_dir,
+                                &project_config_dir,
+                            )
+                            .ok()
+                            .and_then(|conns| {
+                                conns
+                                    .into_iter()
+                                    .find(|c| c.name == session.connection_name)
+                            })
+                            .ok_or_else(|| {
+                                format!(
+                                    "failed to resume: connection '{}' no longer exists; run `local-code connections list`",
+                                    session.connection_name
+                                )
+                            })?;
+                            connection.default_model = session.model_name.clone();
+                            connection.effort = session.effort.or(connection.effort);
+                            let api_key =
+                                crate::config::secrets::SecretStore::get_api_key(&connection.name)
                                     .ok()
-                                    .and_then(|conns| conns.into_iter().find(|c| c.name == session.connection_name));
+                                    .flatten();
+                            let new_model =
+                                crate::agent::provider::build_model(&connection, api_key)
+                                    .map_err(|e| {
+                                        format!("failed to resume: could not build model: {e}")
+                                    })?;
+                            let model_for_state = new_model.clone();
+                            let permission_settings =
+                                crate::permissions::settings::PermissionSettings {
+                                    always_allow,
+                                    always_deny,
+                                };
+                            let rebuilt = crate::tui::rebuild::rebuild_agent(
+                                new_model,
+                                session.tier,
+                                permission_settings,
+                                session.messages.clone(),
+                                &system_context,
+                                mcp_tools,
+                                skills,
+                                pending_permission,
+                            )
+                            .map_err(|e| {
+                                format!("failed to resume: could not rebuild agent: {e}")
+                            })?;
+                            Ok::<_, String>((rebuilt, model_for_state, connection.name, session))
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("failed to resume: {e}")));
 
-                                match resolved_connection {
-                                    Some(mut connection) => {
-                                        connection.default_model = session.model_name.clone();
-                                        let api_key = crate::config::secrets::SecretStore::get_api_key(&connection.name)
-                                            .ok()
-                                            .flatten();
-                                        match crate::agent::provider::build_model(&connection, api_key) {
-                                            Ok(new_model) => {
-                                                let model_for_state = new_model.clone();
-                                                let rebuilt = crate::tui::rebuild::rebuild_agent(
-                                                    new_model,
-                                                    session.tier,
-                                                    always_allow_snapshot.clone(),
-                                                    always_deny_snapshot.clone(),
-                                                    session.messages.clone(),
-                                                    &system_context,
-                                                    mcp_tools_snapshot.clone(),
-                                                    pending_permission.clone(),
-                                                );
-                                                agent_and_responder.set(rebuilt);
-                                                // Kept in lockstep with `agent_and_responder`, mirroring
-                                                // the `/model` fix for Bug 2 above — without this,
-                                                // `SlashContext.model` (used by `/compact`) would keep
-                                                // pointing at the pre-resume model forever.
-                                                current_model.set(model_for_state);
-                                                // Kept in lockstep with `current_model` above,
-                                                // mirroring the `/model` fix: the Header reads
-                                                // from these, not from `props`, so without this
-                                                // it would keep showing the pre-resume
-                                                // connection/model name forever.
-                                                connection_display.set(connection.name.clone());
-                                                model_display.set(session.model_name.clone());
-                                                tier.set(session.tier);
-                                                transcript.set(session.entries.clone());
-                                                session_path.set(summary.path.clone());
-                                                created_at.set(session.created_at.clone());
+                        let (rebuilt, model_for_state, connection_name, session) = match result {
+                            Ok(resumed) => resumed,
+                            Err(text) => {
+                                transcript.update(|entries| {
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text });
+                                });
+                                return;
+                            }
+                        };
+                        agent_and_responder.set(rebuilt);
+                        // Kept in lockstep with `agent_and_responder`, mirroring
+                        // the `/model` fix for Bug 2 above — without this,
+                        // `SlashContext.model` (used by `/compact`) would keep
+                        // pointing at the pre-resume model forever.
+                        current_model.set(model_for_state);
+                        // Kept in lockstep with `current_model` above,
+                        // mirroring the `/model` fix: the Dashboard reads
+                        // from these, not from `props`, so without this
+                        // it would keep showing the pre-resume
+                        // connection/model name forever.
+                        connection_display.set(connection_name);
+                        model_display.set(session.model_name.clone());
+                        effort.set(session.effort);
+                        tier.set(session.tier);
+                        created_at.set(session.created_at.clone());
+                        transcript.set(session.entries.into_iter().map(Arc::new).collect());
+                        session_path.set(summary.path.clone());
+                    });
+                    return;
+                }
+                PendingMenu::McpAddWizard(wizard) => {
+                    if ev.code == KeyCode::Esc {
+                        pending_menu.set(PendingMenu::None);
+                        input_buffer.set(String::new());
+                        transcript.update(|entries| {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
+                                text: "cancelled /mcp add.".to_string(),
+                            });
+                        });
+                        return;
+                    }
+                    // Same modifier guard as the connections wizard:
+                    // Ctrl/Alt+key combos are commands, not input — and on
+                    // the masked bearer steps an inserted letter would be
+                    // invisible. SHIFT still types uppercase.
+                    if let KeyCode::Char(c) = ev.code
+                        && !ev.modifiers.intersects(
+                            ntui::hooks::input::KeyModifiers::CONTROL
+                                | ntui::hooks::input::KeyModifiers::ALT,
+                        )
+                    {
+                        input_buffer.update(|b| b.push(c));
+                        return;
+                    }
+                    if ev.code == KeyCode::Backspace {
+                        input_buffer.update(|b| {
+                            b.pop();
+                        });
+                        return;
+                    }
+                    if ev.code == KeyCode::Enter {
+                        let line = input_buffer.get();
+                        input_buffer.set(String::new());
+                        match crate::tui::mcp_wizard::advance(wizard, &line) {
+                            crate::tui::mcp_wizard::Advance::Continue(next_wizard, prompt) => {
+                                pending_menu.set(PendingMenu::McpAddWizard(next_wizard));
+                                transcript.update(|entries| {
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text: prompt });
+                                });
+                            }
+                            crate::tui::mcp_wizard::Advance::Invalid(same_wizard, message) => {
+                                pending_menu.set(PendingMenu::McpAddWizard(same_wizard));
+                                transcript.update(|entries| {
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text: message });
+                                });
+                            }
+                            crate::tui::mcp_wizard::Advance::Finalize(output) => {
+                                let crate::tui::mcp_wizard::WizardOutput {
+                                    config,
+                                    pending_secret,
+                                } = output;
+                                pending_menu.set(PendingMenu::McpAddConnecting);
+                                let server_name = config.name.clone();
+                                transcript.update(|entries| {
+                                    entries.push_entry(TranscriptEntry::SystemNotice {
+                                        text: format!("connecting to '{server_name}'…"),
+                                    });
+                                });
+
+                                let transcript_for_task = transcript.clone();
+                                let pending_menu_for_task = pending_menu.clone();
+                                let mcp_tools_state_for_task = mcp_tools_state.clone();
+                                let skills_for_task = skills_snapshot.clone();
+                                let user_config_dir_for_task = user_config_dir.clone();
+                                let project_config_dir_for_task = project_config_dir.clone();
+                                let agent_for_history = agent.clone();
+                                let agent_and_responder_for_task = agent_and_responder.clone();
+                                let pending_permission_for_task = pending_permission.clone();
+                                let tier_value = tier.get();
+                                let always_allow = always_allow_snapshot.clone();
+                                let always_deny = always_deny_snapshot.clone();
+                                let system_context_for_task = system_context.clone();
+                                let model_for_rebuild = current_model.get();
+
+                                tokio::spawn(async move {
+                                    // Store the wizard-captured bearer token in the OS
+                                    // keyring BEFORE saving mcp.toml: a failure here must
+                                    // not leave a config referencing a secret that was
+                                    // never stored (the reverse — a stored secret with no
+                                    // config referencing it — is harmless).
+                                    if let Some(secret) = &pending_secret
+                                        && crate::config::secrets::list_secret_names(
+                                            &user_config_dir_for_task,
+                                        )
+                                        .is_ok_and(|names| names.contains(&secret.name))
+                                    {
+                                        transcript_for_task.update(|entries| {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
+                                                text: format!(
+                                                    "overwriting existing keyring secret '{}'",
+                                                    secret.name
+                                                ),
+                                            });
+                                        });
+                                    }
+                                    if let Some(secret) = pending_secret
+                                        && let Err(e) = crate::config::secrets::store_secret(
+                                            &user_config_dir_for_task,
+                                            &secret.name,
+                                            &secret.value,
+                                        )
+                                    {
+                                        transcript_for_task.update(|entries| {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
+                                                text: format!(
+                                                    "failed to store the bearer token in the OS keyring: {e}. Server '{}' was NOT saved.",
+                                                    config.name
+                                                ),
+                                            });
+                                        });
+                                        pending_menu_for_task.set(PendingMenu::None);
+                                        return;
+                                    }
+
+                                    // Save first, using the *raw* (un-interpolated) merged
+                                    // list — loading via the interpolating `load_mcp_servers`
+                                    // here would permanently bake every other server's
+                                    // `${VAR}` secret into mcp.toml as a resolved literal.
+                                    let mut merged = crate::config::mcp_servers::load_mcp_servers_raw(
+                                        &user_config_dir_for_task,
+                                        &project_config_dir_for_task,
+                                    )
+                                    .unwrap_or_default();
+                                    merged.retain(|s| s.name != config.name);
+                                    merged.push(config.clone());
+                                    let saved = crate::config::mcp_servers::save_mcp_servers(
+                                        &project_config_dir_for_task,
+                                        &merged,
+                                    );
+                                    if let Err(e) = &saved {
+                                        transcript_for_task.update(|entries| {
+                                            entries.push_entry(TranscriptEntry::SystemNotice {
+                                                text: format!(
+                                                    "MCP server '{}' failed to save to mcp.toml: {e}",
+                                                    config.name
+                                                ),
+                                            });
+                                        });
+                                    }
+                                    let saved = saved.is_ok();
+
+                                    // Resolve ${VAR} references before connecting — the
+                                    // wizard's config is raw user input, never passed
+                                    // through interpolation the way a disk-loaded config is.
+                                    let resolved_config = crate::config::mcp_servers::resolve_server_refs(config.clone());
+                                    // No outer timeout wrapper: `connect_one`
+                                    // self-bounds every transport (and the
+                                    // tools/list handshake) at its own
+                                    // CONNECT_TIMEOUT, surfacing elapsed time
+                                    // as `McpConnectError::Timeout` through
+                                    // the normal Err arm below. (An older 30s
+                                    // outer wrapper became dead code once the
+                                    // inner bound landed.)
+                                    let connect_result =
+                                        crate::mcp::connect::connect_one(&resolved_config).await;
+
+                                    match connect_result {
+                                        Ok(new_tools) => {
+                                            let tool_count = new_tools.len();
+                                            let mut tools = mcp_tools_state_for_task.get();
+                                            // Drop any tools from a prior connection of a
+                                            // server with this same name first — otherwise
+                                            // daimon's tool registry silently keeps the OLD
+                                            // registration under the shared `{name}__{tool}`
+                                            // key and the newly (re)connected tools never
+                                            // actually take effect.
+                                            let prefix = format!("{}__", config.name);
+                                            tools.retain(|t| !t.name().starts_with(prefix.as_str()));
+                                            tools.extend(new_tools);
+                                            mcp_tools_state_for_task.set(tools.clone());
+
+                                            let permission_settings = crate::permissions::settings::PermissionSettings {
+                                                always_allow,
+                                                always_deny,
+                                            };
+                                            let rebuilt = crate::tui::rebuild::rebuild_agent_from_history(
+                                                &agent_for_history,
+                                                model_for_rebuild,
+                                                tier_value,
+                                                permission_settings,
+                                                &system_context_for_task,
+                                                tools,
+                                                skills_for_task,
+                                                pending_permission_for_task,
+                                            )
+                                            .await;
+                                            match rebuilt {
+                                                Ok(rebuilt) => {
+                                                    agent_and_responder_for_task.set(rebuilt);
+                                                    transcript_for_task.update(|entries| {
+                                                        entries.push_entry(TranscriptEntry::SystemNotice {
+                                                            text: format!(
+                                                                "MCP server '{}' connected — {tool_count} tools added.",
+                                                                config.name
+                                                            ),
+                                                        });
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    // The old agent stays live; the merged
+                                                    // tool list is already in
+                                                    // `mcp_tools_state`, so the next
+                                                    // successful rebuild picks it up.
+                                                    transcript_for_task.update(|entries| {
+                                                        entries.push_entry(TranscriptEntry::SystemNotice {
+                                                            text: format!(
+                                                                "MCP server '{}' connected, but the agent rebuild failed: {e}. \
+                                                                 Its tools will apply after the next successful /model or /resume.",
+                                                                config.name
+                                                            ),
+                                                        });
+                                                    });
+                                                }
                                             }
+                                        }
+                                        Err(e) => {
+                                            let retry_note = if saved {
+                                                "It will be retried on next launch.".to_string()
+                                            } else {
+                                                "It was NOT saved, so it won't be retried — run /mcp add again.".to_string()
+                                            };
+                                            // `e` covers both connect failures and
+                                            // `McpConnectError::Timeout` (whose Display names
+                                            // the actual bound), so no separate timeout arm.
+                                            transcript_for_task.update(|entries| {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                                    text: format!(
+                                                        "MCP server '{}' failed to connect now: {e}. {retry_note}",
+                                                        config.name
+                                                    ),
+                                                });
+                                            });
+                                        }
+                                    }
+                                    pending_menu_for_task.set(PendingMenu::None);
+                                });
+                            }
+                        }
+                    }
+                    return;
+                }
+                PendingMenu::McpAddConnecting => {
+                    if ev.code == KeyCode::Esc {
+                        // The spawned connect+save+rebuild task keeps running in the
+                        // background (it's bounded by connect_one's own timeout and
+                        // always finishes by resetting pending_menu to None again) —
+                        // this just frees up the input loop immediately instead of
+                        // making the user wait out the full timeout.
+                        pending_menu.set(PendingMenu::None);
+                        transcript.update(|entries| {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
+                                text: "still connecting in the background — you can keep typing; \
+                                       a notice will appear here when it finishes."
+                                    .to_string(),
+                            });
+                        });
+                    }
+                    return;
+                }
+                PendingMenu::ConnectionsAddWizard(wizard) => {
+                    if ev.code == KeyCode::Esc {
+                        pending_menu.set(PendingMenu::None);
+                        input_buffer.set(String::new());
+                        transcript.update(|entries| {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
+                                text: "cancelled /connections add.".to_string(),
+                            });
+                        });
+                        return;
+                    }
+                    // Modifier-combos (Ctrl/Alt+key) are commands, not text —
+                    // swallow them rather than insert the letter into the
+                    // buffer (invisible corruption on the masked API-key
+                    // step). SHIFT is fine: it types uppercase.
+                    if let KeyCode::Char(c) = ev.code
+                        && !ev.modifiers.intersects(
+                            ntui::hooks::input::KeyModifiers::CONTROL
+                                | ntui::hooks::input::KeyModifiers::ALT,
+                        )
+                    {
+                        input_buffer.update(|b| b.push(c));
+                        return;
+                    }
+                    if ev.code == KeyCode::Backspace {
+                        input_buffer.update(|b| {
+                            b.pop();
+                        });
+                        return;
+                    }
+                    if ev.code == KeyCode::Enter {
+                        let line = input_buffer.get();
+                        input_buffer.set(String::new());
+                        match crate::tui::connections_wizard::advance(wizard, &line) {
+                            crate::tui::connections_wizard::Advance::Continue(
+                                next_wizard,
+                                prompt,
+                            ) => {
+                                pending_menu.set(PendingMenu::ConnectionsAddWizard(next_wizard));
+                                transcript.update(|entries| {
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text: prompt });
+                                });
+                            }
+                            crate::tui::connections_wizard::Advance::Invalid(
+                                same_wizard,
+                                message,
+                            ) => {
+                                pending_menu.set(PendingMenu::ConnectionsAddWizard(same_wizard));
+                                transcript.update(|entries| {
+                                    entries.push_entry(TranscriptEntry::SystemNotice { text: message });
+                                });
+                            }
+                            crate::tui::connections_wizard::Advance::Finalize(output) => {
+                                let crate::tui::connections_wizard::WizardOutput {
+                                    mut connection,
+                                    pending_api_key,
+                                } = output;
+                                // No blocking `Saving` state (unlike McpAddConnecting):
+                                // the finalize task touches only the keyring and
+                                // connections.toml — no shared agent state — so the
+                                // input loop stays live and notices land when it
+                                // finishes.
+                                pending_menu.set(PendingMenu::None);
+                                let transcript_for_task = transcript.clone();
+                                let user_config_dir_for_task = user_config_dir.clone();
+                                let project_config_dir_for_task = project_config_dir.clone();
+                                let connections_saving_for_task = connections_saving.get();
+                                tokio::spawn(async move {
+                                    let name = connection.name.clone();
+                                    connections_saving_for_task
+                                        .lock()
+                                        .expect("connections-saving set poisoned")
+                                        .insert(name.clone());
+                                    let entered_key = pending_api_key.map(|k| k.value);
+
+                                    // Store the wizard-captured API key in the OS
+                                    // keyring BEFORE saving connections.toml: a
+                                    // failure here must not leave a connection whose
+                                    // key was never stored (the reverse — a stored
+                                    // key with no connection using it — is harmless).
+                                    // On the blocking pool: the keyring write is a
+                                    // synchronous Secret Service D-Bus round trip
+                                    // (or gpg subprocess with the pass fallback),
+                                    // which would otherwise freeze the whole
+                                    // single-threaded UI while the user keeps
+                                    // typing. Same convention as /model and
+                                    // /resume's keyring reads.
+                                    if let Some(key) = &entered_key {
+                                        let name_for_keyring = name.clone();
+                                        let key_for_keyring = key.clone();
+                                        let store_result = tokio::task::spawn_blocking(move || {
+                                            crate::config::secrets::SecretStore::set_api_key(
+                                                &name_for_keyring,
+                                                &key_for_keyring,
+                                            )
+                                        })
+                                        .await
+                                        .expect("keyring write task panicked");
+                                        if let Err(e) = store_result {
+                                            transcript_for_task.update(|entries| {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                                    text: format!(
+                                                        "failed to store the API key in the OS keyring: {e}. Connection '{name}' was NOT saved."
+                                                    ),
+                                                });
+                                            });
+                                            connections_saving_for_task
+                                                .lock()
+                                                .expect("connections-saving set poisoned")
+                                                .remove(&name);
+                                            return;
+                                        }
+                                    }
+
+                                    // Populate the /model picker with what the
+                                    // OpenRouter account can actually use
+                                    // (best-effort: a fetch failure leaves
+                                    // `models` empty and the picker offers just
+                                    // the default). The entered key wins, then
+                                    // the same OPENROUTER_API_KEY env fallback
+                                    // `build_model` uses.
+                                    if connection.provider
+                                        == crate::config::connection::ProviderKind::OpenRouter
+                                    {
+                                        let key = entered_key
+                                            .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
+                                            .filter(|k| !k.is_empty());
+                                        match crate::agent::provider::list_models(
+                                            &connection.base_url,
+                                            key.as_deref(),
+                                        )
+                                        .await
+                                        {
+                                            Ok(models) if !models.is_empty() => {
+                                                transcript_for_task.update(|entries| {
+                                                    entries.push_entry(TranscriptEntry::SystemNotice {
+                                                        text: format!(
+                                                            "fetched {} OpenRouter models for the /model picker.",
+                                                            models.len()
+                                                        ),
+                                                    });
+                                                });
+                                                connection.models = models;
+                                            }
+                                            Ok(_) => {}
                                             Err(e) => {
-                                                transcript.update(|entries| {
-                                                    entries.push(TranscriptEntry::SystemNotice {
-                                                        text: format!("failed to resume: could not build model: {e}"),
+                                                transcript_for_task.update(|entries| {
+                                                    entries.push_entry(TranscriptEntry::SystemNotice {
+                                                        text: format!(
+                                                            "couldn't fetch the OpenRouter model catalog: {e}. \
+                                                             The /model picker will only offer the default until \
+                                                             `models` is filled in connections.toml."
+                                                        ),
                                                     });
                                                 });
                                             }
                                         }
                                     }
-                                    None => {
-                                        transcript.update(|entries| {
-                                            entries.push(TranscriptEntry::SystemNotice {
-                                                text: format!(
-                                                    "failed to resume: connection '{}' no longer exists; run `local-code connections list`",
-                                                    session.connection_name
-                                                ),
+
+                                    // Replace a same-name connection (same rule as
+                                    // the CLI wizard and `connections remove`):
+                                    // user-level first, project entry wins.
+                                    let mut merged = crate::config::connection::load_connections(
+                                        &user_config_dir_for_task,
+                                        &project_config_dir_for_task,
+                                    )
+                                    .unwrap_or_default();
+                                    let replacing = merged.iter().any(|c| c.name == name);
+                                    merged.retain(|c| c.name != name);
+                                    merged.push(connection);
+                                    match crate::config::connection::save_connections(
+                                        &project_config_dir_for_task,
+                                        &merged,
+                                    ) {
+                                        Ok(()) => {
+                                            let overwrite = if replacing {
+                                                " (overwrote an existing connection with the same name)"
+                                            } else {
+                                                ""
+                                            };
+                                            transcript_for_task.update(|entries| {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                                    text: format!(
+                                                        "saved connection '{name}'{overwrite}. Use /model to switch to it."
+                                                    ),
+                                                });
                                             });
-                                        });
+                                        }
+                                        Err(e) => {
+                                            transcript_for_task.update(|entries| {
+                                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                                    text: format!(
+                                                        "connection '{name}' failed to save to connections.toml: {e}"
+                                                    ),
+                                                });
+                                            });
+                                        }
                                     }
-                                }
-                            }
-                            Err(e) => {
-                                transcript.update(|entries| {
-                                    entries.push(TranscriptEntry::SystemNotice {
-                                        text: format!("failed to load session: {e}"),
-                                    });
+                                    connections_saving_for_task
+                                        .lock()
+                                        .expect("connections-saving set poisoned")
+                                        .remove(&name);
                                 });
                             }
                         }
@@ -540,7 +1241,8 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     tier.set(next);
                 }
                 KeyCode::Char('c') if ev.modifiers.contains(ntui::hooks::input::KeyModifiers::CONTROL) => {
-                    // Handled below via `hooks.use_app()`.
+                    // Exit is handled by `Workspace`'s root handler; this arm
+                    // only keeps the 'c' out of the input buffer.
                 }
                 KeyCode::Tab => {
                     transcript.update(|entries| toggle_last_tool_call_expanded(entries));
@@ -565,22 +1267,49 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             tier: tier.clone(),
                             session_path: session_path.clone(),
                             created_at: created_at.clone(),
-                            connection_name: connection_name.clone(),
-                            model_name: model_name.clone(),
+                            // Live display states, not the launch-time props:
+                            // after `/model` or in-TUI `/resume`, `/clear`
+                            // must stamp the *active* connection/model into
+                            // the fresh session file.
+                            connection_name: connection_display.get(),
+                            model_name: model_display.get(),
                             project_root: project_root.clone(),
                             user_state_dir: user_state_dir.clone(),
                             user_config_dir: user_config_dir.clone(),
                             project_config_dir: project_config_dir.clone(),
                             pending_menu: pending_menu.clone(),
+                            connections_saving: connections_saving.get(),
                             always_allow: always_allow_snapshot.clone(),
                             always_deny: always_deny_snapshot.clone(),
                             agent: agent.clone(),
                             model: current_model.get(),
+                            background_tasks: background_tasks.get(),
+                            mcp_tools: mcp_tools_state.clone(),
+                            agent_and_responder: agent_and_responder.clone(),
+                            pending_permission: pending_permission.clone(),
+                            skills: skills_snapshot.clone(),
+                            system_context: system_context.clone(),
+                            model_switch: ModelSwitchContext {
+                                agent: agent.clone(),
+                                pending_permission: pending_permission.clone(),
+                                agent_and_responder: agent_and_responder.clone(),
+                                current_model: current_model.clone(),
+                                transcript: transcript.clone(),
+                                tier: tier.get(),
+                                always_allow: always_allow_snapshot.clone(),
+                                always_deny: always_deny_snapshot.clone(),
+                                system_context: system_context.clone(),
+                                mcp_tools: mcp_tools_state.get(),
+                                skills: skills_snapshot.clone(),
+                                connection_display: connection_display.clone(),
+                                model_display: model_display.clone(),
+                                effort: effort.clone(),
+                            },
                         });
                         return;
                     }
                     transcript.update(|entries| {
-                        entries.push(TranscriptEntry::UserTurn { text: text.clone() });
+                        entries.push_entry(TranscriptEntry::UserTurn { text: text.clone() });
                     });
                     input_buffer.set(String::new());
                     streaming.set(true);
@@ -592,39 +1321,59 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         }
     });
 
-    let app_handle = hooks.use_app();
-    hooks.use_input(move |ev, _ctx| {
-        if ev.code == KeyCode::Char('c') && ev.modifiers.contains(ntui::hooks::input::KeyModifiers::CONTROL) {
-            app_handle.exit();
-        }
-    });
-
     let mut body: Vec<Element> = Vec::new();
     body.push(
         element! {
-            Header(connection_name: connection_display.get(), model_name: model_display.get(), tier_label: tier_label(tier.get()).to_string())
+            Dashboard(
+                connection_name: connection_display.get(),
+                model_name: model_display.get(),
+                effort: effort.get(),
+                tier_label: tier_label(tier.get()).to_string(),
+                tier: tier.get(),
+                usage: usage.get(),
+                streaming: streaming.get(),
+                session_path: session_path.get().display().to_string(),
+                created_at: created_at.get(),
+                project_root: props.project_root.display().to_string(),
+            )
         }
         .with_key("header"),
     );
-    if transcript.get().is_empty() {
-        body.push(
-            element! {
-                View(padding: 1) {
-                    Text(content: MASCOT.to_string(), color: Color::Cyan)
-                }
-            }
-            .with_key("mascot"),
-        );
-    }
     body.push(
         element! {
-            Transcript(entries: transcript.get(), pending_permission: pending_permission.get())
+            Transcript(
+                entries: transcript.get(),
+                pending_permission: pending_permission.get(),
+                streaming_text: stream_text.get(),
+                focused: props.focused,
+                input_gate: props.input_gate.clone(),
+            )
         }
         .with_key("transcript"),
     );
+    let displayed_input_buffer = match &pending_menu.get() {
+        PendingMenu::McpAddWizard(w)
+            if matches!(
+                w.step,
+                crate::tui::mcp_wizard::McpAddStep::AskHttpBearer { .. }
+                    | crate::tui::mcp_wizard::McpAddStep::AskSseBearer { .. }
+            ) =>
+        {
+            "•".repeat(input_buffer.get().chars().count())
+        }
+        PendingMenu::ConnectionsAddWizard(w)
+            if matches!(
+                w.step,
+                crate::tui::connections_wizard::ConnectionsAddStep::AskApiKey { .. }
+            ) =>
+        {
+            "•".repeat(input_buffer.get().chars().count())
+        }
+        _ => input_buffer.get(),
+    };
     body.push(
         element! {
-            InputBox(buffer: input_buffer.get(), disabled: streaming.get())
+            InputBox(buffer: displayed_input_buffer, disabled: streaming.get())
         }
         .with_key("input"),
     );
@@ -636,7 +1385,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
     );
 
     element! {
-        View(flex_direction: FlexDirection::Column, height: Dimension::Percent(100.0), padding: 0) {
+        View(flex_direction: FlexDirection::Column, width: Dimension::Percent(100.0), height: Dimension::Percent(100.0), padding: 0) {
             #(body)
         }
     }
@@ -648,7 +1397,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
 /// more state; every field added there is threaded through from the same
 /// `App` render this struct is built in.
 struct SlashContext {
-    transcript: ntui::State<Vec<TranscriptEntry>>,
+    transcript: ntui::State<TranscriptEntries>,
     tier: ntui::State<PermissionTier>,
     session_path: ntui::State<std::path::PathBuf>,
     created_at: ntui::State<String>,
@@ -659,30 +1408,238 @@ struct SlashContext {
     user_config_dir: std::path::PathBuf,
     project_config_dir: std::path::PathBuf,
     pending_menu: ntui::State<PendingMenu>,
+    /// In-flight `/connections add` saves (see the `connections_saving`
+    /// state in `App`); `/connections remove` refuses to act on these.
+    connections_saving: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     always_allow: Vec<String>,
     always_deny: Vec<String>,
     agent: Arc<Agent>,
     model: SharedModel,
+    /// Registry the pane aborts on unmount; `/compact` and `/init` push
+    /// their spawned task handles here (see the cleanup effect in `App`).
+    background_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    // The live tool-set pieces `/mcp remove` needs to prune a removed
+    // server's tools and rebuild the agent — the exact reverse of `/mcp
+    // add`'s finalize task (see its `use_input` arm above), which reads the
+    // same states.
+    mcp_tools: ntui::State<Vec<crate::mcp::tool::NamespacedMcpTool>>,
+    agent_and_responder: ntui::State<(
+        Arc<Agent>,
+        Arc<crate::permissions::gate::PermissionGate>,
+        crate::tui::rebuild::ResponderHandle,
+    )>,
+    pending_permission: ntui::State<Option<crate::permissions::types::PermissionRequest>>,
+    skills: Vec<crate::skills::types::Skill>,
+    system_context: String,
+    /// Everything `/effort` needs to rebuild the agent against a model with
+    /// a different `reasoning_effort` — the same bundle the `/model` digit
+    /// handler passes to `spawn_model_switch`.
+    model_switch: ModelSwitchContext,
 }
 
-/// The project's ASCII-art mascot, shown once above an empty transcript at
-/// startup (see `App`'s render body) — never persisted to the session file
-/// and never re-shown once the first turn is submitted, since it's rendered
-/// purely from `transcript.get().is_empty()` rather than being seeded into
-/// `initial_entries`.
-const MASCOT: &str = include_str!("../../assets/mascot.txt");
+/// The `App` state a model switch (`/model`, `/effort`) reads and writes,
+/// cloned once at the dispatch site so the async switch task owns
+/// everything it needs. Both switch paths funnel through
+/// `spawn_model_switch` so they can't drift apart (e.g. one forgetting to
+/// update `current_model` or `model_display`).
+#[derive(Clone)]
+struct ModelSwitchContext {
+    agent: Arc<Agent>,
+    pending_permission: ntui::State<Option<crate::permissions::types::PermissionRequest>>,
+    agent_and_responder: ntui::State<(
+        Arc<Agent>,
+        Arc<crate::permissions::gate::PermissionGate>,
+        crate::tui::rebuild::ResponderHandle,
+    )>,
+    current_model: ntui::State<SharedModel>,
+    transcript: ntui::State<TranscriptEntries>,
+    tier: PermissionTier,
+    always_allow: Vec<String>,
+    always_deny: Vec<String>,
+    system_context: String,
+    mcp_tools: Vec<crate::mcp::tool::NamespacedMcpTool>,
+    skills: Vec<crate::skills::types::Skill>,
+    connection_display: ntui::State<String>,
+    model_display: ntui::State<String>,
+    effort: ntui::State<Option<crate::agent::effort::ReasoningEffort>>,
+}
+
+/// Rebuilds the agent against `connection`/`model_name` with the session
+/// effort override `effort` applied (`None` falls back to the connection's
+/// configured default), preserving history, then updates every piece of
+/// `App` state that mirrors the active model. On any failure the old agent
+/// stays live and a notice is posted instead — a failed switch must never
+/// panic the TUI.
+fn spawn_model_switch(
+    sw: ModelSwitchContext,
+    mut connection: crate::config::connection::Connection,
+    model_name: String,
+    effort: Option<crate::agent::effort::ReasoningEffort>,
+    success_notice: String,
+) {
+    connection.default_model = model_name.clone();
+    connection.effort = effort.or(connection.effort);
+    tokio::spawn(async move {
+        // The keyring read is a blocking Secret Service/DBus round trip —
+        // keep it off the event thread, same as the startup path in
+        // `tui::run_tui`.
+        let api_key = tokio::task::spawn_blocking({
+            let name = connection.name.clone();
+            move || crate::config::secrets::SecretStore::get_api_key(&name)
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten();
+        let new_model = match crate::agent::provider::build_model(&connection, api_key) {
+            Ok(m) => m,
+            Err(e) => {
+                sw.transcript.update(|entries| {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
+                        text: format!("failed to switch model: {e}"),
+                    });
+                });
+                return;
+            }
+        };
+        let model_for_state = new_model.clone();
+        let permission_settings = crate::permissions::settings::PermissionSettings {
+            always_allow: sw.always_allow,
+            always_deny: sw.always_deny,
+        };
+        let rebuilt = match crate::tui::rebuild::rebuild_agent_from_history(
+            &sw.agent,
+            new_model,
+            sw.tier,
+            permission_settings,
+            &sw.system_context,
+            sw.mcp_tools,
+            sw.skills,
+            sw.pending_permission,
+        )
+        .await
+        {
+            Ok(rebuilt) => rebuilt,
+            Err(e) => {
+                // Keep the old agent live; a failed switch must not panic
+                // the TUI.
+                sw.transcript.update(|entries| {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
+                        text: format!("failed to switch model: {e}"),
+                    });
+                });
+                return;
+            }
+        };
+        // Last-write-wins: if multiple switches somehow overlap in flight,
+        // whichever `set` call completes last wins regardless of submission
+        // order. Narrow window today since rebuild does no real I/O, but
+        // worth revisiting if it grows any.
+        sw.agent_and_responder.set(rebuilt);
+        // Kept in lockstep with `agent_and_responder` above (Bug 2 fix):
+        // without this, `SlashContext.model` (built from
+        // `current_model.get()` in the `Enter` branch) would keep pointing
+        // at the pre-switch model forever.
+        sw.current_model.set(model_for_state);
+        // Kept in lockstep alongside `current_model` above: the Dashboard
+        // reads from these, not from `props`, so without this it would keep
+        // showing the pre-switch connection/model/effort forever.
+        sw.connection_display.set(connection.name.clone());
+        sw.model_display.set(model_name);
+        sw.effort.set(effort);
+        sw.transcript.update(|entries| {
+            entries.push_entry(TranscriptEntry::SystemNotice {
+                text: success_notice,
+            });
+        });
+    });
+}
+
+/// `/effort <level>` / the `/effort` menu: re-resolves the active connection
+/// by name (so a connection edited on disk since launch is picked up, exactly
+/// like `/resume` does), then rebuilds against it with `new_effort` as the
+/// session override. Runs synchronously up to the spawn — `load_connections`
+/// is the same small file read `/model` itself does inline.
+fn apply_effort(
+    sw: ModelSwitchContext,
+    user_config_dir: &std::path::Path,
+    project_config_dir: &std::path::Path,
+    new_effort: Option<crate::agent::effort::ReasoningEffort>,
+) {
+    let connection_name = sw.connection_display.get();
+    let model_name = sw.model_display.get();
+    let connection =
+        match crate::config::connection::load_connections(user_config_dir, project_config_dir) {
+            Ok(connections) => connections.into_iter().find(|c| c.name == connection_name),
+            Err(e) => {
+                sw.transcript.update(|entries| {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
+                        text: format!("failed to load connections: {e}"),
+                    });
+                });
+                return;
+            }
+        };
+    let Some(connection) = connection else {
+        sw.transcript.update(|entries| {
+            entries.push_entry(TranscriptEntry::SystemNotice {
+                text: format!(
+                    "connection '{connection_name}' no longer exists; run `local-code connections list`"
+                ),
+            });
+        });
+        return;
+    };
+    let mut notice = match new_effort {
+        Some(level) => format!("reasoning effort set to {level}"),
+        None => match connection.effort {
+            Some(default) => format!(
+                "reasoning effort override cleared (using '{}' default: {default})",
+                connection.name
+            ),
+            None => format!(
+                "reasoning effort override cleared ('{}' has no default; the server decides)",
+                connection.name
+            ),
+        },
+    };
+    if !crate::agent::effort::supports_effort(connection.provider) {
+        notice.push_str(&format!(
+            "\nnote: effort is only sent to openai-compatible connections; '{}' is {:?}, so it is remembered for this session but not sent",
+            connection.name, connection.provider
+        ));
+    }
+    spawn_model_switch(sw, connection, model_name, new_effort, notice);
+}
+
+/// Registers a fire-and-forget slash-command task with the pane's abort
+/// registry, pruning already-finished handles so the vec stays bounded.
+fn register_background_task(
+    registry: &std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    handle: tokio::task::JoinHandle<()>,
+) {
+    let mut tasks = registry.lock().expect("background task registry poisoned");
+    tasks.retain(|h| !h.is_finished());
+    tasks.push(handle);
+}
 
 const HELP_TEXT: &str = "\
 /model                     switch the active connection/model (history is kept)
+/effort [low|medium|high|off] set the reasoning effort for this session (menu if omitted)
 /connections list          list configured connections
 /connections remove <name> remove a configured connection
-/connections add           not supported in-TUI; run `local-code connections add` in a separate terminal
+/connections add           add a connection via a step-by-step wizard (Esc to cancel)
+/mcp list                  list configured MCP servers
+/mcp remove <name>         remove a configured MCP server
+/mcp add                   add an MCP server via a step-by-step wizard (Esc to cancel)
 /init                      generate/update AGENTS.md from a survey of this project
 /permissions               view or change the permission tier and allow/deny list
 /compact                   summarize older turns to free up context
 /resume                    switch to a previous session for this project
 /clear                     clear the transcript and start a fresh session
-/help                      show this message";
+/help                      show this message
+workspace: Ctrl+B then     c new window · n/p/0-9 switch · % \" split
+                           arrows/o move pane focus · x close (last pane exits)";
 
 fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashContext) {
     use crate::tui::slash::SlashCommand;
@@ -690,48 +1647,64 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
     match command {
         SlashCommand::Help => {
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text: HELP_TEXT.to_string() });
+                entries.push_entry(TranscriptEntry::SystemNotice {
+                    text: HELP_TEXT.to_string(),
+                });
             });
         }
         SlashCommand::Unknown { raw } => {
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
-                    text: format!("'{raw}' is not a recognized command. Type /help to see the list."),
+                entries.push_entry(TranscriptEntry::SystemNotice {
+                    text: format!(
+                        "'{raw}' is not a recognized command. Type /help to see the list."
+                    ),
                 });
             });
         }
         SlashCommand::Clear => {
             ctx.transcript.set(Vec::new());
+            // The shared "birth a session" recipe (also used by `run_tui`'s
+            // startup session and `Workspace`'s new tabs/panes), so `/clear`
+            // can't drift field-for-field from the other birth sites.
             let now = chrono::Utc::now();
-            let new_created_at = now.to_rfc3339();
-            let new_path = crate::session::paths::new_session_path(
+            match crate::session::store::create_fresh_session(
                 &ctx.user_state_dir,
                 &ctx.project_root,
-                now,
-            );
-            let fresh = crate::session::types::SessionFile::new(
-                ctx.project_root.clone(),
-                ctx.connection_name.clone(),
-                ctx.model_name.clone(),
+                &ctx.connection_name,
+                &ctx.model_name,
                 ctx.tier.get(),
-                new_created_at.clone(),
-            );
-            if let Err(e) = crate::session::store::save_session(&new_path, &fresh) {
-                ctx.transcript.update(|entries| {
-                    entries.push(TranscriptEntry::SystemNotice {
-                        text: format!("cleared transcript, but failed to start a new session file: {e}"),
+                now,
+            ) {
+                Ok((new_path, new_created_at)) => {
+                    ctx.session_path.set(new_path);
+                    ctx.created_at.set(new_created_at);
+                }
+                Err(e) => {
+                    // Adopt the new session's path even though the initial
+                    // write failed: the user asked for a fresh session, so
+                    // subsequent turns belong to it (a later save lands them
+                    // there once a transient failure clears) — not to the
+                    // pre-clear file this pane was just detached from.
+                    let notice =
+                        format!("cleared transcript, but failed to start a new session file: {e}");
+                    ctx.session_path.set(e.path);
+                    ctx.created_at.set(now.to_rfc3339());
+                    ctx.transcript.update(|entries| {
+                        entries.push_entry(TranscriptEntry::SystemNotice { text: notice });
                     });
-                });
+                }
             }
-            ctx.session_path.set(new_path);
-            ctx.created_at.set(new_created_at);
         }
         SlashCommand::Model => {
-            match crate::config::connection::load_connections(&ctx.user_config_dir, &ctx.project_config_dir) {
+            match crate::config::connection::load_connections(
+                &ctx.user_config_dir,
+                &ctx.project_config_dir,
+            ) {
                 Ok(connections) if connections.is_empty() => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
-                            text: "no connections configured; run `local-code connections add`".to_string(),
+                        entries.push_entry(TranscriptEntry::SystemNotice {
+                            text: "no connections configured; run `local-code connections add`"
+                                .to_string(),
                         });
                     });
                 }
@@ -753,23 +1726,53 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                         .map(|(i, (conn, model))| format!("{}) {} · {}", i + 1, conn.name, model))
                         .collect();
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!(
                                 "Select a connection/model (press the digit key):\n{}",
                                 listing.join("\n")
                             ),
                         });
                     });
-                    ctx.pending_menu.set(PendingMenu::ModelChoice(choices.into_iter().take(9).collect()));
+                    ctx.pending_menu.set(PendingMenu::ModelChoice(
+                        choices.into_iter().take(9).collect(),
+                    ));
                 }
                 Err(e) => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("failed to load connections: {e}"),
                         });
                     });
                 }
             }
+        }
+        SlashCommand::Effort { level: Some(level) } => {
+            let new_effort = match level {
+                crate::tui::slash::EffortArg::Level(level) => Some(level),
+                crate::tui::slash::EffortArg::Off => None,
+            };
+            apply_effort(
+                ctx.model_switch.clone(),
+                &ctx.user_config_dir,
+                &ctx.project_config_dir,
+                new_effort,
+            );
+        }
+        SlashCommand::Effort { level: None } => {
+            let current = match ctx.model_switch.effort.get() {
+                Some(level) => level.to_string(),
+                None => "connection default".to_string(),
+            };
+            ctx.transcript.update(|entries| {
+                entries.push_entry(TranscriptEntry::SystemNotice {
+                    text: format!(
+                        "Current reasoning effort: {current}\n\
+                         1) low\n2) medium\n3) high\n4) off (use the connection default)\n\
+                         (press a digit key to select; only sent to openai-compatible connections)"
+                    ),
+                });
+            });
+            ctx.pending_menu.set(PendingMenu::EffortChoice);
         }
         SlashCommand::Permissions => {
             let current = ctx.tier.get();
@@ -779,11 +1782,19 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                  1) ask\n2) auto-accept-edits\n3) full-auto\n\
                  (press a digit key to switch, or Ctrl+A to cycle)\n\
                  always-allow: {}\nalways-deny: {}",
-                if ctx.always_allow.is_empty() { "(none)".to_string() } else { ctx.always_allow.join(", ") },
-                if ctx.always_deny.is_empty() { "(none)".to_string() } else { ctx.always_deny.join(", ") },
+                if ctx.always_allow.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    ctx.always_allow.join(", ")
+                },
+                if ctx.always_deny.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    ctx.always_deny.join(", ")
+                },
             );
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
             ctx.pending_menu.set(PendingMenu::PermissionsMenu);
         }
@@ -799,10 +1810,25 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 Err(e) => format!("failed to list connections: {e}"),
             };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
         SlashCommand::ConnectionsRemove { name } => {
+            if ctx
+                .connections_saving
+                .lock()
+                .expect("connections-saving set poisoned")
+                .contains(&name)
+            {
+                ctx.transcript.update(|entries| {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
+                        text: format!(
+                            "connection '{name}' is still being saved by /connections add — try again in a moment."
+                        ),
+                    });
+                });
+                return;
+            }
             let paths = crate::config::paths::Paths {
                 user_config_dir: ctx.user_config_dir.clone(),
                 project_config_dir: ctx.project_config_dir.clone(),
@@ -814,20 +1840,131 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 Err(e) => format!("failed to remove connection: {e}"),
             };
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice { text });
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
             });
         }
-        SlashCommand::ConnectionsAddUnsupported => {
+        SlashCommand::ConnectionsAdd => {
+            let (wizard, prompt) = crate::tui::connections_wizard::start();
             ctx.transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
-                    text: "adding a connection interactively isn't supported inside the TUI\n\
-                           (the wizard needs multi-step line-by-line stdin, which the raw-mode\n\
-                           TUI input loop doesn't support). Exit and run\n\
-                           `local-code connections add` in a separate terminal, then use /model\n\
-                           to switch to it."
-                        .to_string(),
-                });
+                entries.push_entry(TranscriptEntry::SystemNotice { text: prompt });
             });
+            ctx.pending_menu
+                .set(PendingMenu::ConnectionsAddWizard(wizard));
+        }
+        SlashCommand::McpList => {
+            let paths = crate::config::paths::Paths {
+                user_config_dir: ctx.user_config_dir.clone(),
+                project_config_dir: ctx.project_config_dir.clone(),
+                user_state_dir: ctx.user_state_dir.clone(),
+            };
+            let mut out = Vec::new();
+            let text = match crate::cli::mcp::list(&paths, &mut out) {
+                Ok(()) => String::from_utf8_lossy(&out).to_string(),
+                Err(e) => format!("failed to list MCP servers: {e}"),
+            };
+            ctx.transcript.update(|entries| {
+                entries.push_entry(TranscriptEntry::SystemNotice { text });
+            });
+        }
+        SlashCommand::McpRemove { name } => {
+            let paths = crate::config::paths::Paths {
+                user_config_dir: ctx.user_config_dir.clone(),
+                project_config_dir: ctx.project_config_dir.clone(),
+                user_state_dir: ctx.user_state_dir.clone(),
+            };
+            // `cli::mcp::remove` reports Ok even when nothing matched (it
+            // prints a "No MCP server named ..." notice), so whether the
+            // live tool set needs to change is decided by the pre-remove
+            // listing instead of the Ok/Err result.
+            let configured = crate::config::mcp_servers::load_mcp_servers_raw(
+                &paths.user_config_dir,
+                &paths.project_config_dir,
+            )
+            .unwrap_or_default()
+            .iter()
+            .any(|s| s.name == name);
+            let mut out = Vec::new();
+            let removed = match crate::cli::mcp::remove(&paths, &name, &mut out) {
+                Ok(()) => {
+                    let text = String::from_utf8_lossy(&out).to_string();
+                    ctx.transcript.update(|entries| {
+                        entries.push_entry(TranscriptEntry::SystemNotice { text });
+                    });
+                    configured
+                }
+                Err(e) => {
+                    ctx.transcript.update(|entries| {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
+                            text: format!("failed to remove MCP server: {e}"),
+                        });
+                    });
+                    false
+                }
+            };
+            if removed {
+                // Mirror /mcp add's live-reconnect in reverse: drop the
+                // removed server's tools from the live tool state (the same
+                // `{name}__` prefix prune the add path applies before
+                // merging) and rebuild the agent, so the removed server's
+                // tools stop being callable immediately instead of lingering
+                // until restart.
+                let mut tools = ctx.mcp_tools.get();
+                let prefix = format!("{name}__");
+                tools.retain(|t| !t.name().starts_with(prefix.as_str()));
+                ctx.mcp_tools.set(tools.clone());
+
+                let agent_for_history = ctx.agent.clone();
+                let model = ctx.model.clone();
+                let tier_value = ctx.tier.get();
+                let permission_settings = crate::permissions::settings::PermissionSettings {
+                    always_allow: ctx.always_allow.clone(),
+                    always_deny: ctx.always_deny.clone(),
+                };
+                let system_context = ctx.system_context.clone();
+                let skills = ctx.skills.clone();
+                let pending_permission = ctx.pending_permission.clone();
+                let agent_and_responder = ctx.agent_and_responder.clone();
+                let transcript = ctx.transcript.clone();
+                let handle = tokio::spawn(async move {
+                    let rebuilt = crate::tui::rebuild::rebuild_agent_from_history(
+                        &agent_for_history,
+                        model,
+                        tier_value,
+                        permission_settings,
+                        &system_context,
+                        tools,
+                        skills,
+                        pending_permission,
+                    )
+                    .await;
+                    match rebuilt {
+                        Ok(rebuilt) => {
+                            agent_and_responder.set(rebuilt);
+                        }
+                        Err(e) => {
+                            // The old agent stays live; the pruned tool list is
+                            // already in `mcp_tools_state`, so the next successful
+                            // rebuild picks it up (same recovery as /mcp add).
+                            transcript.update(|entries| {
+                                entries.push_entry(TranscriptEntry::SystemNotice {
+                                    text: format!(
+                                        "MCP server '{name}' was removed, but the agent rebuild failed: {e}. \
+                                         Its tools will stay registered until the next successful /model or /resume."
+                                    ),
+                                });
+                            });
+                        }
+                    }
+                });
+                register_background_task(&ctx.background_tasks, handle);
+            }
+        }
+        SlashCommand::McpAdd => {
+            let (wizard, prompt) = crate::tui::mcp_wizard::start();
+            ctx.transcript.update(|entries| {
+                entries.push_entry(TranscriptEntry::SystemNotice { text: prompt });
+            });
+            ctx.pending_menu.set(PendingMenu::McpAddWizard(wizard));
         }
         SlashCommand::Compact => {
             const RETAIN_RECENT: usize = 10;
@@ -835,12 +1972,12 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
             let agent = ctx.agent.clone();
             let model = ctx.model.clone();
             let transcript = ctx.transcript.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let history = match agent.memory().get_messages_erased().await {
                     Ok(h) => h,
                     Err(e) => {
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("compact failed: could not read history: {e}"),
                             });
                         });
@@ -850,7 +1987,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
 
                 if history.len() <= COMPACT_THRESHOLD {
                     transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!(
                                 "nothing to compact yet ({} messages, threshold is {COMPACT_THRESHOLD})",
                                 history.len()
@@ -863,11 +2000,15 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 let split_at = history.len().saturating_sub(RETAIN_RECENT);
                 let (older, recent) = history.split_at(split_at);
 
-                let mut conversation_text = String::new();
+                let capacity: usize = older
+                    .iter()
+                    .filter_map(|m| m.content.as_ref().map(|c| c.len() + 16))
+                    .sum();
+                let mut conversation_text = String::with_capacity(capacity);
                 for msg in older {
-                    let role = format!("{:?}", msg.role);
                     if let Some(content) = &msg.content {
-                        conversation_text.push_str(&format!("{role}: {content}\n"));
+                        use std::fmt::Write as _;
+                        let _ = writeln!(conversation_text, "{:?}: {content}", msg.role);
                     }
                 }
 
@@ -891,7 +2032,7 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                     Ok(response) => response.text().to_string(),
                     Err(e) => {
                         transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("compact failed: summarization call errored: {e}"),
                             });
                         });
@@ -901,20 +2042,42 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
 
                 if let Err(e) = agent.memory().clear_erased().await {
                     transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("compact failed: could not clear memory: {e}"),
                         });
                     });
                     return;
                 }
-                let _ = agent
+                // The clear already succeeded, so a failed re-injection would
+                // silently lose the summary/recent context — surface it like
+                // the `clear_erased` failure above instead of discarding the
+                // error (the memory is degraded either way, but the user must
+                // know).
+                let mut reinject_error: Option<String> = None;
+                if let Err(e) = agent
                     .memory()
-                    .add_message_erased(daimon::model::types::Message::system(format!(
+                    .add_message_erased(&daimon::model::types::Message::system(format!(
                         "Previous conversation summary: {summary_text}"
                     )))
-                    .await;
-                for msg in recent.iter().cloned() {
-                    let _ = agent.memory().add_message_erased(msg).await;
+                    .await
+                {
+                    reinject_error = Some(e.to_string());
+                }
+                for msg in recent {
+                    if let Err(e) = agent.memory().add_message_erased(msg).await {
+                        reinject_error.get_or_insert_with(|| e.to_string());
+                        break;
+                    }
+                }
+                if let Some(e) = reinject_error {
+                    transcript.update(|entries| {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
+                            text: format!(
+                                "compact warning: memory was cleared but re-seeding it failed: {e} \
+                                 — the agent may be missing the summary or recent turns"
+                            ),
+                        });
+                    });
                 }
 
                 // The display transcript has no 1:1 correspondence to the
@@ -928,51 +2091,54 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                 // approach Phase 3 used for diff coloring.
                 transcript.update(|entries| {
                     let keep_from = entries.len().saturating_sub(RETAIN_RECENT);
-                    let mut compacted = vec![TranscriptEntry::SystemNotice {
+                    let mut compacted: TranscriptEntries = Vec::new();
+                    compacted.push_entry(TranscriptEntry::SystemNotice {
                         text: format!("compacted {} older messages into a summary", older.len()),
-                    }];
+                    });
                     compacted.extend(entries.split_off(keep_from));
                     *entries = compacted;
                 });
             });
+            register_background_task(&ctx.background_tasks, handle);
         }
         SlashCommand::Init => {
             let model = ctx.model.clone();
             let project_root = ctx.project_root.clone();
             let transcript = ctx.transcript.clone();
             transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: "surveying the project and generating AGENTS.md…".to_string(),
                 });
             });
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let survey = crate::init::survey_project(&project_root);
                 match crate::init::generate_agents_md(&model, &survey).await {
                     Ok(content) => match crate::init::write_agents_md(&project_root, &content) {
                         Ok(()) => transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: "wrote AGENTS.md".to_string(),
                             });
                         }),
                         Err(e) => transcript.update(|entries| {
-                            entries.push(TranscriptEntry::SystemNotice {
+                            entries.push_entry(TranscriptEntry::SystemNotice {
                                 text: format!("/init failed to write AGENTS.md: {e}"),
                             });
                         }),
                     },
                     Err(e) => transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("/init failed: {e}"),
                         });
                     }),
                 }
             });
+            register_background_task(&ctx.background_tasks, handle);
         }
         SlashCommand::Resume => {
             match crate::session::store::list_sessions(&ctx.user_state_dir, &ctx.project_root) {
                 Ok(sessions) if sessions.is_empty() => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: "no previous sessions found for this project".to_string(),
                         });
                     });
@@ -997,15 +2163,20 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                         })
                         .collect();
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
-                            text: format!("Select a session to resume (press the digit key):\n{}", listing.join("\n")),
+                        entries.push_entry(TranscriptEntry::SystemNotice {
+                            text: format!(
+                                "Select a session to resume (press the digit key):\n{}",
+                                listing.join("\n")
+                            ),
                         });
                     });
-                    ctx.pending_menu.set(PendingMenu::ResumeChoice(sessions.into_iter().take(9).collect()));
+                    ctx.pending_menu.set(PendingMenu::ResumeChoice(
+                        sessions.into_iter().take(9).collect(),
+                    ));
                 }
                 Err(e) => {
                     ctx.transcript.update(|entries| {
-                        entries.push(TranscriptEntry::SystemNotice {
+                        entries.push_entry(TranscriptEntry::SystemNotice {
                             text: format!("failed to list sessions: {e}"),
                         });
                     });
@@ -1015,105 +2186,28 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
     }
 }
 
-/// Persists one ReAct iteration's completed tool calls into `agent.memory()`,
-/// mirroring exactly what `daimon`'s non-streaming `run_react_loop` does for
-/// the same shape of iteration (see this module's doc comment on `run_turn`
-/// for the full rationale): one `Message::assistant_with_tool_calls` covering
-/// every call in the batch, followed by one `Message::tool_result` per call,
-/// in order. `daimon::agent::Agent::prompt_stream` never writes any of this
-/// to memory itself — see the long comment on `run_turn` below.
-///
-/// If a call's `result` is `None` (the stream ended — errored or otherwise —
-/// before that call's `StreamEvent::ToolResult` arrived), an empty string is
-/// used as the tool result content rather than panicking; see `run_turn`'s
-/// doc comment for why this can't be fully avoided.
-async fn flush_tool_call_batch(agent: &Agent, batch: &mut Vec<ToolCallEntry>) {
-    if batch.is_empty() {
-        return;
-    }
-    let tool_calls: Vec<daimon::tool::ToolCall> = batch
-        .iter()
-        .map(|call| daimon::tool::ToolCall {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            arguments: serde_json::from_str(&call.arguments_json)
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
-        })
-        .collect();
-    let _ = agent
-        .memory()
-        .add_message_erased(daimon::model::types::Message::assistant_with_tool_calls(tool_calls))
-        .await;
-    for call in batch.iter() {
-        let content = call
-            .result
-            .as_ref()
-            .map(|r| r.content.clone())
-            .unwrap_or_default();
-        let _ = agent
-            .memory()
-            .add_message_erased(daimon::model::types::Message::tool_result(&call.id, content))
-            .await;
-    }
-    batch.clear();
-}
-
 /// Drives one turn: streams `agent.prompt_stream(&input)`, folding each
 /// `StreamEvent` into `transcript`/`usage`, then clears `streaming` and
 /// `pending_turn_input` so the next `Enter` can start a new turn.
 ///
-/// # Reconstructing what `daimon` fails to persist
+/// # Memory persistence is handled by `daimon` itself
 ///
-/// `daimon::agent::Agent::prompt_stream` (unlike its non-streaming sibling
-/// `run_react_loop`, which backs `Agent::prompt`) only ever calls
-/// `self.memory.add_message_erased` once per turn, for the user's own
-/// message — confirmed by reading `daimon` 0.16.0's
-/// `src/agent/runner.rs::prompt_stream` directly. Every assistant-with-tool-
+/// As of `daimon` 0.17.0's "consolidate API surface" release,
+/// `daimon::agent::Agent::prompt_stream` persists every assistant-with-tool-
 /// calls message, every tool-result message, and the final assistant text
-/// message are built into a function-local `messages` Vec used only to seed
-/// the next ReAct iteration's request, and are silently discarded once
-/// `prompt_stream`'s returned stream is dropped. Patching this in the
-/// vendored `daimon` crate would cost far more to maintain than reconstructing
-/// the same effect here, in the one function that actually drives every real
-/// turn in this TUI — so this function does that reconstruction itself,
-/// event by event, as `StreamEvent`s arrive:
-///
-/// - `local_batch` mirrors the transcript's own `ToolCallEntry` list for the
-///   *current* ReAct iteration only (started fresh after each flush):
-///   `ToolCallStart` pushes an entry, `ToolCallDelta` appends to its
-///   `arguments_json`, and `ToolResult` fills in its `result`.
-/// - Reading `prompt_stream`'s source precisely: within one iteration that
-///   has tool calls, `StreamEvent::Usage` is yielded *before* any of that
-///   iteration's `StreamEvent::ToolResult`s (`Usage` comes right after the
-///   inner per-iteration stream loop ends; the tool-execution loop that
-///   yields `ToolResult` runs afterward). So `Usage` cannot be used as the
-///   flush signal for a tool-calling iteration — at that point in the stream,
-///   none of the batch's results have arrived yet. Instead, `local_batch` is
-///   flushed to memory (via `flush_tool_call_batch`) the moment every entry
-///   in it has a `result` — which happens right after that iteration's last
-///   `ToolResult` arrives, and strictly before the next iteration's first
-///   `ToolCallStart` (there is no interleaving between iterations).
-/// - `Usage` firing with an *empty* `local_batch` means this iteration had no
-///   tool calls at all — exactly the `!had_tool_calls` branch in
-///   `prompt_stream`'s source, the one case where the model's text becomes
-///   the turn's final answer. `iteration_text` (accumulated the same way as
-///   the transcript's own `AssistantText`, but reset every iteration so text
-///   from a tool-calling iteration is correctly discarded, matching
-///   `prompt_stream`'s own per-iteration `text_buf`) is captured into
-///   `final_assistant_text` at that point.
-/// - After the stream ends (`Done`, an in-band `Error`, or the transport
-///   `Err`), any messages still in `local_batch` are flushed as a best
-///   effort — this only happens if the stream ended mid-iteration before all
-///   `ToolResult`s arrived, in which case whichever calls never got a result
-///   are persisted with empty-string content (see `flush_tool_call_batch`)
-///   rather than being dropped or panicking. `final_assistant_text`, if set,
-///   is then appended as one final `Message::assistant`.
-///
-/// This produces exactly the same message shapes, in exactly the same order,
-/// that `run_react_loop` would have written for an equivalent non-streaming
-/// turn: the user message (already added correctly by `daimon` itself), each
-/// iteration's tool-calls-then-results, and finally the assistant's closing
-/// text.
+/// message into `agent.memory()` itself, exactly matching what its
+/// non-streaming sibling `run_react_loop` (which backs `Agent::prompt`) does
+/// — confirmed by reading `daimon` 0.19.0's `src/agent/runner.rs::prompt_stream`
+/// directly (see `memory.add_message_erased` calls for the tool-calls
+/// message, each tool result, and the final assistant text). Earlier
+/// (`daimon` 0.16.0 and before), `prompt_stream` only ever persisted the
+/// user's own message, silently discarding everything else once the
+/// returned stream was dropped — this function used to reconstruct that
+/// missing persistence itself, event by event. That reconstruction has been
+/// removed now that `daimon` does it natively; duplicating it here would
+/// double-write every assistant/tool message into memory. This function now
+/// only needs to fold `StreamEvent`s into the `transcript`/`usage` UI state —
+/// `agent.memory()` is already correct by the time the stream ends.
 /// Renders a `run_turn` failure as the text of a `TranscriptEntry::SystemNotice`.
 ///
 /// `daimon::DaimonError` collapses every model-facing failure (HTTP, SDK,
@@ -1126,31 +2220,55 @@ fn format_turn_error(e: impl std::fmt::Display) -> String {
     let error_text = e.to_string();
     let lower = error_text.to_lowercase();
     if lower.contains("timed out") || lower.contains("timeout") {
-        format!("error: request timed out — the local model server may be unresponsive ({error_text})")
+        format!(
+            "error: request timed out — the local model server may be unresponsive ({error_text})"
+        )
     } else {
         format!("error: {error_text}")
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     agent: Arc<Agent>,
     input: String,
-    transcript: ntui::State<Vec<TranscriptEntry>>,
+    transcript: ntui::State<TranscriptEntries>,
+    stream_text: ntui::State<String>,
     usage: ntui::State<UsageSummary>,
     streaming: ntui::State<bool>,
     pending_turn_input: ntui::State<Option<String>>,
     session_path: ntui::State<std::path::PathBuf>,
     created_at: ntui::State<String>,
-    connection_name: String,
-    model_name: String,
+    connection_name: ntui::State<String>,
+    model_name: ntui::State<String>,
+    effort: ntui::State<Option<crate::agent::effort::ReasoningEffort>>,
     tier: PermissionTier,
     project_root: std::path::PathBuf,
 ) {
+    // Folds the in-flight streamed text into the transcript as a finished
+    // `AssistantText` entry. Called whenever the current streamed block ends
+    // (a tool call starts, an error interrupts, or the turn completes) so
+    // `transcript` is only touched once per block instead of once per token
+    // — see `stream_text`'s declaration in `App` for the cost rationale.
+    let flush_stream_text = {
+        let transcript = transcript.clone();
+        let stream_text = stream_text.clone();
+        move || {
+            let text = stream_text.get();
+            if !text.is_empty() {
+                stream_text.set(String::new());
+                transcript.update(|entries| {
+                    entries.push_entry(TranscriptEntry::AssistantText { text });
+                });
+            }
+        }
+    };
+
     let mut stream = match agent.prompt_stream(&input).await {
         Ok(s) => s,
         Err(e) => {
             transcript.update(|entries| {
-                entries.push(TranscriptEntry::SystemNotice {
+                entries.push_entry(TranscriptEntry::SystemNotice {
                     text: format_turn_error(e),
                 });
             });
@@ -1160,32 +2278,15 @@ async fn run_turn(
         }
     };
 
-    // See this function's doc comment above for the full rationale: these
-    // three locals reconstruct what `daimon::agent::Agent::prompt_stream`
-    // should have (but doesn't) persist into `agent.memory()` itself.
-    let mut local_batch: Vec<ToolCallEntry> = Vec::new();
-    let mut iteration_text = String::new();
-    let mut final_assistant_text: Option<String> = None;
-
     while let Some(event) = stream.next().await {
         match event {
             Ok(StreamEvent::TextDelta(delta)) => {
-                iteration_text.push_str(&delta);
-                transcript.update(|entries| match entries.last_mut() {
-                    Some(TranscriptEntry::AssistantText { text }) => text.push_str(&delta),
-                    _ => entries.push(TranscriptEntry::AssistantText { text: delta }),
-                });
+                stream_text.update(|text| text.push_str(&delta));
             }
             Ok(StreamEvent::ToolCallStart { id, name }) => {
-                local_batch.push(ToolCallEntry {
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments_json: String::new(),
-                    result: None,
-                    expanded: true,
-                });
+                flush_stream_text();
                 transcript.update(|entries| {
-                    entries.push(TranscriptEntry::ToolCall(ToolCallEntry {
+                    entries.push_entry(TranscriptEntry::ToolCall(ToolCallEntry {
                         id,
                         name,
                         arguments_json: String::new(),
@@ -1194,10 +2295,10 @@ async fn run_turn(
                     }));
                 });
             }
-            Ok(StreamEvent::ToolCallDelta { id, arguments_delta }) => {
-                if let Some(call) = local_batch.iter_mut().find(|c| c.id == id) {
-                    call.arguments_json.push_str(&arguments_delta);
-                }
+            Ok(StreamEvent::ToolCallDelta {
+                id,
+                arguments_delta,
+            }) => {
                 transcript.update(|entries| {
                     if let Some(call) = find_tool_call_mut(entries, &id) {
                         call.arguments_json.push_str(&arguments_delta);
@@ -1205,23 +2306,19 @@ async fn run_turn(
                 });
             }
             Ok(StreamEvent::ToolCallEnd { .. }) => {}
-            Ok(StreamEvent::ToolResult { id, content, is_error }) => {
-                if let Some(call) = local_batch.iter_mut().find(|c| c.id == id) {
-                    call.result = Some(ToolCallResult { content: content.clone(), is_error });
-                }
+            Ok(StreamEvent::ToolResult {
+                id,
+                content,
+                is_error,
+            }) => {
                 transcript.update(|entries| {
                     if let Some(call) = find_tool_call_mut(entries, &id) {
-                        call.result = Some(ToolCallResult { content, is_error });
+                        call.result = Some(ToolCallResult {
+                            content: content.into(),
+                            is_error,
+                        });
                     }
                 });
-                // The moment every call in this iteration's batch has a
-                // result, the batch is complete — flush it now rather than
-                // waiting for `Usage` (which, per this function's doc
-                // comment, fires *before* these `ToolResult`s for a
-                // tool-calling iteration, not after).
-                if !local_batch.is_empty() && local_batch.iter().all(|c| c.result.is_some()) {
-                    flush_tool_call_batch(&agent, &mut local_batch).await;
-                }
             }
             Ok(StreamEvent::Usage {
                 input_tokens,
@@ -1230,29 +2327,20 @@ async fn run_turn(
                 ..
             }) => {
                 usage.update(|u| u.add(input_tokens, output_tokens, estimated_cost));
-                // `local_batch` is only still empty here if this iteration had
-                // no tool calls at all — i.e. this is (so far) the turn's
-                // final, text-only iteration. Capture it as the candidate
-                // final assistant message; a later iteration (if any) that
-                // also has no tool calls would overwrite it, but in practice
-                // `prompt_stream` always ends the loop right after such an
-                // iteration.
-                if local_batch.is_empty() {
-                    final_assistant_text = Some(iteration_text.clone());
-                }
-                iteration_text.clear();
             }
             Ok(StreamEvent::Error(message)) => {
+                flush_stream_text();
                 transcript.update(|entries| {
-                    entries.push(TranscriptEntry::SystemNotice {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
                         text: format!("error: {message}"),
                     });
                 });
             }
             Ok(StreamEvent::Done) => break,
             Err(e) => {
+                flush_stream_text();
                 transcript.update(|entries| {
-                    entries.push(TranscriptEntry::SystemNotice {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
                         text: format_turn_error(e),
                     });
                 });
@@ -1260,33 +2348,54 @@ async fn run_turn(
             }
         }
     }
-
-    // Best-effort flush of any batch left incomplete by an early stream end
-    // (error mid-tool-call) — see `flush_tool_call_batch`'s doc comment.
-    flush_tool_call_batch(&agent, &mut local_batch).await;
-    if let Some(text) = final_assistant_text {
-        if !text.is_empty() {
-            let _ = agent
-                .memory()
-                .add_message_erased(daimon::model::types::Message::assistant(text))
-                .await;
-        }
-    }
+    flush_stream_text();
 
     if let Ok(messages) = agent.memory().get_messages_erased().await {
         let now = chrono::Utc::now().to_rfc3339();
-        let mut session = crate::session::types::SessionFile::new(
-            project_root,
-            connection_name,
-            model_name,
-            tier,
-            created_at.get(),
-        );
-        session.updated_at = now;
-        session.entries = transcript.get();
-        session.messages = messages;
-        if let Err(e) = crate::session::store::save_session(&session_path.get(), &session) {
-            eprintln!("warning: failed to persist session to {}: {e}", session_path.get().display());
+        // `transcript.get()` clones `Arc`s (refcount bumps), not entry text;
+        // the borrowing `SessionFileView` below serializes through those
+        // `Arc`s so the growing transcript is never deep-copied per turn.
+        let entries = transcript.get();
+        let connection_name_value = connection_name.get();
+        let model_name_value = model_name.get();
+        let effort_value = effort.get();
+        let created_at_value = created_at.get();
+        // Serialize + write on the blocking pool: the session grows with the
+        // conversation, and doing this inline stalled the single-threaded
+        // runtime (rendering AND every other pane's stream) for the duration
+        // of the write. A failure lands in the transcript — an `eprintln!`
+        // under the alternate screen was invisible.
+        let path = session_path.get();
+        let saved = tokio::task::spawn_blocking(move || {
+            let view = crate::session::types::SessionFileView {
+                version: crate::session::types::SESSION_FILE_VERSION,
+                project_root: &project_root,
+                connection_name: &connection_name_value,
+                model_name: &model_name_value,
+                tier,
+                effort: effort_value,
+                created_at: &created_at_value,
+                updated_at: &now,
+                entries: &entries,
+                messages: &messages,
+            };
+            crate::session::store::save_session_view(&path, &view)
+        })
+        .await;
+        let save_error = match saved {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(join_error) => Some(join_error.to_string()),
+        };
+        if let Some(e) = save_error {
+            transcript.update(|entries| {
+                entries.push_entry(TranscriptEntry::SystemNotice {
+                    text: format!(
+                        "warning: failed to persist session to {}: {e}",
+                        session_path.get().display()
+                    ),
+                });
+            });
         }
     }
 
@@ -1302,32 +2411,7 @@ mod tests {
     use ntui::testing::TestTerminal;
     use ntui::{Element, KeyCode};
 
-    /// Replies with a two-token streamed response and no tool calls.
-    ///
-    /// Deliberately emits no `StreamEvent::Usage` of its own: `Agent::prompt_stream`
-    /// (see `daimon`'s `agent/runner.rs`) always appends its *own* estimated
-    /// `Usage` event per ReAct iteration (character-count-based, `chars/4`) after
-    /// forwarding whatever the model's stream yields — so any `Usage` this mock
-    /// emitted would be forwarded too and summed with the agent's, on top of the
-    /// agent's own estimate. Omitting it keeps this test's usage assertions tied
-    /// to one authoritative source instead of an arbitrary double-count.
-    struct StreamingEchoModel;
-    impl daimon::model::Model for StreamingEchoModel {
-        async fn generate(&self, _request: &ChatRequest) -> daimon::Result<ChatResponse> {
-            Ok(ChatResponse {
-                message: Message::assistant("unused"),
-                stop_reason: StopReason::EndTurn,
-                usage: Some(Usage::default()),
-            })
-        }
-        async fn generate_stream(&self, _request: &ChatRequest) -> daimon::Result<ResponseStream> {
-            Ok(Box::pin(futures::stream::iter(vec![
-                Ok(StreamEvent::TextDelta("Hello".into())),
-                Ok(StreamEvent::TextDelta(", world".into())),
-                Ok(StreamEvent::Done),
-            ])))
-        }
-    }
+    use crate::tui::test_support::StreamingEchoModel;
 
     fn test_props() -> AppProps {
         AppProps {
@@ -1348,7 +2432,801 @@ mod tests {
         t.send_key(KeyCode::Enter).unwrap();
     }
 
-    // --- Bug 1 fixtures: `run_turn`'s memory-reconstruction fix -----------
+    fn test_props_with_config_dir(dir: &std::path::Path) -> AppProps {
+        AppProps {
+            project_config_dir: dir.to_path_buf(),
+            user_config_dir: dir.join("user-config-unused"),
+            ..test_props()
+        }
+    }
+
+    static KEYRING_INIT: std::sync::Once = std::sync::Once::new();
+    fn use_mock_keyring() {
+        KEYRING_INIT.call_once(|| {
+            keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
+        });
+    }
+
+    fn plain_key(code: KeyCode) -> ntui::KeyEvent {
+        ntui::KeyEvent::new(code, ntui::hooks::input::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn guard_blocks_every_key_when_unfocused() {
+        assert!(!session_may_handle_input(
+            false,
+            &None,
+            &plain_key(KeyCode::Char('a'))
+        ));
+        assert!(!session_may_handle_input(
+            false,
+            &None,
+            &plain_key(KeyCode::Enter)
+        ));
+    }
+
+    #[test]
+    fn guard_passes_normal_keys_when_focused_and_ungated() {
+        assert!(session_may_handle_input(
+            true,
+            &None,
+            &plain_key(KeyCode::Char('a'))
+        ));
+        assert!(session_may_handle_input(
+            true,
+            &None,
+            &plain_key(KeyCode::Enter)
+        ));
+    }
+
+    #[test]
+    fn guard_lets_the_prefix_key_bubble_but_not_a_plain_b() {
+        let prefix = ntui::KeyEvent::new(
+            KeyCode::Char('b'),
+            ntui::hooks::input::KeyModifiers::CONTROL,
+        );
+        assert!(!session_may_handle_input(true, &None, &prefix));
+        assert!(session_may_handle_input(
+            true,
+            &None,
+            &plain_key(KeyCode::Char('b'))
+        ));
+    }
+
+    #[test]
+    fn format_turn_error_diagnoses_timeouts_case_insensitively() {
+        // The diagnosis fires on a case-insensitive "timeout"/"timed out"
+        // substring match, keeping the original error text in parentheses.
+        assert_eq!(
+            format_turn_error("connection timed out"),
+            "error: request timed out — the local model server may be unresponsive (connection timed out)"
+        );
+        assert_eq!(
+            format_turn_error("TIMED OUT"),
+            "error: request timed out — the local model server may be unresponsive (TIMED OUT)"
+        );
+    }
+
+    #[test]
+    fn format_turn_error_wraps_plain_errors_generically() {
+        assert_eq!(
+            format_turn_error("connection refused"),
+            "error: connection refused"
+        );
+    }
+
+    /// Throwaway component whose sole job is to hand its `use_state` handle
+    /// out to the test (states can't be constructed outside a component) —
+    /// same pattern as `src/tui/rebuild.rs`'s own tests.
+    #[derive(Clone, Default)]
+    struct GateHarnessProps {
+        slot: Arc<std::sync::Mutex<Option<ntui::State<bool>>>>,
+    }
+    impl PartialEq for GateHarnessProps {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+    #[component]
+    fn GateHarness(props: &GateHarnessProps, hooks: &mut Hooks) -> Element {
+        let gate = hooks.use_state(|| true);
+        *props.slot.lock().unwrap() = Some(gate.clone());
+        element! { View {} }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guard_blocks_the_focused_session_while_the_gate_is_armed() {
+        let slot: Arc<std::sync::Mutex<Option<ntui::State<bool>>>> = Default::default();
+        let _t = TestTerminal::new(
+            10,
+            1,
+            Element::component::<GateHarness>(GateHarnessProps { slot: slot.clone() }),
+        )
+        .unwrap();
+        let gate = slot.lock().unwrap().clone().unwrap();
+        let ev = plain_key(KeyCode::Char('1'));
+        assert!(
+            !session_may_handle_input(true, &Some(gate.clone()), &ev),
+            "an armed prefix gates even permission-prompt digits"
+        );
+        gate.set(false);
+        assert!(session_may_handle_input(true, &Some(gate), &ev));
+    }
+
+    /// Same slot-handout pattern as `GateHarness`, but for the
+    /// `State<Option<PermissionRequest>>` an `NtuiPermissionPrompter` binds
+    /// to (states can't be constructed outside a component).
+    #[derive(Clone, Default)]
+    struct PendingHarnessProps {
+        slot: Arc<
+            std::sync::Mutex<
+                Option<ntui::State<Option<crate::permissions::types::PermissionRequest>>>,
+            >,
+        >,
+    }
+    impl PartialEq for PendingHarnessProps {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+    #[component]
+    fn PendingHarness(props: &PendingHarnessProps, hooks: &mut Hooks) -> Element {
+        let pending =
+            hooks.use_state(|| Option::<crate::permissions::types::PermissionRequest>::None);
+        *props.slot.lock().unwrap() = Some(pending.clone());
+        element! { View {} }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn respond_returns_false_without_a_pending_prompt_and_resolves_a_pending_one() {
+        let slot: Arc<
+            std::sync::Mutex<
+                Option<ntui::State<Option<crate::permissions::types::PermissionRequest>>>,
+            >,
+        > = Default::default();
+        let _t = TestTerminal::new(
+            10,
+            1,
+            Element::component::<PendingHarness>(PendingHarnessProps { slot: slot.clone() }),
+        )
+        .unwrap();
+        let pending = slot.lock().unwrap().clone().unwrap();
+
+        let prompter = NtuiPermissionPrompter::new(pending);
+        let responder = prompter.responder_handle();
+
+        // A stray decision with nothing pending is a no-op returning false.
+        assert!(!NtuiPermissionPrompter::respond(
+            &responder,
+            PermissionDecision::Allow
+        ));
+
+        // With a prompt() future pending, respond resolves it with the given
+        // decision and returns true.
+        use crate::permissions::types::PermissionPrompter as _;
+        let request = crate::permissions::types::PermissionRequest {
+            description: "run shell command: rm x".into(),
+        };
+        let prompt = tokio::spawn(async move { prompter.prompt(&request).await });
+        // Let the spawned task poll the prompt future once — its first poll
+        // is what registers the responder slot.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if responder.lock().unwrap().is_some() {
+                break;
+            }
+        }
+        assert!(NtuiPermissionPrompter::respond(
+            &responder,
+            PermissionDecision::AllowAlwaysThisSession
+        ));
+        let decision = prompt.await.unwrap();
+        assert_eq!(decision, PermissionDecision::AllowAlwaysThisSession);
+
+        // And once that prompt has resolved, a further respond is a no-op again.
+        assert!(!NtuiPermissionPrompter::respond(
+            &responder,
+            PermissionDecision::Allow
+        ));
+    }
+
+    /// Streams a `write_file` tool call (to `path`) on its first invocation,
+    /// then a plain text reply once the tool result comes back — the
+    /// write-file call is what drives the `Ask`-tier gate into `prompt()`.
+    struct StreamingWriteFileModel {
+        path: String,
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+    impl daimon::model::Model for StreamingWriteFileModel {
+        async fn generate(&self, _request: &ChatRequest) -> daimon::Result<ChatResponse> {
+            unreachable!("prompt_stream only ever calls generate_stream_erased")
+        }
+        async fn generate_stream(&self, _request: &ChatRequest) -> daimon::Result<ResponseStream> {
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if count == 0 {
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::ToolCallStart {
+                        id: "call_1".into(),
+                        name: "write_file".into(),
+                    }),
+                    Ok(StreamEvent::ToolCallDelta {
+                        id: "call_1".into(),
+                        arguments_delta: serde_json::json!({
+                            "path": self.path.as_str(),
+                            "content": "permission round trip",
+                        })
+                        .to_string(),
+                    }),
+                    Ok(StreamEvent::ToolCallEnd {
+                        id: "call_1".into(),
+                    }),
+                    Ok(StreamEvent::Done),
+                ])))
+            } else {
+                Ok(Box::pin(futures::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta("wrote it".into())),
+                    Ok(StreamEvent::Done),
+                ])))
+            }
+        }
+    }
+
+    /// The interactive Ask tier end to end: a turn's `write_file` call gates
+    /// into `prompt()`, the pending card renders, pressing `1` pushes a
+    /// `PermissionResolved` transcript entry and resolves the gate's pending
+    /// future with Allow, so the tool actually executes and the turn
+    /// completes.
+    #[tokio::test(start_paused = true)]
+    async fn permission_prompt_digit_allows_the_gated_call_and_resolves_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.txt");
+
+        let mut props = test_props();
+        props.initial_tier = PermissionTier::Ask;
+        props.model = Some(Arc::new(StreamingWriteFileModel {
+            path: target.display().to_string(),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        }));
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "write the file").await;
+        let text = tick_until_contains(&mut t, "Permission requested: write file:").await;
+        assert!(text.contains("Permission requested: write file:"), "{text}");
+
+        t.send_key(KeyCode::Char('1')).unwrap();
+        let text = tick_until_contains(&mut t, "wrote it").await;
+        assert!(
+            text.contains("[allowed] write file:"),
+            "the PermissionResolved entry must record an Allow: {text}"
+        );
+        assert!(
+            text.contains("wrote it"),
+            "the turn must complete after the decision resolves: {text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "permission round trip",
+            "Allow must have let the gated write_file call execute"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_bearer_token_lands_in_keyring_and_reference_in_config() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let user_config_dir = props.user_config_dir.clone();
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "secure-tools").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "4").await; // HTTP
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "http://127.0.0.1:1").await; // nothing listens here
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Bearer token"),
+            "{}",
+            t.frame_text()
+        );
+        // While typing the bearer token, the input box must mask it rather
+        // than echoing the raw characters.
+        for c in "sekrit-tok".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.tick().await.unwrap();
+        let masked_frame = t.frame_text();
+        assert!(!masked_frame.contains("sekrit-tok"), "{}", masked_frame);
+        assert!(masked_frame.contains('•'), "{}", masked_frame);
+        t.send_key(KeyCode::Enter).unwrap();
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        // The token never appears anywhere on screen or on disk.
+        assert!(!t.frame_text().contains("sekrit-tok"), "{}", t.frame_text());
+
+        // Config saved with the literal reference (raw load — no resolution).
+        let saved = crate::config::mcp_servers::load_mcp_servers_raw(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        let crate::config::mcp_servers::McpTransportConfig::Http { headers, .. } =
+            &saved[0].transport
+        else {
+            panic!("expected Http transport");
+        };
+        assert_eq!(
+            headers["Authorization"],
+            "Bearer ${keyring:mcp-secure-tools}"
+        );
+
+        // Token in the (mock) keyring, name in the index.
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_secret("mcp-secure-tools").unwrap(),
+            Some("sekrit-tok".to_string())
+        );
+        assert_eq!(
+            crate::config::secrets::list_secret_names(&user_config_dir).unwrap(),
+            vec!["mcp-secure-tools".to_string()]
+        );
+    }
+
+    /// If storing the bearer token in the keyring/index fails, the wizard
+    /// must abort before ever writing `mcp.toml` — a config that references
+    /// a secret which was never actually stored is worse than no config at
+    /// all. Here the index write is forced to fail by pointing
+    /// `user_config_dir` at a path whose parent component is a regular file,
+    /// so `create_dir_all` (inside `write_index`) errors.
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_keyring_failure_aborts_save() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_file = dir.path().join("user-config-blocked");
+        std::fs::write(&blocked_file, b"not a directory").unwrap();
+        let bogus_user_config_dir = blocked_file.join("nested");
+
+        // Sanity-check the assumption this test relies on: creating a
+        // directory under a path whose parent is a regular file must error
+        // on this platform.
+        assert!(
+            crate::config::secrets::store_secret(
+                &bogus_user_config_dir,
+                "sanity-check-name",
+                "sanity-check-value",
+            )
+            .is_err(),
+            "expected store_secret to fail when user_config_dir's parent is a regular file"
+        );
+
+        let props = AppProps {
+            project_config_dir: dir.path().to_path_buf(),
+            user_config_dir: bogus_user_config_dir,
+            ..test_props()
+        };
+        // Wide viewport: the failure notice embeds a long temp-dir path with
+        // no natural word breaks, so at a normal 80-column width it gets
+        // clipped mid-word (its tail, including "was NOT saved", never
+        // renders at all rather than wrapping onto another line).
+        let mut t = TestTerminal::new(400, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "abort-server").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "4").await; // HTTP
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "http://127.0.0.1:1").await; // nothing listens here
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Bearer token"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "tok-abort-1").await;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        let frame = t.frame_text();
+        assert!(frame.contains("was NOT saved"), "{frame}");
+        assert!(!frame.contains("tok-abort-1"), "{frame}");
+
+        let saved = crate::config::mcp_servers::load_mcp_servers_raw(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    /// Same modifier guard as the connections wizard: Ctrl-combos are
+    /// commands, not input; SHIFT still types uppercase.
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_ignores_ctrl_modified_chars_but_allows_shift() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        for c in "ab".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.send_key_event(ntui::KeyEvent::new(
+            KeyCode::Char('c'),
+            ntui::hooks::input::KeyModifiers::CONTROL,
+        ))
+        .unwrap();
+        t.send_key_event(ntui::KeyEvent::new(
+            KeyCode::Char('D'),
+            ntui::hooks::input::KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        t.send_key(KeyCode::Enter).unwrap();
+        t.tick().await.unwrap();
+
+        type_and_submit(&mut t, "4").await; // HTTP
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "http://127.0.0.1:1").await; // nothing listens here
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await; // no token
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        let saved = crate::config::mcp_servers::load_mcp_servers_raw(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].name, "abD",
+            "Ctrl+C must not insert 'c'; Shift+D must insert 'D'"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_walks_through_the_http_branch_and_saves_the_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Server name:"),
+            "{}",
+            t.frame_text()
+        );
+
+        type_and_submit(&mut t, "remote-tools").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Choose a transport"),
+            "{}",
+            t.frame_text()
+        );
+
+        type_and_submit(&mut t, "4").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("HTTP URL:"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "http://127.0.0.1:1").await; // nothing listens here
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Bearer token"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "").await; // no token
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+        let text = t.frame_text();
+        assert!(text.contains("failed to connect now"), "{text}");
+
+        let saved = crate::config::mcp_servers::load_mcp_servers(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "remote-tools");
+    }
+
+    // Deliberately NOT `start_paused = true`, unlike its sibling tests: this
+    // branch spawns a real `npx` process. `npx` needs real wall-clock time
+    // (network round trip to the npm registry) to resolve the package name
+    // before it can fail, and a paused tokio clock fast-forwards `sleep()`s
+    // to zero real time, starving that real subprocess of the wall-clock
+    // progress it needs (verified by hand: under `start_paused` the connect
+    // task never got far enough to fail even after 20+ real seconds).
+    //
+    // Uses an unresolvable package name (unlike the plan's original example
+    // of a real, network-fetched package) so `npx` fails fast and
+    // deterministically via a 404 from the registry, rather than actually
+    // downloading and running a real MCP server — this test is about the
+    // wizard's step flow and save-to-disk result, not `connect_one`'s
+    // success path (already covered by `mcp/connect.rs`'s own tests).
+    #[tokio::test]
+    async fn mcp_add_wizard_npm_branch_collects_package_and_args_then_finalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "fs").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "1").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("npm package name:"),
+            "{}",
+            t.frame_text()
+        );
+
+        type_and_submit(&mut t, "definitely-not-a-real-npm-package-xyz-123").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Extra args"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "/tmp").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await; // blank line finishes the args loop
+        // Real wall-clock wait (see the `#[tokio::test]` doc comment above):
+        // poll until the save lands, up to a generous real-time budget.
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::mcp_servers::load_mcp_servers(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].transport,
+            crate::config::mcp_servers::McpTransportConfig::Stdio {
+                command: "npx".into(),
+                args: vec![
+                    "-y".into(),
+                    "definitely-not-a-real-npm-package-xyz-123".into(),
+                    "/tmp".into(),
+                ],
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_esc_cancels_mid_flow_without_saving_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "abandoned").await;
+        t.tick().await.unwrap();
+
+        t.send_key(KeyCode::Esc).unwrap();
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("cancelled /mcp add"),
+            "{}",
+            t.frame_text()
+        );
+
+        // Esc cancelled the wizard, so ordinary chat input works again —
+        // confirms pending_menu was actually reset to None, not left stuck.
+        type_and_submit(&mut t, "hello").await;
+        t.tick().await.unwrap();
+
+        let saved = crate::config::mcp_servers::load_mcp_servers(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(saved.is_empty());
+    }
+
+    // Deliberately NOT `start_paused = true` — same rationale as the npm
+    // branch test above (real `pipx` subprocess I/O needs real wall-clock
+    // time to progress).
+    #[tokio::test]
+    async fn mcp_add_wizard_pipx_branch_collects_package_and_args_then_finalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "pipx-tools").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "2").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("pipx package name:"),
+            "{}",
+            t.frame_text()
+        );
+
+        type_and_submit(&mut t, "some-pipx-pkg").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Extra args"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "").await; // no extra args, finish immediately
+        // Real wall-clock wait, same rationale as the npm branch test above.
+        let mut saved = Vec::new();
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::mcp_servers::load_mcp_servers(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].transport,
+            crate::config::mcp_servers::McpTransportConfig::Stdio {
+                command: "pipx".into(),
+                args: vec!["run".into(), "some-pipx-pkg".into()],
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_custom_stdio_branch_collects_command_and_args_then_finalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "custom-tools").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "3").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Command:"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "definitely-not-a-real-mcp-server-binary-xyz").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("Extra args"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "--stdio").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await; // blank line finishes the args loop
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        let saved = crate::config::mcp_servers::load_mcp_servers(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].transport,
+            crate::config::mcp_servers::McpTransportConfig::Stdio {
+                command: "definitely-not-a-real-mcp-server-binary-xyz".into(),
+                args: vec!["--stdio".into()],
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_sse_branch_finalizes_with_sse_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "sse-tools").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "5").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("SSE URL:"), "{}", t.frame_text());
+
+        type_and_submit(&mut t, "http://127.0.0.1:1").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Bearer token"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "").await; // no token
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        let text = t.frame_text();
+        assert!(text.contains("failed to connect now"), "{text}");
+
+        let saved = crate::config::mcp_servers::load_mcp_servers(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].transport,
+            crate::config::mcp_servers::McpTransportConfig::Sse {
+                url: "http://127.0.0.1:1".into(),
+                headers: std::collections::HashMap::new(),
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_wizard_websocket_branch_finalizes_with_websocket_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "ws-tools").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "6").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("WebSocket URL:"),
+            "{}",
+            t.frame_text()
+        );
+
+        type_and_submit(&mut t, "ws://127.0.0.1:1").await;
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+
+        let text = t.frame_text();
+        assert!(text.contains("failed to connect now"), "{text}");
+
+        let saved = crate::config::mcp_servers::load_mcp_servers(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].transport,
+            crate::config::mcp_servers::McpTransportConfig::Websocket {
+                url: "ws://127.0.0.1:1".into(),
+            }
+        );
+    }
+
+    // --- Bug 1 fixtures: verifies `agent.memory()` ends up correctly -------
+    // populated after a streamed turn. As of `daimon` 0.17.0+, `prompt_stream`
+    // persists these messages itself (see the doc comment on `run_turn`
+    // above); these tests just assert the end state.
     //
     // `run_turn` is exercised directly here (bypassing the full `App`
     // component and its slash-command/permission-gate machinery) via a
@@ -1367,7 +3245,9 @@ mod tests {
     }
     impl StreamingToolCallModel {
         fn new() -> Self {
-            Self { call_count: std::sync::atomic::AtomicUsize::new(0) }
+            Self {
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+            }
         }
     }
     impl daimon::model::Model for StreamingToolCallModel {
@@ -1375,15 +3255,22 @@ mod tests {
             unreachable!("prompt_stream only ever calls generate_stream_erased")
         }
         async fn generate_stream(&self, _request: &ChatRequest) -> daimon::Result<ResponseStream> {
-            let count = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if count == 0 {
                 Ok(Box::pin(futures::stream::iter(vec![
-                    Ok(StreamEvent::ToolCallStart { id: "call_1".into(), name: "adder".into() }),
+                    Ok(StreamEvent::ToolCallStart {
+                        id: "call_1".into(),
+                        name: "adder".into(),
+                    }),
                     Ok(StreamEvent::ToolCallDelta {
                         id: "call_1".into(),
                         arguments_delta: "{\"a\":2,\"b\":3}".into(),
                     }),
-                    Ok(StreamEvent::ToolCallEnd { id: "call_1".into() }),
+                    Ok(StreamEvent::ToolCallEnd {
+                        id: "call_1".into(),
+                    }),
                     Ok(StreamEvent::Done),
                 ])))
             } else {
@@ -1410,7 +3297,10 @@ mod tests {
                 "required": ["a", "b"],
             })
         }
-        async fn execute(&self, input: &serde_json::Value) -> daimon::Result<daimon::tool::ToolOutput> {
+        async fn execute(
+            &self,
+            input: &serde_json::Value,
+        ) -> daimon::Result<daimon::tool::ToolOutput> {
             let a = input["a"].as_i64().unwrap_or(0);
             let b = input["b"].as_i64().unwrap_or(0);
             Ok(daimon::tool::ToolOutput::text(format!("{}", a + b)))
@@ -1441,22 +3331,30 @@ mod tests {
 
     #[component]
     fn RunTurnHarness(props: &RunTurnHarnessProps, hooks: &mut Hooks) -> Element {
-        let transcript = hooks.use_state(Vec::<TranscriptEntry>::new);
+        let transcript = hooks.use_state(TranscriptEntries::new);
+        let stream_text = hooks.use_state(String::new);
         let usage_state = hooks.use_state(UsageSummary::default);
         let streaming = hooks.use_state(|| false);
         let pending_turn_input = hooks.use_state(|| Option::<String>::None);
         let session_path = hooks.use_state(std::path::PathBuf::new);
         let created_at = hooks.use_state(|| "2026-01-01T00:00:00Z".to_string());
+        let connection_name = hooks.use_state(|| "local-vllm".to_string());
+        let model_name = hooks.use_state(|| "qwen2.5-coder-32b".to_string());
+        let effort = hooks.use_state(|| None);
 
         hooks.use_effect((), {
             let slot = props.slot.clone();
             let mode = props.mode;
             let transcript = transcript.clone();
+            let stream_text = stream_text.clone();
             let usage_state = usage_state.clone();
             let streaming = streaming.clone();
             let pending_turn_input = pending_turn_input.clone();
             let session_path = session_path.clone();
             let created_at = created_at.clone();
+            let connection_name = connection_name.clone();
+            let model_name = model_name.clone();
+            let effort = effort.clone();
             move || {
                 let agent = Arc::new(match mode {
                     HarnessMode::ToolCall => Agent::builder()
@@ -1473,13 +3371,15 @@ mod tests {
                     agent,
                     "add 2 and 3".to_string(),
                     transcript,
+                    stream_text,
                     usage_state,
                     streaming,
                     pending_turn_input,
                     session_path,
                     created_at,
-                    "local-vllm".into(),
-                    "qwen2.5-coder-32b".into(),
+                    connection_name,
+                    model_name,
+                    effort,
                     PermissionTier::FullAuto,
                     std::env::temp_dir(),
                 ));
@@ -1489,17 +3389,19 @@ mod tests {
         element! { View {} }
     }
 
-    /// Bug 1, tool-calling case: before this fix, `run_turn` relied entirely
-    /// on `agent.prompt_stream`'s own (buggy) memory writes, which — per
-    /// direct inspection of `daimon` 0.16.0's `agent/runner.rs::prompt_stream`
-    /// — never call `add_message_erased` for anything but the user's own
-    /// message. This asserts `run_turn`'s reconstruction now persists both
-    /// the assistant-with-tool-calls message and the tool-result message
-    /// that `prompt_stream` silently dropped.
+    /// Bug 1, tool-calling case: as of `daimon` 0.17.0+, `Agent::prompt_stream`
+    /// persists both the assistant-with-tool-calls message and each
+    /// tool-result message into `agent.memory()` itself — this asserts that
+    /// end state directly (see the doc comment on `run_turn` above; on
+    /// `daimon` 0.16.0 this used to require a manual reconstruction that has
+    /// since been removed).
     #[tokio::test(start_paused = true)]
     async fn run_turn_persists_tool_call_and_result_messages_to_memory() {
         let slot = AgentSlot::default();
-        let props = RunTurnHarnessProps { slot: slot.clone(), mode: HarnessMode::ToolCall };
+        let props = RunTurnHarnessProps {
+            slot: slot.clone(),
+            mode: HarnessMode::ToolCall,
+        };
         let mut t = TestTerminal::new(10, 1, Element::component::<RunTurnHarness>(props)).unwrap();
 
         for _ in 0..30 {
@@ -1507,11 +3409,18 @@ mod tests {
             t.tick().await.unwrap();
         }
 
-        let agent = slot.0.lock().unwrap().clone().expect("harness should have built an agent");
+        let agent = slot
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("harness should have built an agent");
         let messages = agent.memory().get_messages_erased().await.unwrap();
 
         assert!(
-            messages.iter().any(|m| m.role == Role::User && m.content.as_deref() == Some("add 2 and 3")),
+            messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content.as_deref() == Some("add 2 and 3")),
             "missing user message: {messages:?}"
         );
         assert!(
@@ -1530,7 +3439,9 @@ mod tests {
             "missing tool-result message: {messages:?}"
         );
         assert!(
-            messages.iter().any(|m| m.role == Role::Assistant && m.content.as_deref() == Some("The sum is 5")),
+            messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content.as_deref() == Some("The sum is 5")),
             "missing final assistant text message: {messages:?}"
         );
         // Exactly these four: user, assistant-with-tool-calls, tool-result,
@@ -1539,13 +3450,16 @@ mod tests {
         assert_eq!(messages.len(), 4, "{messages:?}");
     }
 
-    /// Bug 1, plain-text case: proves the fix also covers turns with no tool
-    /// calls at all — before the fix, only the user's message ever made it
-    /// into memory; the assistant's reply was completely absent.
+    /// Bug 1, plain-text case: covers turns with no tool calls at all — both
+    /// the user's message and the assistant's plain-text reply should be in
+    /// `agent.memory()` after the stream ends.
     #[tokio::test(start_paused = true)]
     async fn run_turn_persists_plain_text_reply_to_memory() {
         let slot = AgentSlot::default();
-        let props = RunTurnHarnessProps { slot: slot.clone(), mode: HarnessMode::TextOnly };
+        let props = RunTurnHarnessProps {
+            slot: slot.clone(),
+            mode: HarnessMode::TextOnly,
+        };
         let mut t = TestTerminal::new(10, 1, Element::component::<RunTurnHarness>(props)).unwrap();
 
         for _ in 0..30 {
@@ -1553,15 +3467,24 @@ mod tests {
             t.tick().await.unwrap();
         }
 
-        let agent = slot.0.lock().unwrap().clone().expect("harness should have built an agent");
+        let agent = slot
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("harness should have built an agent");
         let messages = agent.memory().get_messages_erased().await.unwrap();
 
         assert!(
-            messages.iter().any(|m| m.role == Role::User && m.content.as_deref() == Some("add 2 and 3")),
+            messages
+                .iter()
+                .any(|m| m.role == Role::User && m.content.as_deref() == Some("add 2 and 3")),
             "missing user message: {messages:?}"
         );
         assert!(
-            messages.iter().any(|m| m.role == Role::Assistant && m.content.as_deref() == Some("Hello, world")),
+            messages
+                .iter()
+                .any(|m| m.role == Role::Assistant && m.content.as_deref() == Some("Hello, world")),
             "missing assistant reply message: {messages:?}"
         );
         assert_eq!(messages.len(), 2, "{messages:?}");
@@ -1586,64 +3509,59 @@ mod tests {
         // not a value this test controls directly — assert usage moved off
         // its zero default rather than pin an exact, implementation-detail
         // number.
-        assert!(!text.contains("0 in / 0 out"), "usage should have accumulated: {text}");
+        assert!(
+            !text.contains("0 in / 0 out"),
+            "usage should have accumulated: {text}"
+        );
         assert!(text.contains("ready"), "turn should have finished: {text}");
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn mascot_shows_on_a_fresh_session_and_disappears_after_the_first_turn() {
-        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
-        assert!(t.frame_text().contains("(@)"), "{}", t.frame_text());
-
-        type_and_submit(&mut t, "hi there").await;
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            t.tick().await.unwrap();
-        }
-
-        assert!(!t.frame_text().contains("(@)"), "{}", t.frame_text());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn mascot_is_never_persisted_to_the_session_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut props = test_props();
-        props.user_state_dir = dir.path().to_path_buf();
-        let session_path = dir.path().join("session.json");
-        props.session_path = session_path.clone();
-        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
-
-        type_and_submit(&mut t, "hi there").await;
-        for _ in 0..20 {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            t.tick().await.unwrap();
-        }
-
-        let saved = crate::session::store::load_session(&session_path).unwrap();
-        assert!(!saved.entries.iter().any(|e| matches!(e, TranscriptEntry::SystemNotice { text } if text.contains("(@)"))));
+    /// The dashboard's top row (brand + tier chip). Tier-chip assertions must
+    /// scope to this line: the padded chip text (` ask `) also occurs inside
+    /// `/permissions`' transcript listing ("1) ask"), so a whole-frame
+    /// `contains` would pass even if the chip never changed.
+    fn dashboard_chip_line(text: &str) -> String {
+        text.lines()
+            .find(|l| l.contains(concat!("local-code v", env!("CARGO_PKG_VERSION"))))
+            .unwrap_or_else(|| panic!("no dashboard brand line in frame: {text}"))
+            .to_string()
     }
 
     #[tokio::test(start_paused = true)]
     async fn ctrl_a_cycles_the_permission_tier_label() {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
-        assert!(t.frame_text().contains("[full-auto]"));
+        assert!(dashboard_chip_line(&t.frame_text()).contains(" full-auto "));
         t.send_key_event(ntui::KeyEvent::new(
             KeyCode::Char('a'),
             ntui::hooks::input::KeyModifiers::CONTROL,
         ))
         .unwrap();
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("[ask]"));
+        assert!(dashboard_chip_line(&t.frame_text()).contains(" ask "));
     }
 
     #[tokio::test(start_paused = true)]
     async fn help_command_lists_every_slash_command() {
-        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        // 30 rows: HELP_TEXT grew a workspace-keybindings section and no
+        // longer fits a 24-row frame alongside the dashboard.
+        let mut t = TestTerminal::new(80, 30, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/help").await;
         t.tick().await.unwrap();
         let text = t.frame_text();
-        for command in ["/model", "/connections", "/init", "/permissions", "/compact", "/resume", "/clear", "/help"] {
-            assert!(text.contains(command), "missing {command} in help text: {text}");
+        for command in [
+            "/model",
+            "/connections",
+            "/init",
+            "/permissions",
+            "/compact",
+            "/resume",
+            "/clear",
+            "/help",
+        ] {
+            assert!(
+                text.contains(command),
+                "missing {command} in help text: {text}"
+            );
         }
     }
 
@@ -1654,7 +3572,10 @@ mod tests {
         t.tick().await.unwrap();
         let text = t.frame_text();
         assert!(text.contains("not a recognized command"), "{text}");
-        assert!(!text.contains("Hello, world"), "must not have run a turn: {text}");
+        assert!(
+            !text.contains("Hello, world"),
+            "must not have run a turn: {text}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1715,16 +3636,76 @@ mod tests {
             .find(|p| p.file_name().unwrap() != "original.json")
             .expect("a new session file distinct from original.json should exist");
         let new_session = crate::session::store::load_session(new_path).unwrap();
-        assert!(new_session.entries.is_empty(), "new session should start with an empty transcript");
-        assert!(new_session.messages.is_empty(), "new session should start with empty message history");
+        assert!(
+            new_session.entries.is_empty(),
+            "new session should start with an empty transcript"
+        );
+        assert!(
+            new_session.messages.is_empty(),
+            "new session should start with empty message history"
+        );
 
         // original.json was written to by the "hi there" turn (which ran before
         // /clear), so it should still hold that turn's history — /clear must not
         // retroactively wipe it, only stop using it going forward.
-        let original = crate::session::store::load_session(&dir.path().join("original.json")).unwrap();
+        let original =
+            crate::session::store::load_session(&dir.path().join("original.json")).unwrap();
         assert!(
-            original.entries.iter().any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there")),
+            original
+                .entries
+                .iter()
+                .any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there")),
             "original.json should retain the pre-/clear turn history"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn clear_adopts_the_new_session_path_when_the_initial_save_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut props = test_props();
+        // `user_state_dir` is a regular FILE, so `create_fresh_session`'s
+        // create_dir_all(<file>/sessions/…) fails — the /clear save fails.
+        let state_file = dir.path().join("not-a-dir");
+        std::fs::write(&state_file, "x").unwrap();
+        props.user_state_dir = state_file;
+        props.session_path = dir.path().join("original.json");
+        crate::session::store::save_session(
+            &props.session_path,
+            &crate::session::types::SessionFile::new(
+                std::path::PathBuf::from("/proj"),
+                "local-vllm".into(),
+                "m".into(),
+                PermissionTier::FullAuto,
+                "2026-07-06T00:00:00Z".into(),
+            ),
+        )
+        .unwrap();
+
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+        type_and_submit(&mut t, "hi there").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+
+        type_and_submit(&mut t, "/clear").await;
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(
+            text.contains("failed to start a new session file"),
+            "the failure notice must be shown: {text}"
+        );
+        // Even with the failed write, the pane must adopt the NEW session
+        // path (under the unwritable state dir) — the user asked for a
+        // fresh session, so subsequent turns must not be stranded in
+        // original.json.
+        assert!(
+            !text.contains("original.json"),
+            "the old session path must be gone from the dashboard: {text}"
+        );
+        assert!(
+            text.contains("not-a-dir"),
+            "the newly allocated session path must be shown: {text}"
         );
     }
 
@@ -1756,7 +3737,12 @@ mod tests {
         }
 
         let saved = crate::session::store::load_session(&session_path).unwrap();
-        assert!(saved.entries.iter().any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there")));
+        assert!(
+            saved
+                .entries
+                .iter()
+                .any(|e| matches!(e, TranscriptEntry::UserTurn { text } if text == "hi there"))
+        );
         assert!(!saved.messages.is_empty());
         assert_eq!(saved.created_at, "2026-07-06T00:00:00Z");
     }
@@ -1818,7 +3804,87 @@ mod tests {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/model").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("no connections configured"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("no connections configured"),
+            "{}",
+            t.frame_text()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn effort_command_switches_model_updates_dashboard_and_persists_to_session() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        // The active connection must exist on disk: `/effort` re-resolves it
+        // by name (like `/resume`) before rebuilding the model against it.
+        crate::config::connection::save_connections(
+            dir.path(),
+            &[crate::config::connection::Connection {
+                name: "local-vllm".into(),
+                provider: crate::config::connection::ProviderKind::OpenAiCompatible,
+                base_url: "http://127.0.0.1:9/v1".into(),
+                default_model: "qwen2.5-coder-32b".into(),
+                models: vec![],
+                effort: None,
+            }],
+        )
+        .unwrap();
+        let mut props = test_props_with_config_dir(dir.path());
+        props.session_path = dir.path().join("session.json");
+        let session_path = props.session_path.clone();
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        // Direct form: `/effort high` rebuilds and the dashboard reflects it.
+        type_and_submit(&mut t, "/effort high").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        let text = t.frame_text();
+        assert!(text.contains("reasoning effort set to high"), "{text}");
+        assert!(
+            text.contains("local-vllm · qwen2.5-coder-32b · effort high"),
+            "{text}"
+        );
+
+        // A turn persists the override into the session file. (The switched
+        // model points at a dead port, so the turn itself errors — the save
+        // still happens, and that's all this asserts.)
+        type_and_submit(&mut t, "hi").await;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            t.tick().await.unwrap();
+        }
+        let saved = crate::session::store::load_session(&session_path).unwrap();
+        assert_eq!(
+            saved.effort,
+            Some(crate::agent::effort::ReasoningEffort::High)
+        );
+
+        // Menu form: bare `/effort` shows the current level, a digit selects.
+        type_and_submit(&mut t, "/effort").await;
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("Current reasoning effort: high"), "{text}");
+        assert!(text.contains("1) low"), "{text}");
+        t.send_key(KeyCode::Char('4')).unwrap();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        let text = t.frame_text();
+        assert!(text.contains("reasoning effort override cleared"), "{text}");
+        assert!(!text.contains("· effort"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn effort_command_rejects_unknown_levels() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/effort extreme").await;
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("/effort extreme"), "{text}");
+        assert!(!text.contains("reasoning effort set"), "{text}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1826,11 +3892,19 @@ mod tests {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/permissions").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("Current tier: full-auto"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("Current tier: full-auto"),
+            "{}",
+            t.frame_text()
+        );
 
         t.send_key(KeyCode::Char('1')).unwrap();
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("[ask]"), "{}", t.frame_text());
+        let chip_line = dashboard_chip_line(&t.frame_text());
+        assert!(
+            chip_line.contains(" ask "),
+            "tier chip should show ask after the digit press, got: {chip_line}"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1838,15 +3912,651 @@ mod tests {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/connections list").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("No connections configured"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("No connections configured"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn connections_add_explains_it_is_unsupported_in_tui() {
+    async fn mcp_list_reports_no_servers_configured() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/mcp list").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("No MCP servers configured"),
+            "{}",
+            t.frame_text()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mcp_add_starts_the_wizard_and_prompts_for_a_name() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/mcp add").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Server name:"),
+            "{}",
+            t.frame_text()
+        );
+    }
+
+    /// Records the tool names advertised on each request, so the `/mcp
+    /// remove` test below can assert which tools the *live* agent has
+    /// registered before vs after the removal.
+    struct ToolListRecordingModel {
+        snapshots: Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+    impl daimon::model::Model for ToolListRecordingModel {
+        async fn generate(&self, _request: &ChatRequest) -> daimon::Result<ChatResponse> {
+            Ok(ChatResponse {
+                message: Message::assistant("unused"),
+                stop_reason: StopReason::EndTurn,
+                usage: Some(Usage::default()),
+            })
+        }
+        async fn generate_stream(&self, request: &ChatRequest) -> daimon::Result<ResponseStream> {
+            self.snapshots
+                .lock()
+                .unwrap()
+                .push(request.tools.iter().map(|tool| tool.name.clone()).collect());
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::TextDelta("ok".into())),
+                Ok(StreamEvent::Done),
+            ])))
+        }
+    }
+
+    /// `/mcp remove` must do to the live tool set what `/mcp add` does in
+    /// reverse: edit mcp.toml AND prune the removed server's
+    /// `{server}__{tool}`-namespaced tools from the live agent (the same
+    /// prefix prune + `rebuild_agent_from_history` the add path uses), so
+    /// the removed server's tools stop being callable immediately instead of
+    /// lingering until restart. Unlike `/mcp add`'s success path this needs
+    /// no real server — removal never connects — so it lives here rather
+    /// than in `tests/mcp_add_live_reconnect.rs`.
+    #[tokio::test(start_paused = true)]
+    async fn mcp_remove_prunes_the_servers_tools_from_the_live_agent() {
+        use crate::mcp::tool::{NamespacedMcpTool, test_support::bridge_named};
+
+        let dir = tempfile::tempdir().unwrap();
+        crate::config::mcp_servers::save_mcp_servers(
+            dir.path(),
+            &[crate::config::mcp_servers::McpServerConfig {
+                name: "fixture".into(),
+                transport: crate::config::mcp_servers::McpTransportConfig::Stdio {
+                    command: "unused".into(),
+                    args: Vec::new(),
+                },
+            }],
+        )
+        .unwrap();
+
+        let snapshots: Arc<std::sync::Mutex<Vec<Vec<String>>>> = Default::default();
+        let mut props = test_props_with_config_dir(dir.path());
+        props.model = Some(Arc::new(ToolListRecordingModel {
+            snapshots: snapshots.clone(),
+        }));
+        props.mcp_tools = vec![
+            NamespacedMcpTool::new("fixture", bridge_named("echo")),
+            NamespacedMcpTool::new("other", bridge_named("keep")),
+        ];
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        // Baseline: the launch agent advertises both servers' tools.
+        type_and_submit(&mut t, "before").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        {
+            let snapshots = snapshots.lock().unwrap();
+            let baseline = snapshots.last().expect("the first turn ran");
+            assert!(
+                baseline.iter().any(|n| n == "fixture__echo"),
+                "{baseline:?}"
+            );
+            assert!(baseline.iter().any(|n| n == "other__keep"), "{baseline:?}");
+        }
+
+        type_and_submit(&mut t, "/mcp remove fixture").await;
+        let text = tick_until_contains(&mut t, "Removed MCP server 'fixture'.").await;
+        assert!(text.contains("Removed MCP server 'fixture'."), "{text}");
+
+        // mcp.toml no longer lists the server either.
+        let saved = crate::config::mcp_servers::load_mcp_servers_raw(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+
+        // Let the spawned prune+rebuild task finish (it does no real I/O),
+        // then run another turn: it must hit the rebuilt agent — the removed
+        // server's tool gone, the other server's tool preserved.
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        type_and_submit(&mut t, "after").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        let snapshots = snapshots.lock().unwrap();
+        let after = snapshots.last().expect("the post-remove turn ran");
+        assert!(
+            !after.iter().any(|n| n == "fixture__echo"),
+            "the removed server's tool must no longer be registered: {after:?}"
+        );
+        assert!(
+            after.iter().any(|n| n == "other__keep"),
+            "the other server's tool must survive the prefix prune: {after:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connections_add_starts_the_wizard_and_prompts_for_a_name() {
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
         type_and_submit(&mut t, "/connections add").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("local-code connections add"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("Connection name:"),
+            "{}",
+            t.frame_text()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connections_add_esc_cancels_mid_flow_without_saving_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "partial-name").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Choose a provider"),
+            "{}",
+            t.frame_text()
+        );
+
+        t.send_key(KeyCode::Esc).unwrap();
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("cancelled /connections add"),
+            "{}",
+            t.frame_text()
+        );
+
+        // Esc cancelled the wizard, so ordinary chat input works again —
+        // and nothing was written to connections.toml.
+        type_and_submit(&mut t, "hello after cancel").await;
+        t.tick().await.unwrap();
+        assert!(t.frame_text().contains("hello after cancel"));
+        let saved = crate::config::connection::load_connections(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(saved.is_empty());
+    }
+
+    /// NOT `start_paused`: the finalize task does a real HTTP round trip to
+    /// the wiremock catalog server, which needs wall-clock progress.
+    #[tokio::test]
+    async fn connections_add_openrouter_branch_saves_connection_with_fetched_models() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer sk-or-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"id": "anthropic/claude-sonnet-4"},
+                    {"id": "openai/gpt-4o"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "or").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Choose a provider"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "3").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("Base URL [blank ="),
+            "{}",
+            t.frame_text()
+        );
+        // Enter the mock catalog's URL explicitly (blank would aim the
+        // finalize task at the real openrouter.ai).
+        type_and_submit(&mut t, &server.uri()).await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("anthropic/claude-sonnet-4"),
+            "the openrouter model-slug hint: {}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "anthropic/claude-sonnet-4").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("OPENROUTER_API_KEY"),
+            "{}",
+            t.frame_text()
+        );
+        type_and_submit(&mut t, "sk-or-test").await;
+
+        // Poll until the finalize task (keyring write → catalog fetch →
+        // toml save) lands.
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        let conn = &saved[0];
+        assert_eq!(
+            conn.provider,
+            crate::config::connection::ProviderKind::OpenRouter
+        );
+        assert_eq!(conn.base_url, server.uri());
+        assert_eq!(conn.default_model, "anthropic/claude-sonnet-4");
+        assert_eq!(
+            conn.models,
+            vec!["anthropic/claude-sonnet-4", "openai/gpt-4o"],
+            "the fetched OpenRouter catalog must land in connection.models"
+        );
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_api_key("or").unwrap(),
+            Some("sk-or-test".to_string())
+        );
+        assert!(
+            t.frame_text().contains("saved connection 'or'"),
+            "{}",
+            t.frame_text()
+        );
+
+        // …and those models are what /model offers for the connection.
+        type_and_submit(&mut t, "/model").await;
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("or · anthropic/claude-sonnet-4"), "{text}");
+        assert!(text.contains("or · openai/gpt-4o"), "{text}");
+    }
+
+    /// Terminals deliver a paste as a burst of ordinary key events (ntui
+    /// doesn't enable bracketed paste, so there is no atomic paste event) —
+    /// a single-line paste must therefore land in the wizard buffer exactly
+    /// like typed input. Multi-line pastes are a known limitation: each
+    /// pasted newline arrives as an Enter and submits the current step.
+    #[tokio::test]
+    async fn connections_add_accepts_a_single_line_paste_into_the_api_key_step() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PASTED_KEY: &str = "sk-or-pasted-AbC_123-xyz";
+
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "m"}]
+            })))
+            .mount(&server)
+            .await;
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "or-paste").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "3").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, &server.uri()).await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "m").await;
+        t.tick().await.unwrap();
+
+        // Simulate the paste as the terminal delivers it: one Char key event
+        // per byte, no interleaved ticks.
+        for c in PASTED_KEY.chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.send_key(KeyCode::Enter).unwrap();
+
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_api_key("or-paste").unwrap(),
+            Some(PASTED_KEY.to_string()),
+            "the pasted key must land in the keyring intact"
+        );
+    }
+
+    /// Ctrl/Alt-modified keys are commands, not wizard input: they must not
+    /// land in the buffer (invisible corruption on the masked key step).
+    /// SHIFT must still type uppercase, though — names are case-sensitive.
+    #[tokio::test]
+    async fn connections_add_wizard_ignores_ctrl_modified_chars_but_allows_shift() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        for c in "ab".chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.send_key_event(ntui::KeyEvent::new(
+            KeyCode::Char('c'),
+            ntui::hooks::input::KeyModifiers::CONTROL,
+        ))
+        .unwrap();
+        t.send_key_event(ntui::KeyEvent::new(
+            KeyCode::Char('D'),
+            ntui::hooks::input::KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        t.send_key(KeyCode::Enter).unwrap();
+        t.tick().await.unwrap();
+
+        // Walk the rest of the ollama branch to the save.
+        type_and_submit(&mut t, "2").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "http://localhost:11434").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "m").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await;
+
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].name, "abD",
+            "Ctrl+C must not insert 'c'; Shift+D must insert 'D'"
+        );
+    }
+
+    /// `/connections remove` submitted while the wizard's finalize task is
+    /// still fetching the catalog must be refused (not silently no-op and
+    /// then have the save land anyway), and must work again once the save
+    /// completes.
+    #[tokio::test]
+    async fn connections_remove_during_in_flight_save_is_refused_then_works() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        let server = MockServer::start().await;
+        // Slow catalog fetch, so the remove below lands mid-save.
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(500))
+                    .set_body_json(serde_json::json!({"data": [{"id": "m"}]})),
+            )
+            .mount(&server)
+            .await;
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "or-race").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "3").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, &server.uri()).await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "m").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await; // blank key → no keyring write
+
+        // Let the spawned finalize task start (it marks the save in-flight
+        // before its first await), then try to remove mid-flight.
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        type_and_submit(&mut t, "/connections remove or-race").await;
+        t.tick().await.unwrap();
+        assert!(
+            t.frame_text().contains("still being saved"),
+            "{}",
+            t.frame_text()
+        );
+
+        // The save then lands intact…
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "or-race");
+
+        // …and once it's done, remove works again.
+        type_and_submit(&mut t, "/connections remove or-race").await;
+        t.tick().await.unwrap();
+        let saved = crate::config::connection::load_connections(
+            std::path::Path::new("/nonexistent"),
+            dir.path(),
+        )
+        .unwrap();
+        assert!(saved.is_empty(), "{saved:?}");
+    }
+
+    /// The wizard's API key must exist ONLY in the OS keyring: never in
+    /// connections.toml, never in the session file (wizard prompts/notices
+    /// are transcript entries, and every turn persists the transcript), and
+    /// never in any other file under the config/state dirs.
+    #[tokio::test]
+    async fn connections_add_api_key_lands_only_in_the_keyring_never_on_disk() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const KEY: &str = "sk-or-must-never-touch-disk-9f3b2c71";
+
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let mut props = test_props_with_config_dir(dir.path());
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        props.user_state_dir = state_dir.clone();
+        props.session_path = state_dir.join("session.json");
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "anthropic/claude-sonnet-4"}]
+            })))
+            .mount(&server)
+            .await;
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "or-keysafe").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "3").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, &server.uri()).await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "anthropic/claude-sonnet-4").await;
+        t.tick().await.unwrap();
+
+        // While typing the key, the input box must show only mask bullets.
+        for c in KEY.chars() {
+            t.send_key(KeyCode::Char(c)).unwrap();
+        }
+        t.tick().await.unwrap();
+        let frame = t.frame_text();
+        assert!(
+            !frame.contains(KEY),
+            "key visible on screen while typing: {frame}"
+        );
+        assert!(frame.contains("•"), "expected mask bullets: {frame}");
+        t.send_key(KeyCode::Enter).unwrap();
+
+        // Let the finalize task land, then run one ordinary turn so the
+        // transcript (with all the wizard notices) is persisted to the
+        // session file. Poll until BOTH the connection save and the session
+        // save have landed — the finalize task's real HTTP fetch can finish
+        // after the (instant) echo-model turn.
+        type_and_submit(&mut t, "an ordinary message").await;
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            let session_saved = state_dir.join("session.json").exists()
+                && std::fs::read_to_string(state_dir.join("session.json"))
+                    .map(|c| c.contains("an ordinary message"))
+                    .unwrap_or(false);
+            if !saved.is_empty() && session_saved {
+                break;
+            }
+        }
+
+        // The key is in the keyring…
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_api_key("or-keysafe").unwrap(),
+            Some(KEY.to_string())
+        );
+        // …the connection was saved…
+        assert_eq!(saved.len(), 1);
+        // …and no file anywhere under the config/state root contains it.
+        for entry in walkdir::WalkDir::new(dir.path())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_file())
+        {
+            let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            assert!(
+                !content.contains(KEY),
+                "the API key leaked into {}",
+                entry.path().display()
+            );
+        }
+    }
+
+    /// NOT `start_paused`: shares the finalize task's wall-clock needs with
+    /// the OpenRouter test above (no catalog fetch here, but the save still
+    /// runs on a spawned task).
+    #[tokio::test]
+    async fn connections_add_ollama_branch_saves_without_a_model_fetch() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        let props = test_props_with_config_dir(dir.path());
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        type_and_submit(&mut t, "/connections add").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "home").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "2").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "http://localhost:11434").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "llama3.1").await;
+        t.tick().await.unwrap();
+        type_and_submit(&mut t, "").await; // blank key: unkeyed local server
+
+        let mut saved = Vec::new();
+        for _ in 0..150 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            t.tick().await.unwrap();
+            saved = crate::config::connection::load_connections(
+                std::path::Path::new("/nonexistent"),
+                dir.path(),
+            )
+            .unwrap();
+            if !saved.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].provider,
+            crate::config::connection::ProviderKind::Ollama
+        );
+        assert!(saved[0].models.is_empty());
+        assert_eq!(
+            crate::config::secrets::SecretStore::get_api_key("home").unwrap(),
+            None
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1857,7 +4567,11 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             t.tick().await.unwrap();
         }
-        assert!(t.frame_text().contains("nothing to compact yet"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("nothing to compact yet"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1875,19 +4589,15 @@ mod tests {
         // test fragile regardless of whether compaction actually happened.
         let mut t = TestTerminal::new(80, 1000, Element::component::<App>(props.clone())).unwrap();
 
-        // `Agent::prompt_stream` (the streaming path `run_turn` uses) itself
-        // only ever calls `memory.add_message_erased` for the *user* half of
-        // each turn — confirmed by reading daimon 0.16.0's
-        // `agent/runner.rs::prompt_stream`, which has no `add_message_erased`
-        // call for the assistant's final text. `run_turn` now compensates for
-        // this (see its doc comment and the dedicated
-        // `run_turn_persists_plain_text_reply_to_memory` /
-        // `run_turn_persists_tool_call_and_result_messages_to_memory` tests
-        // above), reconstructing the missing assistant message itself — so
-        // each submitted turn here contributes 2 messages (user + assistant),
-        // not 1. This test still submits 25 turns (more than strictly needed
-        // now) so the resulting 50-message history clears `COMPACT_THRESHOLD`
-        // (20) with margin.
+        // `Agent::prompt_stream` (the streaming path `run_turn` uses) persists
+        // both the user message and the assistant's final text into
+        // `agent.memory()` itself as of daimon 0.17.0+ (see `run_turn`'s doc
+        // comment and the dedicated `run_turn_persists_plain_text_reply_to_memory`
+        // / `run_turn_persists_tool_call_and_result_messages_to_memory` tests
+        // above) — so each submitted turn here contributes 2 messages (user +
+        // assistant), not 1. This test still submits 25 turns (more than
+        // strictly needed now) so the resulting 50-message history clears
+        // `COMPACT_THRESHOLD` (20) with margin.
         for i in 0..25 {
             type_and_submit(&mut t, &format!("turn {i}")).await;
             for _ in 0..20 {
@@ -1901,7 +4611,25 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             t.tick().await.unwrap();
         }
-        assert!(t.frame_text().contains("compacted"), "{}", t.frame_text());
+        let text = t.frame_text();
+        assert!(text.contains("compacted"), "{text}");
+        // The last RETAIN_RECENT (10) display entries survive — with 2 entries
+        // per turn that is the last ~5 turns — while early turns are gone and
+        // the summary notice sits ABOVE the retained tail, not appended.
+        assert!(
+            text.contains("turn 24"),
+            "recent turns must survive: {text}"
+        );
+        assert!(
+            !text.contains("turn 0\n") && !text.contains("turn 1\n"),
+            "old turns must be compacted away: {text}"
+        );
+        let notice_at = text.find("compacted").expect("asserted above");
+        let recent_at = text.find("turn 24").expect("asserted above");
+        assert!(
+            notice_at < recent_at,
+            "the summary notice must precede the retained turns: {text}"
+        );
         let _ = props; // props is cloned above only to keep it available for potential future assertions
     }
 
@@ -1970,7 +4698,11 @@ models = ["test-model"]
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             t.tick().await.unwrap();
         }
-        assert!(t.frame_text().contains("switched to test-ollama"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("switched to test-ollama"),
+            "{}",
+            t.frame_text()
+        );
 
         type_and_submit(&mut t, "/compact").await;
         for _ in 0..60 {
@@ -1991,20 +4723,20 @@ models = ["test-model"]
         );
     }
 
-    /// Header staleness bug found in code review: `Header`'s
+    /// Dashboard staleness bug found in code review: `Dashboard`'s
     /// `connection_name`/`model_name` used to be read directly from
     /// `props.connection_name`/`props.model_name` — a one-time snapshot taken
     /// at mount and never refreshed — so after a successful `/model` switch
     /// (which does correctly rebuild the agent and post a "switched to X · Y"
     /// notice, per `model_switch_updates_the_model_compact_uses` above), the
-    /// Header kept silently showing the connection/model the process
+    /// Dashboard kept silently showing the connection/model the process
     /// launched with. This test proves the fix (`connection_display`/
     /// `model_display`, kept in lockstep with `current_model` at the same
-    /// `/model` digit-press site) by asserting the Header's rendered text
+    /// `/model` digit-press site) by asserting the Dashboard's rendered text
     /// shows the NEW connection/model name after switching, and no longer
     /// shows `test_props()`'s original ones.
     #[tokio::test(start_paused = true)]
-    async fn model_switch_updates_the_header_display() {
+    async fn model_switch_updates_the_dashboard_display() {
         let user_config_dir = tempfile::tempdir().unwrap();
         let project_config_dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2026,10 +4758,14 @@ models = ["test-model"]
 
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
 
-        // Sanity check: the Header starts out showing test_props()'s
+        // Sanity check: the Dashboard starts out showing test_props()'s
         // original connection/model, exactly as it did before this fix.
         assert!(t.frame_text().contains("local-vllm"), "{}", t.frame_text());
-        assert!(t.frame_text().contains("qwen2.5-coder-32b"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("qwen2.5-coder-32b"),
+            "{}",
+            t.frame_text()
+        );
 
         type_and_submit(&mut t, "/model").await;
         t.tick().await.unwrap();
@@ -2040,17 +4776,21 @@ models = ["test-model"]
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             t.tick().await.unwrap();
         }
-        assert!(t.frame_text().contains("switched to test-ollama"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("switched to test-ollama"),
+            "{}",
+            t.frame_text()
+        );
 
         let text = t.frame_text();
         assert!(
             text.contains("test-ollama") && text.contains("test-model"),
-            "expected the Header to now show the NEW connection/model after \
+            "expected the Dashboard to now show the NEW connection/model after \
              the switch: {text}"
         );
         assert!(
             !text.contains("local-vllm") && !text.contains("qwen2.5-coder-32b"),
-            "the Header still shows the ORIGINAL (pre-switch) connection/model \
+            "the Dashboard still shows the ORIGINAL (pre-switch) connection/model \
              — this is the staleness bug the fix addresses: {text}"
         );
     }
@@ -2078,7 +4818,11 @@ models = ["test-model"]
             t.tick().await.unwrap();
         }
 
-        assert!(t.frame_text().contains("wrote AGENTS.md"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("wrote AGENTS.md"),
+            "{}",
+            t.frame_text()
+        );
         assert!(dir.path().join("AGENTS.md").exists());
     }
 
@@ -2090,7 +4834,11 @@ models = ["test-model"]
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
         type_and_submit(&mut t, "/resume").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("no previous sessions found"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("no previous sessions found"),
+            "{}",
+            t.frame_text()
+        );
     }
 
     // `/resume`'s listing reads `list_sessions(&ctx.user_state_dir,
@@ -2113,8 +4861,11 @@ models = ["test-model"]
             PermissionTier::FullAuto,
             "2026-07-06T09:00:00Z".into(),
         );
-        session.entries.push(TranscriptEntry::UserTurn { text: "earlier turn".into() });
-        let path = crate::session::paths::new_session_path(dir.path(), &project_root, chrono::Utc::now());
+        session.entries.push(TranscriptEntry::UserTurn {
+            text: "earlier turn".into(),
+        });
+        let path =
+            crate::session::paths::new_session_path(dir.path(), &project_root, chrono::Utc::now());
         crate::session::store::save_session(&path, &session).unwrap();
 
         let mut props = test_props();
@@ -2123,28 +4874,49 @@ models = ["test-model"]
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
         type_and_submit(&mut t, "/resume").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("some-connection"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("some-connection"),
+            "{}",
+            t.frame_text()
+        );
 
         // Resuming when the session's connection is no longer configured
         // (test_props() sets up no real connections.toml) surfaces the
         // clear "connection no longer exists" notice rather than panicking —
         // this exercises that failure path explicitly, since it's the
-        // reachable one without a full connections.toml fixture.
+        // reachable one without a full connections.toml fixture. The notice
+        // is produced by a spawned task that crosses the blocking pool, so
+        // poll rather than assuming one tick is enough.
         t.send_key(KeyCode::Char('1')).unwrap();
-        t.tick().await.unwrap();
-        assert!(t.frame_text().contains("no longer exists"), "{}", t.frame_text());
+        let text = tick_until_contains(&mut t, "no longer exists").await;
+        assert!(text.contains("no longer exists"), "{text}");
+    }
+
+    /// Ticks the terminal until `needle` appears, bounded by a real-time
+    /// deadline — for notices produced by spawned tasks that cross the
+    /// blocking pool, whose completion isn't tied to the paused clock.
+    async fn tick_until_contains(t: &mut TestTerminal, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let text = t.frame_text();
+            if text.contains(needle) || std::time::Instant::now() > deadline {
+                return text;
+            }
+            tokio::task::yield_now().await;
+            t.tick().await.unwrap();
+        }
     }
 
     // Closes the coverage gap the test above deliberately leaves open: that
     // test only exercises listing plus the "connection no longer exists"
     // failure branch, since `test_props()` wires up no real connections.toml.
-    // This test follows `model_switch_updates_the_header_display`'s fixture
+    // This test follows `model_switch_updates_the_dashboard_display`'s fixture
     // pattern (a real `connections.toml` under tempdir-backed
     // `user_config_dir`/`project_config_dir`) so the *success* branch of
     // `/resume` — rebuilding the agent, restoring the transcript, and
-    // refreshing the Header — is exercised too.
+    // refreshing the Dashboard — is exercised too.
     #[tokio::test(start_paused = true)]
-    async fn resume_command_success_path_restores_transcript_and_updates_header() {
+    async fn resume_command_success_path_restores_transcript_and_updates_dashboard() {
         let state_dir = tempfile::tempdir().unwrap();
         let user_config_dir = tempfile::tempdir().unwrap();
         let project_config_dir = tempfile::tempdir().unwrap();
@@ -2169,8 +4941,14 @@ models = ["irrelevant-default", "resumed-model"]
             PermissionTier::Ask,
             "2026-07-06T09:00:00Z".into(),
         );
-        session.entries.push(TranscriptEntry::UserTurn { text: "earlier turn".into() });
-        let path = crate::session::paths::new_session_path(state_dir.path(), &project_root, chrono::Utc::now());
+        session.entries.push(TranscriptEntry::UserTurn {
+            text: "earlier turn".into(),
+        });
+        let path = crate::session::paths::new_session_path(
+            state_dir.path(),
+            &project_root,
+            chrono::Utc::now(),
+        );
         crate::session::store::save_session(&path, &session).unwrap();
 
         let mut props = test_props();
@@ -2180,14 +4958,18 @@ models = ["irrelevant-default", "resumed-model"]
         props.project_root = project_root;
         let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
 
-        // Sanity check: the Header starts out showing test_props()'s
+        // Sanity check: the Dashboard starts out showing test_props()'s
         // original connection/model, exactly as it did before the fix this
-        // guards (Header staleness after in-TUI /model and /resume switches).
+        // guards (Dashboard staleness after in-TUI /model and /resume switches).
         assert!(t.frame_text().contains("local-vllm"), "{}", t.frame_text());
 
         type_and_submit(&mut t, "/resume").await;
         t.tick().await.unwrap();
-        assert!(t.frame_text().contains("resumed-connection"), "{}", t.frame_text());
+        assert!(
+            t.frame_text().contains("resumed-connection"),
+            "{}",
+            t.frame_text()
+        );
 
         t.send_key(KeyCode::Char('1')).unwrap();
         for _ in 0..20 {
@@ -2199,6 +4981,9 @@ models = ["irrelevant-default", "resumed-model"]
         assert!(!text.contains("no longer exists"), "{text}");
         assert!(!text.contains("failed to resume"), "{text}");
         assert!(text.contains("earlier turn"), "{text}");
-        assert!(text.contains("resumed-connection") && text.contains("resumed-model"), "{text}");
+        assert!(
+            text.contains("resumed-connection") && text.contains("resumed-model"),
+            "{text}"
+        );
     }
 }

@@ -21,6 +21,7 @@ async fn summarization_call_returns_nonempty_text() {
         base_url,
         default_model: model_id,
         models: vec![],
+        effort: None,
     };
     let model = build_model(&connection, None).expect("model construction should not fail");
 
@@ -34,6 +35,9 @@ async fn summarization_call_returns_nonempty_text() {
         max_tokens: Some(128),
     };
 
-    let response = model.generate_erased(&request).await.expect("summarization call should succeed");
+    let response = model
+        .generate_erased(&request)
+        .await
+        .expect("summarization call should succeed");
     assert!(!response.text().is_empty());
 }

@@ -5,13 +5,33 @@
 use daimon::tool::ToolOutput;
 use daimon::tool_fn;
 
+/// `read_file` refuses to read files larger than this — an unbounded read
+/// would balloon the transcript (every read result is retained and
+/// re-persisted to the session file on every subsequent turn) and risks a
+/// large-file OOM. 2 MiB comfortably covers real source files while bounding
+/// the worst case.
+const MAX_READ_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Reads the full contents of a file at `path` (absolute or relative to the
-/// process's current working directory).
+/// process's current working directory). Refuses files larger than
+/// [`MAX_READ_FILE_BYTES`] — use `grep`/`bash` to inspect a large file instead
+/// of reading it whole.
 #[tool_fn]
 async fn read_file(
     /// Path to the file to read.
     path: String,
 ) -> daimon::Result<ToolOutput> {
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.len() > MAX_READ_FILE_BYTES => {
+            return Ok(ToolOutput::error(format!(
+                "{path} is {} bytes, which exceeds the {MAX_READ_FILE_BYTES}-byte read_file limit; \
+                 use grep to search it or bash (e.g. head/tail) to inspect it in parts instead",
+                meta.len()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) => return Ok(ToolOutput::error(format!("failed to read {path}: {e}"))),
+    }
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => Ok(ToolOutput::text(content)),
         Err(e) => Ok(ToolOutput::error(format!("failed to read {path}: {e}"))),
@@ -29,14 +49,13 @@ async fn write_file(
     content: String,
 ) -> daimon::Result<ToolOutput> {
     let path_ref = std::path::Path::new(&path);
-    if let Some(parent) = path_ref.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                return Ok(ToolOutput::error(format!(
-                    "failed to create parent directories for {path}: {e}"
-                )));
-            }
-        }
+    if let Some(parent) = path_ref.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return Ok(ToolOutput::error(format!(
+            "failed to create parent directories for {path}: {e}"
+        )));
     }
     match tokio::fs::write(&path, content).await {
         Ok(()) => Ok(ToolOutput::text(format!("wrote {path}"))),
@@ -64,9 +83,7 @@ async fn edit_file(
 
     let occurrences = content.matches(find.as_str()).count();
     if occurrences == 0 {
-        return Ok(ToolOutput::error(format!(
-            "find text not found in {path}"
-        )));
+        return Ok(ToolOutput::error(format!("find text not found in {path}")));
     }
     if occurrences > 1 {
         return Ok(ToolOutput::error(format!(
@@ -127,34 +144,55 @@ async fn grep(
         Err(e) => return Ok(ToolOutput::error(format!("invalid regex '{pattern}': {e}"))),
     };
 
-    let mut matches = Vec::new();
-    for entry in walkdir::WalkDir::new(&root)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        for (line_no, line) in content.lines().enumerate() {
-            if regex.is_match(line) {
-                matches.push(format!(
-                    "{}:{}: {}",
-                    entry.path().display(),
-                    line_no + 1,
-                    line
-                ));
-                if matches.len() >= 200 {
-                    break;
+    // The walk + reads are synchronous filesystem work; run them on the
+    // blocking pool so a large tree doesn't stall the single-threaded tokio
+    // runtime (which would freeze rendering and every other pane's stream
+    // for the duration of the search).
+    let walked = tokio::task::spawn_blocking(move || {
+        let mut matches = Vec::new();
+        for entry in walkdir::WalkDir::new(&root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            // Same cap `read_file` enforces: reading a multi-GB file whole
+            // just to line-scan it is the OOM hazard that limit exists for.
+            if entry
+                .metadata()
+                .map(|m| m.len() > MAX_READ_FILE_BYTES)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            for (line_no, line) in content.lines().enumerate() {
+                if regex.is_match(line) {
+                    matches.push(format!(
+                        "{}:{}: {}",
+                        entry.path().display(),
+                        line_no + 1,
+                        line
+                    ));
+                    if matches.len() >= 200 {
+                        break;
+                    }
                 }
             }
+            if matches.len() >= 200 {
+                break;
+            }
         }
-        if matches.len() >= 200 {
-            break;
-        }
-    }
+        matches
+    })
+    .await;
+    let matches = match walked {
+        Ok(matches) => matches,
+        Err(e) => return Ok(ToolOutput::error(format!("grep failed: {e}"))),
+    };
 
     if matches.is_empty() {
         Ok(ToolOutput::text("no matches found"))
@@ -177,18 +215,30 @@ async fn glob(
 
     let paths = match glob::glob(&full_pattern) {
         Ok(p) => p,
-        Err(e) => return Ok(ToolOutput::error(format!("invalid glob '{full_pattern}': {e}"))),
+        Err(e) => {
+            return Ok(ToolOutput::error(format!(
+                "invalid glob '{full_pattern}': {e}"
+            )));
+        }
     };
 
-    let mut matches = Vec::new();
-    for entry in paths {
-        if let Ok(p) = entry {
+    // Iterating the glob walks the filesystem; blocking pool for the same
+    // single-threaded-runtime reason as `grep` above.
+    let walked = tokio::task::spawn_blocking(move || {
+        let mut matches = Vec::new();
+        for p in paths.flatten() {
             matches.push(p.display().to_string());
             if matches.len() >= 200 {
                 break;
             }
         }
-    }
+        matches
+    })
+    .await;
+    let matches = match walked {
+        Ok(matches) => matches,
+        Err(e) => return Ok(ToolOutput::error(format!("glob failed: {e}"))),
+    };
 
     if matches.is_empty() {
         Ok(ToolOutput::text("no matches found"))
@@ -216,6 +266,21 @@ mod builtin_tool_tests {
             .unwrap();
         assert!(!output.is_error);
         assert_eq!(output.content, "hello world");
+    }
+
+    #[tokio::test]
+    async fn read_file_refuses_a_file_larger_than_the_cap() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("big.txt");
+        std::fs::write(&file_path, vec![b'x'; (MAX_READ_FILE_BYTES + 1) as usize]).unwrap();
+
+        let tool = ReadFile;
+        let output = tool
+            .execute(&serde_json::json!({"path": file_path.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("exceeds"));
     }
 
     #[tokio::test]
@@ -321,7 +386,10 @@ mod builtin_tool_tests {
     #[tokio::test]
     async fn bash_reports_nonzero_exit_as_error_output() {
         let tool = Bash;
-        let output = tool.execute(&serde_json::json!({"command": "exit 3"})).await.unwrap();
+        let output = tool
+            .execute(&serde_json::json!({"command": "exit 3"}))
+            .await
+            .unwrap();
         assert!(output.is_error);
         assert!(output.content.contains("exit code: 3"));
     }

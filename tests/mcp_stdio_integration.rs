@@ -1,9 +1,11 @@
-//! Exercises the real stdio MCP transport end to end: spawns
-//! `mock_mcp_stdio_server` (built as part of this crate, see `Cargo.toml`'s
-//! `[[bin]]` target) as a real child process, connects to it, discovers its
-//! one `echo` tool, and calls it — proving `daimon::mcp::StdioTransport` +
-//! `McpClient` + this plan's `connect_one`/`NamespacedMcpTool` work together
-//! against a real (if tiny) MCP server, not just an in-process mock.
+//! Exercises the real stdio MCP transport end to end: spawns the
+//! `local-code` binary itself in its hidden `__mcp_fixture_server` mode
+//! (see `main.rs` and `local_code::mcp::fixture_server`) as a real child
+//! process, connects to it, discovers its one `echo` tool, and calls it —
+//! proving `daimon::mcp::StdioTransport` + `McpClient` + this plan's
+//! `connect_one`/`NamespacedMcpTool` work together against a real (if tiny)
+//! MCP server, not just an in-process mock. This reuses the product's only
+//! `[[bin]]` target rather than shipping a second one just for tests.
 
 use local_code::config::mcp_servers::{McpServerConfig, McpTransportConfig};
 use local_code::mcp::connect::{connect_all, connect_one};
@@ -12,8 +14,8 @@ fn fixture_server_config(name: &str) -> McpServerConfig {
     McpServerConfig {
         name: name.to_string(),
         transport: McpTransportConfig::Stdio {
-            command: env!("CARGO_BIN_EXE_mock_mcp_stdio_server").to_string(),
-            args: vec![],
+            command: env!("CARGO_BIN_EXE_local-code").to_string(),
+            args: vec!["__mcp_fixture_server".to_string()],
         },
     }
 }
@@ -21,13 +23,12 @@ fn fixture_server_config(name: &str) -> McpServerConfig {
 #[tokio::test]
 async fn discovers_and_namespaces_the_fixture_servers_echo_tool() {
     let config = fixture_server_config("fixture");
-    let tools = connect_one(&config).await.expect("fixture server should connect");
+    let tools = connect_one(&config)
+        .await
+        .expect("fixture server should connect");
 
     assert_eq!(tools.len(), 1);
-    assert_eq!(
-        daimon::tool::Tool::name(&tools[0]),
-        "fixture__echo"
-    );
+    assert_eq!(daimon::tool::Tool::name(&tools[0]), "fixture__echo");
 }
 
 #[tokio::test]
@@ -35,7 +36,9 @@ async fn calls_the_fixture_servers_echo_tool_and_gets_real_output_back() {
     use daimon::tool::Tool;
 
     let config = fixture_server_config("fixture2");
-    let tools = connect_one(&config).await.expect("fixture server should connect");
+    let tools = connect_one(&config)
+        .await
+        .expect("fixture server should connect");
     let echo_tool = &tools[0];
 
     let output = echo_tool
@@ -52,7 +55,9 @@ async fn fixture_servers_tool_level_error_surfaces_as_error_output() {
     use daimon::tool::Tool;
 
     let config = fixture_server_config("fixture3");
-    let tools = connect_one(&config).await.expect("fixture server should connect");
+    let tools = connect_one(&config)
+        .await
+        .expect("fixture server should connect");
     let echo_tool = &tools[0];
 
     let output = echo_tool

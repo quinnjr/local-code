@@ -1,7 +1,4 @@
-// src/tui/components/input_box.rs
-
 use ntui::props::FlexDirection;
-use ntui::style::{BorderStyle, Color};
 use ntui::{component, element};
 
 #[derive(Clone, PartialEq, Default)]
@@ -14,19 +11,21 @@ pub struct InputBoxProps {
 
 /// Bottom, full-width input box. Purely presentational: `App` owns the actual
 /// buffer `State` and all key handling (backspace/char/enter), and passes the
-/// current buffer text down each render.
+/// current buffer text down each render. The border doubles as a focus cue —
+/// accent while accepting input, muted while a turn is streaming.
 #[component]
-pub fn InputBox(props: &InputBoxProps, _hooks: &mut ntui::Hooks) -> ntui::Element {
-    let prompt_color = if props.disabled {
-        Color::DarkGrey
+pub fn InputBox(props: &InputBoxProps, hooks: &mut ntui::Hooks) -> ntui::Element {
+    let theme = hooks.use_theme();
+    let (border_color, prompt_color, text_color) = if props.disabled {
+        (theme.border, theme.muted, theme.muted)
     } else {
-        Color::White
+        (theme.accent, theme.accent, theme.foreground)
     };
     let cursor = if props.disabled { "" } else { "▏" };
     element! {
-        View(flex_direction: FlexDirection::Row, border_style: BorderStyle::Round, border_color: Color::DarkGrey, padding: 0) {
-            Text(content: "> ", color: Color::Cyan)
-            Text(content: format!("{}{}", props.buffer, cursor), color: prompt_color)
+        View(flex_direction: FlexDirection::Row, border_style: theme.border_style, border_color: border_color, padding: 0) {
+            Text(content: "❯ ", color: prompt_color)
+            Text(content: format!("{}{}", props.buffer, cursor), color: text_color)
         }
     }
 }
@@ -34,8 +33,8 @@ pub fn InputBox(props: &InputBoxProps, _hooks: &mut ntui::Hooks) -> ntui::Elemen
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ntui::testing::TestTerminal;
     use ntui::Element;
+    use ntui::testing::TestTerminal;
 
     #[tokio::test]
     async fn renders_current_buffer_with_cursor_when_enabled() {
@@ -44,7 +43,9 @@ mod tests {
             disabled: false,
         };
         let t = TestTerminal::new(40, 3, Element::component::<InputBox>(props)).unwrap();
-        assert!(t.frame_text().contains("fix the bug"));
+        let text = t.frame_text();
+        assert!(text.contains("fix the bug"));
+        assert!(text.contains('❯'));
     }
 
     #[tokio::test]

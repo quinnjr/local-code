@@ -1,0 +1,240 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+`local-code` is a Claude-Code-style terminal coding agent that talks primarily to local and
+local-network OpenAI-compatible LLM servers (llama.cpp, vLLM, LM Studio, Ollama) — no cloud
+calls, no API keys required for local inference — with optional hosted access to any model
+through OpenRouter. It's a Rust binary (`local-code`) built on top of two sibling
+crates: `ntui` (a custom Ink-style TUI framework, flexbox layout via `taffy`) and `daimon` (the
+agent framework providing `Agent`/`AgentBuilder`, model providers, MCP transports, tool-calling).
+Both are external dependencies pulled from crates.io, not part of this repo. OpenRouter
+connections are served by daimon's own `daimon-provider-openrouter` (the `openrouter`
+cargo feature); there is no in-repo provider code.
+
+## Workflow
+
+This repo follows git-flow branching. `main` tracks production releases only; `develop` is the
+integration branch. Do all work on a `feature/<name>` branch cut from `develop` — never commit
+directly to `develop` or `main`. Land work via a PR from the feature branch into `develop`, not a
+direct push. `release/<version>` branches cut from `develop` stage a release before it merges to
+both `main` and back into `develop`; `hotfix/<name>` branches cut from `main` do the same for
+urgent production fixes. If asked to start new work while sitting on `develop` or `main`, create
+and switch to the appropriate branch first rather than committing in place.
+
+Before merging a branch/PR (whether via subagent-driven-development, finishing-a-development-branch,
+or any other workflow), stop and give the user the chance to run `/simplify`, `/code-review`,
+`/optimize`, or similar audit commands themselves first — even if the branch already went through
+its own review/fix loop. Present the branch as ready (tests green, reviews passed) and ask whether
+to proceed with push/PR/merge, or wait while the user runs additional audits. Don't merge
+automatically just because internal review passed.
+
+## Commands
+
+```bash
+cargo build                          # debug build
+cargo build --release                # release build
+cargo test                           # full test suite (unit + integration, excludes live/ignored tests)
+cargo test <module>::<test_name>     # single test, e.g. cargo test skills::spec::tests::gl_prefix
+cargo test --lib skills::install     # all tests in one module
+cargo test --test mcp_stdio_integration  # one integration test file under tests/
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+`.github/workflows/ci.yml` runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+and `cargo test` as three parallel jobs on push/PR to `main`/`develop`. Run all three locally
+before considering a change done — CI is the same three commands, not a superset.
+
+### Live/ignored tests
+
+`tests/live_*.rs` (`live_ollama`, `live_openai_compatible`, `live_compact`, `live_init`) require a
+real running LLM server and are `#[ignore]`d by default. Run explicitly when needed:
+
+```bash
+cargo test --test live_ollama -- --ignored --nocapture
+```
+
+## Architecture
+
+### Module map (`src/`)
+
+- `cli/` — clap `Cli`/`Command` definitions and the non-interactive subcommand handlers
+  (`connections`, `mcp`, `memory`, `skills`, `marketplace`, `plugin`, `secret`). `cli::run` is the top-level dispatcher called from
+  `main.rs`: `-p/--prompt` routes to headless mode, a `Command` routes to a CLI subcommand handler,
+  and no args/command launches the TUI.
+- `tui/` — the interactive terminal UI, built as an `ntui` component tree.
+  - `tui::run_tui` resolves the connection/model/settings/skills/MCP tools and hands off to
+    `ntui::render(element!(App(...)))`.
+  - `app.rs` is the single largest file in the crate (the root `App` component: turn loop, slash
+    command dispatch, permission prompting, session persistence hooks).
+  - `rebuild.rs` centralizes agent-rebuild logic (`/model`, `/resume`, `/mcp add` reconnect) so
+    every rebuild site constructs an agent the same way.
+  - `mcp_wizard.rs` is a pure state machine for the `/mcp add` in-TUI stepper (transport selection,
+    prompts, `Advance` enum) — kept side-effect-free and unit-testable separately from `app.rs`'s
+    wiring of it. `connections_wizard.rs` is the same pattern for `/connections add`
+    (name → provider → base URL → default model → API key); its `Finalize` task stores the key
+    in the keyring, fetches OpenRouter's model catalog into `Connection.models` for the `/model`
+    picker (OpenRouter connections only), and saves to the project-level connections.toml.
+    Connection API keys live ONLY in the OS keyring — never in connections.toml, session files,
+    or any other on-disk state (guarded by
+    `connections_add_api_key_lands_only_in_the_keyring_never_on_disk`). Note the CLI
+    `connections add` does NOT fetch the OpenRouter catalog (it's synchronous — no runtime
+    context for the HTTP call), so CLI-created OpenRouter connections keep `models = []`
+    until filled by hand or re-added in-TUI.
+  - `theme.rs` — the app-wide `ntui::widgets::Theme` (`local_code_theme()`), the brand
+    gradient endpoints (`BRAND_FROM`/`BRAND_TO`) and semantic consts (`TOOL_ACCENT`,
+    `WARN`/`ON_WARN`), and the shared `chip()` helper. Provided once via `ContextProvider` at
+    the `Workspace` root; components with `Hooks` read it via `hooks.use_theme()` and thread a
+    `&Theme` parameter into any plain render functions they call (e.g.
+    `transcript::render_entry`) so there is exactly one theme-resolution path — don't call
+    `local_code_theme()` from render code below the provider, and don't hardcode `Color::*`
+    values in TUI components; take them from the theme (or the semantic consts).
+  - `workspace/` — tmux-style tabbing: `Workspace` (the actual root component `run_tui` mounts;
+    `App` is mounted once per pane under it) keeps every window's sessions mounted at all times
+    (inactive windows collapse to a zero-height clipped `View` — never unmount, or their live
+    state/streams would be lost), `workspace/state.rs` is the pure `C-b`-prefix state machine
+    (same pattern as `mcp_wizard.rs`), `workspace/tab_bar.rs` the status line. Panes are a flat
+    list per window (single split axis) because ntui keys are sibling-scoped — see TODO.md.
+- `agent/` — wraps `daimon::agent::{Agent, AgentBuilder}` for this project's needs.
+  - `build.rs::register_all_tools` is the **one and only tool-registration function** in the
+    project — every built-in tool and every MCP-discovered tool passes through it, each wrapped in
+    `GatedTool` (see `permissions/`), so permission enforcement is identical across all tool
+    sources and both `Agent::prompt`/`Agent::prompt_stream`. Both TUI and headless mode call
+    through this same function; don't add a parallel registration path.
+  - `tools.rs` — the six `#[tool_fn]` built-in tools (`ReadFile`, `WriteFile`, `EditFile`,
+    `Bash`, `Grep`, `Glob`). The remaining built-ins are struct impls elsewhere: `SkillTool`
+    (`agent/skill_tool.rs`, holds the discovered skill list) and `ServeArtifacts`
+    (`artifacts/tool.rs`, stateless — server state lives in `artifacts::server`'s process-wide
+    registry).
+  - `effort.rs` — `ReasoningEffort` (low/medium/high) and `supports_effort`. Effort has two
+    layers: a per-connection default (`Connection.effort`, `effort = "high"` in
+    connections.toml) and a session-level override (`--effort`, `/effort`, persisted in
+    `SessionFile.effort` so `/resume` restores it). `provider::build_model` reads
+    `Connection.effort` and sends it as the OpenAI-standard `reasoning_effort` body field via
+    `OpenAiCompatible::with_extra_field`; daimon 0.23's `Ollama`/`OpenRouter` builders have no
+    extra-field hook, so `supports_effort` is false for them and every switch site posts a
+    "remembered but not sent" notice instead of silently dropping it. In the TUI, `/model` and
+    `/effort` both go through `app.rs::spawn_model_switch` (one `ModelSwitchContext` bundle)
+    so the two switch paths can't drift.
+  - `headless.rs` — the `-p/--prompt` non-interactive path (`run_headless`), used by both the CLI
+    and by `local-code`'s own live integration tests.
+- `artifacts/` — localhost HTTP serving of agent-created artifacts (HTML/CSS/JS mockups and more)
+  so the agent can showcase visual work in the user's browser. `server.rs` is a hand-rolled HTTP/1.1
+  static-file server (tokio only, no new deps) bound to 127.0.0.1 on an OS-assigned port; URLs
+  404 without an unguessable per-server token path component, the `Host` header is validated
+  (anti-DNS-rebinding), and dotfiles are never served or listed. A canonical-dir-keyed process-wide
+  registry lets each rebuild's fresh tool instance reuse the running server. `tool.rs` is the
+  `serve_artifacts` built-in: starts/reuses the server for `<project>/.local-code/artifacts/` and
+  returns the base URL; the agent drops files there with `write_file` and shares the links.
+- `permissions/` — the permission-tier system (`Ask` / `AutoAcceptEdits` / `FullAuto`).
+  `gate::PermissionGate` is the single enforcement point every tool call passes through
+  (`agent::gated_tool::GatedTool` wraps a tool and checks the gate before executing). `settings.rs`
+  handles the persisted always-allow/always-deny lists; `stdio.rs` is the interactive terminal
+  prompter used outside the TUI (headless mode, CLI wizards).
+- `config/` — `Paths` (resolves user config/state dirs via `directories::ProjectDirs` plus the
+  project-local `.local-code/` dir), `connection.rs` (LLM server connections), `mcp_servers.rs`
+  (`mcp.toml` load/save with `${VAR}` env interpolation — see below), `secrets.rs` (OS
+  keyring-backed API key + generic named-secret storage via the `keyring` crate, plus the
+  names-only `secret-names.toml` index for `secret ls`); `pass_backend.rs` (unix-only pass/password-store credential builder, installed as the
+  keyring fallback when Secret Service is unreachable).
+- `mcp/` — MCP (Model Context Protocol) client support. `connect.rs::connect_all` discovers tools
+  from every configured server (stdio/HTTP/SSE/WebSocket transports, from `daimon`), tolerating
+  individual server failures without aborting startup. `tool.rs::NamespacedMcpTool` wraps a
+  discovered MCP tool so it can be registered like any other `Tool` via `register_all_tools`.
+  `fixture_server.rs` is a hidden stdio MCP server the binary can turn itself into
+  (`__mcp_fixture_server` arg, wired in `main.rs`) purely so integration tests can spawn a real
+  child-process MCP server without a second `[[bin]]` target.
+- `skills/` — downloadable skills (Claude-Code-style `SKILL.md` + supporting files), installable
+  from GitHub, GitLab, or Bitbucket.
+  - `spec.rs::parse_spec` is the unified entry point for all skill source specs: `gh:`/`gl:`/`bb:`
+    prefixes, full URLs (github.com/gitlab.com/bitbucket.org), or a bare `owner/repo[/path][@ref]`
+    (defaults to GitHub — this is the one required backward-compatibility guarantee across the
+    whole module). GitLab shorthand specs can't be fully resolved synchronously (nested groups
+    make the project-path/in-repo-path split ambiguous without an API call), so `parse_spec`
+    returns a `ParsedSpec` with `needs_project_path_resolution: true` in that case; the caller runs
+    `gitlab::GitlabClient::resolve_project_path` before proceeding.
+  - `client.rs::SkillClient` is an enum (`GitHub`/`GitLab`/`Bitbucket`) wrapping the three concrete
+    host clients (`github.rs`, `gitlab.rs`, `bitbucket.rs`) behind one set of async methods
+    (`resolve_default_branch`, `resolve_commit_sha`, `fetch_directory_files`). This project uses
+    **enum dispatch, not `dyn Trait`**, for this kind of "one of a few known variants" polymorphism
+    — see also `config::mcp_servers::McpTransportConfig` for the same pattern. Follow it for any
+    similar multi-backend addition rather than introducing a trait object.
+  - `types.rs` holds shared cross-host types: `Host`, `SkillHostError`, `FetchedFile`,
+    `SkillSource`, `InstalledSkillManifest` (`host` field is `#[serde(default)]` so manifests
+    written before multi-host support still deserialize as `GitHub`).
+  - `install.rs` is host-agnostic: `install_skill`/`update_skill` take `&SkillClient` and never
+    branch on which host they're talking to — all host-specific behavior lives inside `SkillClient`
+    and the three client modules. Their fetch-free tails (`install_resolved_files` /
+    `swap_skill_files`) are shared with marketplace plugin installs, which resolve and fetch
+    through the marketplace instead of a skill spec.
+  - `discovery.rs`/`frontmatter.rs`/`agent/skill_tool.rs` operate purely on already-downloaded
+    local files and know nothing about hosts — everything upstream of "skill is on disk" is
+    host-agnostic by design.
+- `marketplace/` — Claude Code plugin marketplaces (`.claude-plugin/marketplace.json` catalogs):
+  `marketplace add/list/remove` registers sources, `plugin list/install/remove/update` installs
+  plugins' skills from them.
+  - `catalog.rs` parses and validates the catalog schema, including the four plugin source kinds
+    (`./relative`, `github`, `url`, `git-subdir`, `npm` — npm is parsed but rejected at install).
+  - `source.rs` holds the persisted `MarketplaceSource` enum (`Remote` fetched via the skill host
+    clients / `Local` directory read live — the same kebab-case tagged-enum convention as
+    `McpTransportConfig`), the add-spec parser (an existing directory is local; anything else goes
+    through `skills::spec::parse_spec`), and git-URL parsing for `url`/`git-subdir` plugin sources.
+  - `registry.rs` is the user-level `marketplaces.toml` (one marketplace per name, re-adding
+    replaces). Marketplaces are user-level only — they're a discovery mechanism; the skills
+    plugins install land in the normal project/global skill scopes.
+  - `install.rs` fetches catalogs fresh on every operation (no clone/cache like Claude Code's),
+    finds each plugin's `skills/*/SKILL.md` dirs (default scan, or the catalog entry's `skills`
+    paths), and installs them as ordinary skills whose manifests carry a `PluginProvenance`
+    (`skills::types`). That provenance is what makes `skills update` skip plugin-managed skills
+    (they belong to `plugin update`), and lets `plugin remove`/`plugin list` map installed
+    skills back to their plugin. Client construction is injected (a `ClientFor` fn) because a
+    plugin's source host can differ from its marketplace's host.
+- `memory/` — flat-file, cross-session memory (`memory search`/`memory core`/`memory core add`/`memory add`):
+  `buffer.rs` (short-term), `rollup.rs` (daily/recent/archive rollup), `search.rs` (keyword search
+  across all of it).
+- `session/` — session persistence (`store.rs` load/save, `types.rs::SessionFile`); every TUI turn
+  is saved (atomically — temp file in the same dir, then rename — so a crash mid-turn can't
+  corrupt a session) so `local-code --resume` (or in-TUI `/resume`) can reopen it later.
+- `context/mod.rs::load_project_context` — loads and concatenates project `AGENTS.md`/`CLAUDE.md`
+  and user-level `AGENTS.md`/`CLAUDE.md` (in that order) into the system prompt. Both the TUI
+  (`tui::run_tui`) and headless mode (`agent::headless::run_headless`) load this context.
+- `init/` — the `/init` slash command's survey + generation logic for producing a project
+  `AGENTS.md`.
+
+### Cross-cutting conventions
+
+- **Enum dispatch over `dyn Trait`** for "one of N known concrete backends" polymorphism
+  (`SkillClient`, `McpTransportConfig`). Keep following this pattern rather than introducing trait
+  objects for similar future additions.
+- **One tool-registration path.** Never add tools to an `Agent` outside
+  `agent::build::register_all_tools` — TUI and headless mode must always end up with the same tool
+  set built the same way.
+- **`Paths`** (`config::paths::Paths`) is the single source of truth for where config/state live,
+  resolved per-OS via the `directories` crate: `user_config_dir` (XDG config dir on Linux & the
+  BSDs, `~/Library/Application Support` on macOS, `%APPDATA%` on Windows), `project_config_dir`
+  (`.local-code/` under the project root), `user_state_dir` (XDG state dir on Linux & the BSDs,
+  `~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows — machine-local, never
+  the roaming profile; sessions live here). Always resolve via `Paths::resolve(project_root)`,
+  don't hand-roll path joins elsewhere. Temporary/staging files are written via the shared
+  `fsutil::write_atomically` helper (temp file next to the final target, fsync, atomic rename —
+  never a hardcoded `/tmp`); tests use the `tempfile` dev-dependency, which honors the OS temp
+  dir on every platform.
+- **`mcp.toml`** supports `${VAR_NAME}` (environment) and `${keyring:<name>}` (OS keyring via
+  `SecretStore`, managed by `local-code secret set/rm/ls`) interpolation at load time
+  (`config::mcp_servers::load_mcp_servers` interpolates; `load_mcp_servers_raw` does not — used
+  when round-tripping the file for editing so secrets aren't baked into what gets written back).
+- **Secrets** are never stored in plaintext config files — `config::secrets::SecretStore` goes
+  through the OS keyring (`keyring` crate, platform-specific backend per `Cargo.toml`'s
+  `target.'cfg(...)'.dependencies`). On non-mac unix, if the Secret Service daemon is
+  unreachable at first secret use, a once-per-process probe swaps in the pass-backed builder
+  (`config::pass_backend`, via `pass-sys`) — entries land GPG-encrypted under `local-code/` in
+  the user's password store.
+- Many modules that read/write via `stdin`/`stdout` (CLI wizards, `select_session_to_resume`, etc.)
+  are generic over `BufRead`/`Write` specifically so they can be unit-tested without a real
+  terminal — follow this pattern for any new interactive CLI flow.
+
+See `TODO.md` for a list of currently-known, accepted v1 limitations (not bugs) — check it before
+assuming something is broken rather than a documented trade-off.

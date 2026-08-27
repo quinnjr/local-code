@@ -1,11 +1,10 @@
-// src/agent/headless.rs
-
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::agent::build::build_agent_with_mcp_tools;
+use crate::agent::effort::{ReasoningEffort, supports_effort};
 use crate::agent::provider::build_model;
-use crate::config::connection::{load_connections, Connection};
+use crate::config::connection::{Connection, load_connections};
 use crate::config::mcp_servers::load_mcp_servers;
 use crate::config::paths::Paths;
 use crate::config::secrets::SecretStore;
@@ -14,6 +13,7 @@ use crate::permissions::gate::PermissionGate;
 use crate::permissions::settings::load_settings;
 use crate::permissions::stdio::StdioPrompter;
 use crate::permissions::types::PermissionTier;
+use crate::skills::discovery::{discover_skills, render_skill_context, resolve_skill_context};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HeadlessError {
@@ -33,7 +33,7 @@ pub enum HeadlessError {
     Provider(#[from] crate::agent::provider::ProviderError),
     #[error("agent error: {0}")]
     Agent(#[from] daimon::DaimonError),
-    #[error("failed to load mcp-servers.toml: {0}")]
+    #[error("failed to load mcp.toml: {0}")]
     LoadMcpServers(crate::config::mcp_servers::McpServersError),
 }
 
@@ -61,48 +61,110 @@ fn select_connection(
     }
 }
 
+/// Joins project/user `AGENTS.md`/`CLAUDE.md` context with rendered skill
+/// context the same way `tui::run_tui` does: project context first, skill
+/// context appended after a blank line, either half omitted entirely if
+/// empty. Extracted as a pure function so the composition logic is
+/// unit-testable without building a full `Agent` (which doesn't expose its
+/// constructed system prompt for inspection).
+fn combined_system_context(project_context: &str, rendered_skill_context: &str) -> String {
+    if rendered_skill_context.is_empty() {
+        project_context.to_string()
+    } else if project_context.is_empty() {
+        rendered_skill_context.to_string()
+    } else {
+        format!("{project_context}\n\n{rendered_skill_context}")
+    }
+}
+
+/// The headless tier rule, extracted so the FullAuto default is directly
+/// unit-testable — `run_headless` itself needs a live model, so this default
+/// otherwise had no regression signal.
+fn resolve_tier(permission_mode_override: Option<PermissionTier>) -> PermissionTier {
+    permission_mode_override.unwrap_or(PermissionTier::FullAuto)
+}
+
 /// Runs one full ReAct-loop turn headlessly and returns the final text response.
 /// Headless invocations default to `PermissionTier::FullAuto` (there is no TTY to
 /// answer an inline prompt); pass `permission_mode_override` to force a different
-/// tier (the project/user allow/deny list still applies as a hard boundary
-/// regardless of tier).
+/// tier. The project/user allow/deny list still applies regardless of tier —
+/// but note its actual scope: best-effort substring matching against bash
+/// commands only (see the `NOTE(security, v1 limitation)` in
+/// `permissions::gate`), not a hard boundary over every tool.
 pub async fn run_headless(
     paths: &Paths,
-    _project_root: &Path,
+    project_root: &Path,
     connection_name: Option<&str>,
     permission_mode_override: Option<PermissionTier>,
+    effort_override: Option<ReasoningEffort>,
     prompt: &str,
 ) -> Result<String, HeadlessError> {
     let connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
-    let connection = select_connection(&connections, connection_name)?;
+    let mut connection = select_connection(&connections, connection_name)?;
+    if let Some(effort) = effort_override {
+        if !supports_effort(connection.provider) {
+            eprintln!(
+                "warning: --effort is only sent to openai-compatible connections; '{}' is {:?}, so it is ignored",
+                connection.name, connection.provider
+            );
+        }
+        connection.effort = Some(effort);
+    }
+
+    // Start the MCP network connect (the dominant tail latency, up to 15s
+    // per server) before the local fs/keyring work, so startup pays
+    // max(network, local) instead of their sum — mirrors `tui::run_tui`.
+    let mcp_server_configs = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)
+        .map_err(HeadlessError::LoadMcpServers)?;
+    let mcp_task = tokio::spawn(async move { connect_all(&mcp_server_configs).await });
 
     let api_key = SecretStore::get_api_key(&connection.name)?;
     let model = build_model(&connection, api_key)?;
 
     let settings = load_settings(&paths.user_config_dir, &paths.project_config_dir)?;
-    let tier = permission_mode_override.unwrap_or(PermissionTier::FullAuto);
+    let tier = resolve_tier(permission_mode_override);
     let gate = Arc::new(PermissionGate::new(
         tier,
         settings,
         Arc::new(StdioPrompter::real()),
     ));
 
-    let mcp_server_configs = load_mcp_servers(&paths.user_config_dir, &paths.project_config_dir)
-        .map_err(HeadlessError::LoadMcpServers)?;
-    let mcp_report = connect_all(&mcp_server_configs).await;
+    let discovered_skills = discover_skills(paths);
+    let skill_context = resolve_skill_context(&discovered_skills, project_root);
+    let rendered_skill_context = render_skill_context(&skill_context);
+    let project_context = crate::context::load_project_context(paths, project_root);
+    let system_context = combined_system_context(&project_context, &rendered_skill_context);
+
+    let mcp_report = mcp_task.await.expect("MCP connect task panicked");
     for error in &mcp_report.errors {
         eprintln!("warning: {error}");
     }
 
-    let agent = build_agent_with_mcp_tools(model, gate, mcp_report.tools)?;
-    let response = agent.prompt(prompt).await?;
-    Ok(response.text().to_string())
+    // Cheap Arc clones retained so the connections can be closed after the
+    // prompt completes (orderly stdio-server shutdown, matching run_tui).
+    let mcp_tools_for_shutdown = mcp_report.tools.clone();
+    let agent = build_agent_with_mcp_tools(
+        model,
+        gate,
+        mcp_report.tools,
+        discovered_skills,
+        &system_context,
+    )?;
+    let response = agent.prompt(prompt).await;
+    crate::mcp::connect::close_all(&mcp_tools_for_shutdown).await;
+    Ok(response?.text().to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::connection::ProviderKind;
+
+    #[test]
+    fn tier_defaults_to_full_auto_without_an_override() {
+        assert_eq!(resolve_tier(None), PermissionTier::FullAuto);
+        assert_eq!(resolve_tier(Some(PermissionTier::Ask)), PermissionTier::Ask);
+    }
 
     fn conn(name: &str) -> Connection {
         Connection {
@@ -111,6 +173,7 @@ mod tests {
             base_url: "http://localhost:8000/v1".into(),
             default_model: "m".into(),
             models: vec![],
+            effort: None,
         }
     }
 
@@ -145,14 +208,45 @@ mod tests {
     fn select_connection_errors_when_named_connection_missing() {
         let connections = vec![conn("a")];
         let result = select_connection(&connections, Some("does-not-exist"));
-        assert!(matches!(result, Err(HeadlessError::ConnectionNotFound(name)) if name == "does-not-exist"));
+        assert!(
+            matches!(result, Err(HeadlessError::ConnectionNotFound(name)) if name == "does-not-exist")
+        );
+    }
+
+    #[test]
+    fn combined_system_context_returns_empty_when_both_are_empty() {
+        assert_eq!(combined_system_context("", ""), "");
+    }
+
+    #[test]
+    fn combined_system_context_returns_project_context_alone_when_skills_are_empty() {
+        assert_eq!(
+            combined_system_context("project rules", ""),
+            "project rules"
+        );
+    }
+
+    #[test]
+    fn combined_system_context_returns_skill_context_alone_when_project_context_is_empty() {
+        assert_eq!(
+            combined_system_context("", "skill context"),
+            "skill context"
+        );
+    }
+
+    #[test]
+    fn combined_system_context_joins_both_with_a_blank_line() {
+        assert_eq!(
+            combined_system_context("project rules", "skill context"),
+            "project rules\n\nskill context"
+        );
     }
 
     #[tokio::test]
     async fn mcp_report_errors_do_not_prevent_agent_construction() {
         use crate::agent::build::build_agent_with_mcp_tools;
         use crate::config::mcp_servers::{McpServerConfig, McpTransportConfig};
-        use crate::mcp::connect::{connect_all, McpConnectError};
+        use crate::mcp::connect::{McpConnectError, connect_all};
         use crate::permissions::settings::PermissionSettings;
         use crate::permissions::stdio::StdioPrompter;
 
@@ -178,7 +272,7 @@ mod tests {
 
         // The whole point: a fully-failed MCP discovery report still produces
         // a working agent with just the built-in tools.
-        let agent = build_agent_with_mcp_tools(model, gate, report.tools);
+        let agent = build_agent_with_mcp_tools(model, gate, report.tools, Vec::new(), "");
         assert!(agent.is_ok());
     }
 }

@@ -1,16 +1,15 @@
-// src/tui/rebuild.rs
-
 use std::sync::{Arc, Mutex};
 
 use daimon::agent::Agent;
-use daimon::model::types::Message;
 use daimon::model::SharedModel;
+use daimon::model::types::Message;
 use tokio::sync::oneshot;
 
 use crate::mcp::tool::NamespacedMcpTool;
 use crate::permissions::gate::PermissionGate;
 use crate::permissions::settings::PermissionSettings;
 use crate::permissions::types::{PermissionDecision, PermissionRequest, PermissionTier};
+use crate::skills::types::Skill;
 use crate::tui::gated_tool::build_streaming_agent_with_history;
 use crate::tui::permission_prompter::NtuiPermissionPrompter;
 
@@ -18,40 +17,91 @@ pub type ResponderHandle = Arc<Mutex<Option<oneshot::Sender<PermissionDecision>>
 
 /// Builds a fresh `(Agent, PermissionGate, ResponderHandle)` triple: a new
 /// `NtuiPermissionPrompter` bound to `pending_permission`, a `PermissionGate`
-/// at `initial_tier` with `always_allow`/`always_deny`, and an `Agent` seeded
+/// at `initial_tier` with `permission_settings`, and an `Agent` seeded
 /// with `initial_messages`, `extra_system_context`, and `mcp_tools` (already
 /// `connect_all`-discovered `NamespacedMcpTool`s — `NamespacedMcpTool` is
 /// `Clone`, wrapping an `Arc<McpToolBridge>`, so the *same* live MCP
 /// connections can be handed to a freshly-rebuilt agent without reconnecting
 /// to every server again on `/model`/`/resume`). This is the single place
-/// that logic lives — `App`'s mount, `/model`, and `/resume` all call it
-/// instead of duplicating the construction sequence Phase 3 originally left
-/// inlined in `App`'s `hooks.use_state` initializer.
+/// that logic lives — `App`'s mount, `/model`, `/resume`, and `/mcp add` all
+/// call it instead of duplicating the construction sequence.
+///
+/// Takes `permission_settings: PermissionSettings` rather than separate
+/// `always_allow`/`always_deny: Vec<String>` parameters deliberately: two
+/// adjacent same-typed `Vec<String>` params are a real footgun a caller
+/// could transpose without a compile error, and `PermissionSettings` is the
+/// type this function builds internally anyway. The resulting 8-parameter
+/// signature is intentional (see above), hence the lint suppression below.
+#[allow(clippy::too_many_arguments)]
 pub fn rebuild_agent(
     model: SharedModel,
     initial_tier: PermissionTier,
-    always_allow: Vec<String>,
-    always_deny: Vec<String>,
+    permission_settings: PermissionSettings,
     initial_messages: Vec<Message>,
     extra_system_context: &str,
     mcp_tools: Vec<NamespacedMcpTool>,
+    skills: Vec<Skill>,
     pending_permission: ntui::State<Option<PermissionRequest>>,
-) -> (Arc<Agent>, Arc<PermissionGate>, ResponderHandle) {
+) -> daimon::Result<(Arc<Agent>, Arc<PermissionGate>, ResponderHandle)> {
     let prompter = NtuiPermissionPrompter::new(pending_permission);
     let responder = prompter.responder_handle();
-    let settings = PermissionSettings { always_allow, always_deny };
-    let gate = Arc::new(PermissionGate::new(initial_tier, settings, Arc::new(prompter)));
-    let agent = Arc::new(
-        build_streaming_agent_with_history(
-            model,
-            gate.clone(),
-            initial_messages,
-            extra_system_context,
-            mcp_tools,
-        )
-        .expect("agent construction should not fail"),
-    );
-    (agent, gate, responder)
+    let gate = Arc::new(PermissionGate::new(
+        initial_tier,
+        permission_settings,
+        Arc::new(prompter),
+    ));
+    // Construction only fails on builder-rejected config (e.g. a duplicate
+    // tool name from an MCP server). Propagated rather than `.expect`ed so
+    // the `/model`/`/resume`/`/mcp add` switch sites can keep the old agent
+    // and surface a notice instead of panicking the whole TUI.
+    let agent = Arc::new(build_streaming_agent_with_history(
+        model,
+        gate.clone(),
+        initial_messages,
+        extra_system_context,
+        mcp_tools,
+        skills,
+    )?);
+    Ok((agent, gate, responder))
+}
+
+/// Reloads `old_agent`'s conversation history and calls [`rebuild_agent`]
+/// with it — the shared core of both `/model`'s and `/mcp add`'s rebuild
+/// flow (they differ only in what they do with the result: `/model` swaps
+/// the active model, `/mcp add` merges in newly-discovered tools). `/resume`
+/// does NOT use this — it rebuilds from a *loaded session's* messages, not
+/// the live agent's current history, so reloading would be wrong there.
+///
+/// Mirrors [`rebuild_agent`]'s parameter list (plus `old_agent`) — see its
+/// doc comment for why the arg count is intentional, hence the same lint
+/// suppression below.
+#[allow(clippy::too_many_arguments)]
+pub async fn rebuild_agent_from_history(
+    old_agent: &Agent,
+    model: SharedModel,
+    initial_tier: PermissionTier,
+    permission_settings: PermissionSettings,
+    extra_system_context: &str,
+    mcp_tools: Vec<NamespacedMcpTool>,
+    skills: Vec<Skill>,
+    pending_permission: ntui::State<Option<PermissionRequest>>,
+) -> daimon::Result<(Arc<Agent>, Arc<PermissionGate>, ResponderHandle)> {
+    // A failed history read must propagate as `Err` (both call sites keep
+    // the old agent live and post a notice) — never default to an empty
+    // history, which would silently drop the whole conversation while the
+    // switch reports success. Same `DaimonError` type as the return, so
+    // plain `?` matches `rebuild_agent`'s propagation style above.
+    let history = old_agent.memory().get_messages_erased().await?;
+    rebuild_agent(
+        model,
+        initial_tier,
+        permission_settings,
+        history,
+        extra_system_context,
+        mcp_tools,
+        skills,
+        pending_permission,
+    )
 }
 
 #[cfg(test)]
@@ -60,7 +110,7 @@ mod tests {
     use daimon::model::types::{ChatRequest, ChatResponse, StopReason, Usage};
     use daimon::stream::ResponseStream;
     use ntui::testing::TestTerminal;
-    use ntui::{component, element, Element};
+    use ntui::{Element, component, element};
 
     struct EchoModel;
     impl daimon::model::Model for EchoModel {
@@ -92,13 +142,14 @@ mod tests {
                 let (agent, _gate, _responder) = rebuild_agent(
                     model,
                     PermissionTier::FullAuto,
-                    vec![],
-                    vec![],
+                    PermissionSettings::default(),
                     vec![Message::user("seeded turn")],
                     "",
                     Vec::new(),
+                    Vec::new(),
                     pending,
-                );
+                )
+                .expect("static test tool set never fails to build");
                 tokio::spawn(async move {
                     let response = agent.prompt("hi").await.unwrap();
                     result_text.set(response.text().to_string());
@@ -109,6 +160,137 @@ mod tests {
         element! {
             View { Text(content: result_text.get()) }
         }
+    }
+
+    /// Forces the one realistic construction failure — two MCP tools whose
+    /// namespaced names collide — and pins that `rebuild_agent` returns `Err`
+    /// instead of panicking (the call sites' keep-old-agent recovery depends
+    /// on this being an `Err`, not an `.expect`).
+    #[derive(Clone, Default)]
+    struct DupToolProps {
+        saw_err: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+    impl PartialEq for DupToolProps {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+
+    #[component]
+    fn DupToolHarness(props: &DupToolProps, hooks: &mut ntui::Hooks) -> ntui::Element {
+        let pending = hooks.use_state(|| Option::<PermissionRequest>::None);
+        hooks.use_effect((), {
+            let saw_err = props.saw_err.clone();
+            let pending = pending.clone();
+            move || {
+                use crate::mcp::tool::{NamespacedMcpTool, test_support::bridge_named};
+                let model: SharedModel = Arc::new(EchoModel);
+                let result = rebuild_agent(
+                    model,
+                    PermissionTier::FullAuto,
+                    PermissionSettings::default(),
+                    Vec::new(),
+                    "",
+                    vec![
+                        NamespacedMcpTool::new("srv", bridge_named("do_thing")),
+                        NamespacedMcpTool::new("srv", bridge_named("do_thing")),
+                    ],
+                    Vec::new(),
+                    pending,
+                );
+                *saw_err.lock().unwrap() = Some(result.is_err());
+            }
+        });
+        element! { View {} }
+    }
+
+    #[tokio::test]
+    async fn rebuild_agent_propagates_a_duplicate_tool_name_failure() {
+        let props = DupToolProps::default();
+        let saw_err = props.saw_err.clone();
+        let _t = TestTerminal::new(10, 1, Element::component::<DupToolHarness>(props)).unwrap();
+        assert_eq!(
+            *saw_err.lock().unwrap(),
+            Some(true),
+            "duplicate namespaced tool names must surface as Err, not a panic"
+        );
+    }
+
+    /// A `Memory` backend whose reads always fail — pins that
+    /// `rebuild_agent_from_history` propagates a history-read failure as
+    /// `Err` instead of silently rebuilding with an empty history (the call
+    /// sites' keep-old-agent recovery depends on this being an `Err`, same
+    /// as the duplicate-tool-name case above).
+    struct FailMemory;
+    impl daimon::memory::Memory for FailMemory {
+        async fn add_message(&self, _message: &Message) -> daimon::Result<()> {
+            Ok(())
+        }
+        async fn get_messages(&self) -> daimon::Result<Vec<Message>> {
+            Err(daimon::DaimonError::storage("injected read failure"))
+        }
+        async fn clear(&self) -> daimon::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FailMemoryProps {
+        saw_err: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+    impl PartialEq for FailMemoryProps {
+        fn eq(&self, _other: &Self) -> bool {
+            true
+        }
+    }
+
+    #[component]
+    fn FailMemoryHarness(props: &FailMemoryProps, hooks: &mut ntui::Hooks) -> ntui::Element {
+        let pending = hooks.use_state(|| Option::<PermissionRequest>::None);
+        hooks.use_effect((), {
+            let saw_err = props.saw_err.clone();
+            let pending = pending.clone();
+            move || {
+                let model: SharedModel = Arc::new(EchoModel);
+                let old_agent = daimon::agent::AgentBuilder::new()
+                    .shared_model(model.clone())
+                    .memory(FailMemory)
+                    .build()
+                    .expect("static test agent never fails to build");
+                tokio::spawn(async move {
+                    let result = rebuild_agent_from_history(
+                        &old_agent,
+                        model,
+                        PermissionTier::FullAuto,
+                        PermissionSettings::default(),
+                        "",
+                        Vec::new(),
+                        Vec::new(),
+                        pending,
+                    )
+                    .await;
+                    *saw_err.lock().unwrap() = Some(result.is_err());
+                });
+            }
+        });
+        element! { View {} }
+    }
+
+    #[tokio::test]
+    async fn rebuild_agent_from_history_propagates_a_memory_read_failure() {
+        let props = FailMemoryProps::default();
+        let saw_err = props.saw_err.clone();
+        let mut t =
+            TestTerminal::new(10, 1, Element::component::<FailMemoryHarness>(props)).unwrap();
+        for _ in 0..10 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            t.tick().await.unwrap();
+        }
+        assert_eq!(
+            *saw_err.lock().unwrap(),
+            Some(true),
+            "a failed history read must surface as Err, not a silent empty history"
+        );
     }
 
     #[tokio::test]

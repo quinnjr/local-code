@@ -1,12 +1,12 @@
-pub mod types;
-pub mod settings;
 pub mod gate;
+pub mod settings;
 pub mod stdio;
+pub mod types;
 
-pub use types::{
-    classify_tool, PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier,
-    ToolKind,
-};
-pub use settings::{load_settings, PermissionSettings, SettingsFile};
 pub use gate::{CheckOutcome, PermissionGate};
+pub use settings::{PermissionSettings, SettingsFile, load_settings};
 pub use stdio::StdioPrompter;
+pub use types::{
+    PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier, ToolKind,
+    classify_tool,
+};

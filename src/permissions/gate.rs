@@ -1,16 +1,12 @@
-// src/permissions/gate.rs
-
 use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
 use crate::permissions::settings::PermissionSettings;
 use crate::permissions::types::{
-    classify_tool, PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier,
-    ToolKind,
+    PermissionDecision, PermissionPrompter, PermissionRequest, PermissionTier, ToolKind,
+    classify_tool,
 };
 
 /// Result of [`PermissionGate::check`].
@@ -66,32 +62,32 @@ impl PermissionGate {
             return CheckOutcome::Allowed;
         }
 
-        if kind == ToolKind::Bash {
-            if let Some(command) = arguments.get("command").and_then(|v| v.as_str()) {
-                // NOTE(security, v1 limitation): this is substring matching over the raw
-                // command string, not a tokenized/parsed shell command. It is a best-effort
-                // safety net, not a hard security boundary — it can be bypassed by an
-                // adversarial or merely unlucky command string (e.g. extra whitespace,
-                // reordered flags, or splitting `rm -rf` into `rm -r -f`). A more robust
-                // (tokenized) matcher is a candidate for a future pass.
-                if self
-                    .settings
-                    .always_deny
-                    .iter()
-                    .any(|rule| command.contains(rule.as_str()))
-                {
-                    return CheckOutcome::Denied(format!(
-                        "command matches an always-deny rule and was blocked: {command}"
-                    ));
-                }
-                if self
-                    .settings
-                    .always_allow
-                    .iter()
-                    .any(|rule| command.contains(rule.as_str()))
-                {
-                    return CheckOutcome::Allowed;
-                }
+        if kind == ToolKind::Bash
+            && let Some(command) = arguments.get("command").and_then(|v| v.as_str())
+        {
+            // NOTE(security, v1 limitation): this is substring matching over the raw
+            // command string, not a tokenized/parsed shell command. It is a best-effort
+            // safety net, not a hard security boundary — it can be bypassed by an
+            // adversarial or merely unlucky command string (e.g. extra whitespace,
+            // reordered flags, or splitting `rm -rf` into `rm -r -f`). A more robust
+            // (tokenized) matcher is a candidate for a future pass.
+            if self
+                .settings
+                .always_deny
+                .iter()
+                .any(|rule| command.contains(rule.as_str()))
+            {
+                return CheckOutcome::Denied(format!(
+                    "command matches an always-deny rule and was blocked: {command}"
+                ));
+            }
+            if self
+                .settings
+                .always_allow
+                .iter()
+                .any(|rule| command.contains(rule.as_str()))
+            {
+                return CheckOutcome::Allowed;
             }
         }
 
@@ -109,15 +105,8 @@ impl PermissionGate {
             return CheckOutcome::Allowed;
         }
 
-        let command_preview = arguments
-            .get("command")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let description = describe_call(tool_name, arguments);
         let request = PermissionRequest {
-            tool_name: tool_name.to_string(),
-            description,
-            command_preview,
+            description: describe_call(tool_name, arguments),
         };
 
         match self.prompter.prompt(&request).await {
@@ -152,7 +141,10 @@ fn describe_call(tool_name: &str, arguments: &serde_json::Value) -> String {
     match tool_name {
         "bash" => format!(
             "run shell command: {}",
-            arguments.get("command").and_then(|v| v.as_str()).unwrap_or("")
+            arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
         ),
         "write_file" => format!(
             "write file: {}",
@@ -169,6 +161,8 @@ fn describe_call(tool_name: &str, arguments: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
 
     struct StubPrompter {
         decision: PermissionDecision,
@@ -200,7 +194,9 @@ mod tests {
                 feedback: "should never be reached".into(),
             },
         );
-        let outcome = gate.check("read_file", &serde_json::json!({"path": "x"})).await;
+        let outcome = gate
+            .check("read_file", &serde_json::json!({"path": "x"}))
+            .await;
         assert_eq!(outcome, CheckOutcome::Allowed);
     }
 
@@ -212,7 +208,9 @@ mod tests {
                 feedback: "should never be reached".into(),
             },
         );
-        let outcome = gate.check("bash", &serde_json::json!({"command": "ls"})).await;
+        let outcome = gate
+            .check("bash", &serde_json::json!({"command": "ls"}))
+            .await;
         assert_eq!(outcome, CheckOutcome::Allowed);
     }
 
@@ -220,7 +218,10 @@ mod tests {
     async fn auto_accept_edits_allows_edit_but_still_prompts_bash() {
         let gate = gate_with(PermissionTier::AutoAcceptEdits, PermissionDecision::Allow);
         let edit_outcome = gate
-            .check("write_file", &serde_json::json!({"path": "x", "content": "y"}))
+            .check(
+                "write_file",
+                &serde_json::json!({"path": "x", "content": "y"}),
+            )
             .await;
         assert_eq!(edit_outcome, CheckOutcome::Allowed);
 
@@ -245,7 +246,10 @@ mod tests {
             },
         );
         let outcome = gate
-            .check("edit_file", &serde_json::json!({"path": "x", "find": "a", "replace": "b"}))
+            .check(
+                "edit_file",
+                &serde_json::json!({"path": "x", "find": "a", "replace": "b"}),
+            )
             .await;
         assert_eq!(
             outcome,
@@ -257,7 +261,10 @@ mod tests {
     async fn allow_always_this_session_skips_future_prompts_for_the_same_command_only() {
         // A prompter that always answers AllowAlwaysThisSession, used to record the
         // approval for the first ("cargo test") command.
-        let gate = gate_with(PermissionTier::Ask, PermissionDecision::AllowAlwaysThisSession);
+        let gate = gate_with(
+            PermissionTier::Ask,
+            PermissionDecision::AllowAlwaysThisSession,
+        );
         let first = gate
             .check("bash", &serde_json::json!({"command": "cargo test"}))
             .await;

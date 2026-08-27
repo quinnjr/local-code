@@ -1,0 +1,55 @@
+# Maintainer: Joseph R. Quinn <quinn.josephr@gmail.com>
+
+pkgname=local-code
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Claude-Code-style terminal coding agent for local OpenAI-compatible LLM servers (llama.cpp, vLLM, LM Studio, Ollama), with optional OpenRouter access"
+arch=('x86_64' 'aarch64')
+url="https://github.com/quinnjr/local-code"
+license=('MIT OR Apache-2.0')
+depends=('glibc' 'dbus')
+makedepends=('cargo' 'pkgconf')
+# Rust handles LTO itself; makepkg's -flto CFLAGS break the aws-lc-sys C/asm build.
+options=('!lto')
+optdepends=(
+  'pass: password-store fallback for API keys when no Secret Service daemon is running'
+  'gnome-keyring: Secret Service backend for API-key storage'
+  'kwallet: Secret Service backend for API-key storage'
+)
+# The license files are local sources (symlinks to the repo-root copies) so the
+# package carries them even for tags cut before they were added.
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+        LICENSE-MIT
+        LICENSE-APACHE)
+sha256sums=('8d60eaae200a3f22216b69878b4766a6fa6e3ba8f524e39bbc6b93517e695b88'
+            'dc51ca6634394df53bd15a4cd589d13cc2fd5b6b9ed3dfe2b7a44cfeec2977bd'
+            'cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  # Live tests (tests/live_*.rs) are #[ignore]d and need a running LLM server; they stay skipped.
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+  install -Dm644 "$srcdir/LICENSE-MIT" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 "$srcdir/LICENSE-APACHE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

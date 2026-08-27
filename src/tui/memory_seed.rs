@@ -1,5 +1,3 @@
-// src/tui/memory_seed.rs
-
 use tokio::sync::Mutex;
 
 use daimon::memory::Memory;
@@ -21,8 +19,8 @@ impl SeededMemory {
 }
 
 impl Memory for SeededMemory {
-    async fn add_message(&self, message: Message) -> daimon::Result<()> {
-        self.0.lock().await.push(message);
+    async fn add_message(&self, message: &Message) -> daimon::Result<()> {
+        self.0.lock().await.push(message.clone());
         Ok(())
     }
 
@@ -50,8 +48,12 @@ mod tests {
 
     #[tokio::test]
     async fn add_message_appends_without_evicting() {
-        let memory = SeededMemory::new((0..100).map(|i| Message::user(format!("msg {i}"))).collect());
-        memory.add_message(Message::user("msg 100")).await.unwrap();
+        let memory = SeededMemory::new(
+            (0..100)
+                .map(|i| Message::user(format!("msg {i}")))
+                .collect(),
+        );
+        memory.add_message(&Message::user("msg 100")).await.unwrap();
         let messages = memory.get_messages().await.unwrap();
         assert_eq!(messages.len(), 101);
         assert_eq!(messages[0].content.as_deref(), Some("msg 0"));

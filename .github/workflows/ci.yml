@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # keyring's Linux secret-service backend (libdbus-sys) needs libdbus's
+      # headers + pkg-config to build; pass-sys (the pass fallback backend)
+      # needs libgpgme's. ubuntu-latest ships neither.
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config libgpgme-dev
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config libgpgme-dev
+      # live_*.rs integration tests are #[ignore]d by default (see CLAUDE.md)
+      # and require a real running LLM server, so the default `cargo test`
+      # filter already excludes them here.
+      - run: cargo test
+
+  # Compile-only on the other two OSes: proves the cfg(windows)/cfg(macos)
+  # code paths (keyring backends, directory resolution, tests) build
+  # everywhere, without needing the Linux-only system libs above (the
+  # secret-service/pass deps are unix-gated). The full test suite still
+  # runs Linux-only; only the hermetic per-OS tests below run here.
+  check-cross:
+    name: cargo check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo check --all-targets
+      # Run the hermetic per-OS directory/session-store tests natively —
+      # compile-only doesn't exercise the cfg-gated behavior they assert.
+      - run: cargo test --lib config::paths
+      - run: cargo test --lib session::store
+
+  # A single required status check for branch protection to depend on,
+  # rather than requiring fmt/clippy/test individually (easy to forget one
+  # when configuring protected-branch settings, which would let that job's
+  # failures silently stop blocking merges).
+  ci-passed:
+    name: CI passed
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, check-cross]
+    if: always()
+    steps:
+      - run: |
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "one or more required jobs failed"
+            exit 1
+          fi

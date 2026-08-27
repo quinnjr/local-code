@@ -1,11 +1,17 @@
 pub mod connections;
+pub mod marketplace;
+pub mod mcp;
 pub mod memory;
+pub mod plugin;
+pub mod secret;
+pub mod skills;
 
+use crate::agent::effort::ReasoningEffort;
 use crate::agent::headless::run_headless;
 use crate::config::paths::Paths;
 use crate::permissions::types::PermissionTier;
 use clap::{Parser, Subcommand, ValueEnum};
-use std::io::{stdin, stdout, IsTerminal};
+use std::io::{IsTerminal, stdin, stdout};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -26,6 +32,12 @@ pub struct Cli {
     #[arg(long = "permission-mode", value_enum)]
     pub permission_mode: Option<PermissionModeArg>,
 
+    /// Reasoning effort to request from the model (low, medium, high). Overrides
+    /// the connection's configured default for this run; `/effort` changes it
+    /// in-TUI. Only sent to openai-compatible connections.
+    #[arg(long, value_enum)]
+    pub effort: Option<ReasoningEffort>,
+
     /// Resume a previous session for this project: lists recent sessions and
     /// prompts for a choice (reading a line from stdin), or reopens the most
     /// recent one automatically if exactly one exists.
@@ -33,35 +45,153 @@ pub struct Cli {
     pub resume: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum Command {
     /// Manage LLM connections (add/list/remove)
     Connections {
         #[command(subcommand)]
         action: ConnectionsAction,
     },
+    /// Manage MCP servers (list/remove; add is TUI-only via /mcp add)
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// Inspect cross-session memory (search/core/add)
     Memory {
         #[command(subcommand)]
         action: MemoryAction,
     },
+    /// Manage skills (install/list/remove/update from GitHub, GitLab, or Bitbucket)
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
+    /// Manage plugin marketplaces (add/list/remove Claude Code marketplaces)
+    Marketplace {
+        #[command(subcommand)]
+        action: MarketplaceAction,
+    },
+    /// Install plugins from registered marketplaces (list/install/remove/update)
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
+    /// Manage named secrets in the OS keyring, referenced from mcp.toml as ${keyring:<name>}
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
+pub enum McpAction {
+    Add,
+    List,
+    Remove { name: String },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum ConnectionsAction {
     Add,
     List,
     Remove { name: String },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 pub enum MemoryAction {
     /// Keyword-search the buffer, daily files, recent.md, and archive.md
     Search { query: String },
-    /// Print the always-loaded core-memories.md file in full
-    Core,
-    /// Append a manual entry to the short-term buffer
+    /// Print the always-loaded core-memories.md file in full, or `core add
+    /// <text>` to append a permanent entry to it
+    Core {
+        #[command(subcommand)]
+        action: Option<CoreAction>,
+    },
+    /// Append a manual entry to the short-term buffer (also runs the daily
+    /// rollover/rollup maintenance pass)
     Add { text: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum CoreAction {
+    /// Append a permanent entry to core-memories.md
+    Add { text: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillsAction {
+    /// Install a skill: owner/repo[/path][@ref], a gh:/gl:/bb: spec, or a full URL
+    Install {
+        spec: String,
+        /// Install into the global (user-level) scope instead of this project
+        #[arg(long)]
+        global: bool,
+        /// Override the derived skill name
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List installed skills across both scopes
+    List,
+    /// Remove an installed skill
+    Remove {
+        name: String,
+        #[arg(long)]
+        global: bool,
+    },
+    /// Re-fetch a skill (or all skills in scope) if its pinned ref has moved
+    Update {
+        name: Option<String>,
+        #[arg(long)]
+        global: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SecretAction {
+    /// Store a secret (value is prompted, never passed as an argument)
+    Set { name: String },
+    /// Delete a secret
+    Rm { name: String },
+    /// List stored secret names (never values)
+    Ls,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MarketplaceAction {
+    /// Register a Claude Code marketplace: owner/repo[/path][@ref], a
+    /// gh:/gl:/bb: spec or URL, or a local directory containing
+    /// .claude-plugin/marketplace.json
+    Add { spec: String },
+    /// List registered marketplaces
+    List,
+    /// Unregister a marketplace (installed plugin skills stay installed)
+    Remove { name: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PluginAction {
+    /// List plugins offered by the registered marketplaces
+    List,
+    /// Install a plugin's skills: <plugin>@<marketplace>
+    Install {
+        spec: String,
+        /// Install into the global (user-level) scope instead of this project
+        #[arg(long)]
+        global: bool,
+    },
+    /// Remove all skills installed from a plugin
+    Remove {
+        name: String,
+        #[arg(long)]
+        global: bool,
+    },
+    /// Re-fetch a plugin's skills from its marketplace
+    Update {
+        name: String,
+        #[arg(long)]
+        global: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -108,6 +238,7 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             &project_root,
             cli.connection.as_deref(),
             tier_override,
+            cli.effort,
             prompt,
         )
         .await?;
@@ -127,20 +258,92 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
                 connections::remove(&paths, &name, stdout())?;
             }
         },
+        Some(Command::Mcp { action }) => match action {
+            McpAction::Add => {
+                mcp::add_unsupported(stdout())?;
+            }
+            McpAction::List => {
+                mcp::list(&paths, stdout())?;
+            }
+            McpAction::Remove { name } => {
+                mcp::remove(&paths, &name, stdout())?;
+            }
+        },
         Some(Command::Memory { action }) => match action {
             MemoryAction::Search { query } => {
                 memory::search_command(&paths, &query, stdout())?;
             }
-            MemoryAction::Core => {
+            MemoryAction::Core { action: None } => {
                 memory::core_command(&paths, stdout())?;
+            }
+            MemoryAction::Core {
+                action: Some(CoreAction::Add { text }),
+            } => {
+                memory::core_add_command(&paths, &text, stdout())?;
             }
             MemoryAction::Add { text } => {
                 memory::add_command(&paths, &text, stdout())?;
             }
         },
+        Some(Command::Skills { action }) => match action {
+            SkillsAction::Install { spec, global, name } => {
+                skills::install(&paths, &spec, global, name.as_deref(), stdout()).await?;
+            }
+            SkillsAction::List => {
+                skills::list(&paths, stdout())?;
+            }
+            SkillsAction::Remove { name, global } => {
+                skills::remove(&paths, &name, global, stdout())?;
+            }
+            SkillsAction::Update { name, global } => {
+                skills::update(&paths, name.as_deref(), global, stdout()).await?;
+            }
+        },
+        Some(Command::Marketplace { action }) => match action {
+            MarketplaceAction::Add { spec } => {
+                marketplace::add(&paths, &spec, stdout()).await?;
+            }
+            MarketplaceAction::List => {
+                marketplace::list(&paths, stdout())?;
+            }
+            MarketplaceAction::Remove { name } => {
+                marketplace::remove(&paths, &name, stdout())?;
+            }
+        },
+        Some(Command::Plugin { action }) => match action {
+            PluginAction::List => {
+                plugin::list(&paths, stdout()).await?;
+            }
+            PluginAction::Install { spec, global } => {
+                plugin::install(&paths, &spec, global, stdout()).await?;
+            }
+            PluginAction::Remove { name, global } => {
+                plugin::remove(&paths, &name, global, stdout())?;
+            }
+            PluginAction::Update { name, global } => {
+                plugin::update(&paths, &name, global, stdout()).await?;
+            }
+        },
+        Some(Command::Secret { action }) => match action {
+            SecretAction::Set { name } => {
+                if stdin().is_terminal() {
+                    let value = rpassword::prompt_password(format!("Value for '{name}': "))?;
+                    secret::store_value(&paths, &name, value.trim(), stdout())?;
+                } else {
+                    secret::set(&paths, &name, stdin().lock(), stdout())?;
+                }
+            }
+            SecretAction::Rm { name } => {
+                secret::rm(&paths, &name, stdout())?;
+            }
+            SecretAction::Ls => {
+                secret::ls(&paths, stdout())?;
+            }
+        },
         None => {
             let resume = if cli.resume {
-                let sessions = crate::session::store::list_sessions(&paths.user_state_dir, &project_root)?;
+                let sessions =
+                    crate::session::store::list_sessions(&paths.user_state_dir, &project_root)?;
                 let chosen = select_session_to_resume(&sessions, stdin().lock(), stdout())?;
                 match chosen {
                     Some(summary) => {
@@ -152,6 +355,7 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
                             tier: session.tier,
                             connection_name: session.connection_name,
                             model_name: session.model_name,
+                            effort: session.effort,
                             created_at: session.created_at,
                         })
                     }
@@ -166,6 +370,7 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
                 &project_root,
                 cli.connection.as_deref(),
                 cli.permission_mode.map(PermissionModeArg::into_tier),
+                cli.effort,
                 resume,
             )
             .await?;
@@ -193,7 +398,11 @@ pub fn select_session_to_resume<R: BufRead, W: Write>(
         return Ok(None);
     }
     if sessions.len() == 1 {
-        writeln!(out, "Resuming the only previous session ({}).", sessions[0].updated_at)?;
+        writeln!(
+            out,
+            "Resuming the only previous session ({}).",
+            sessions[0].updated_at
+        )?;
         return Ok(Some(sessions[0].clone()));
     }
 
@@ -206,10 +415,17 @@ pub fn select_session_to_resume<R: BufRead, W: Write>(
             s.updated_at,
             s.connection_name,
             s.model_name,
-            s.first_user_turn_preview.as_ref().map(|p| format!(" · \"{p}\"")).unwrap_or_default()
+            s.first_user_turn_preview
+                .as_ref()
+                .map(|p| format!(" · \"{p}\""))
+                .unwrap_or_default()
         )?;
     }
-    write!(out, "Resume which session? [1-{}, blank for most recent]: ", sessions.len())?;
+    write!(
+        out,
+        "Resume which session? [1-{}, blank for most recent]: ",
+        sessions.len()
+    )?;
     out.flush()?;
 
     let mut line = String::new();
@@ -218,7 +434,12 @@ pub fn select_session_to_resume<R: BufRead, W: Write>(
     let index = if trimmed.is_empty() {
         0
     } else {
-        trimmed.parse::<usize>().ok().filter(|n| *n >= 1 && *n <= sessions.len()).map(|n| n - 1).unwrap_or(0)
+        trimmed
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1 && *n <= sessions.len())
+            .map(|n| n - 1)
+            .unwrap_or(0)
     };
     Ok(Some(sessions[index].clone()))
 }
@@ -260,7 +481,11 @@ mod select_session_tests {
         let mut out = Vec::new();
         let result = select_session_to_resume(&[], &b""[..], &mut out).unwrap();
         assert!(result.is_none());
-        assert!(String::from_utf8(out).unwrap().contains("No previous sessions"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("No previous sessions")
+        );
     }
 
     #[test]
@@ -273,7 +498,10 @@ mod select_session_tests {
 
     #[test]
     fn blank_input_selects_the_most_recent() {
-        let sessions = vec![summary("newest", "2026-07-06T00:00:00Z"), summary("older", "2026-07-01T00:00:00Z")];
+        let sessions = vec![
+            summary("newest", "2026-07-06T00:00:00Z"),
+            summary("older", "2026-07-01T00:00:00Z"),
+        ];
         let mut out = Vec::new();
         let result = select_session_to_resume(&sessions, &b"\n"[..], &mut out).unwrap();
         assert_eq!(result.unwrap().connection_name, "newest");
@@ -281,7 +509,10 @@ mod select_session_tests {
 
     #[test]
     fn numeric_input_selects_by_index() {
-        let sessions = vec![summary("newest", "2026-07-06T00:00:00Z"), summary("older", "2026-07-01T00:00:00Z")];
+        let sessions = vec![
+            summary("newest", "2026-07-06T00:00:00Z"),
+            summary("older", "2026-07-01T00:00:00Z"),
+        ];
         let mut out = Vec::new();
         let result = select_session_to_resume(&sessions, &b"2\n"[..], &mut out).unwrap();
         assert_eq!(result.unwrap().connection_name, "older");
@@ -289,10 +520,52 @@ mod select_session_tests {
 
     #[test]
     fn out_of_range_input_falls_back_to_most_recent() {
-        let sessions = vec![summary("newest", "2026-07-06T00:00:00Z"), summary("older", "2026-07-01T00:00:00Z")];
+        let sessions = vec![
+            summary("newest", "2026-07-06T00:00:00Z"),
+            summary("older", "2026-07-01T00:00:00Z"),
+        ];
         let mut out = Vec::new();
         let result = select_session_to_resume(&sessions, &b"99\n"[..], &mut out).unwrap();
         assert_eq!(result.unwrap().connection_name, "newest");
+    }
+}
+
+#[cfg(test)]
+mod mcp_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_mcp_list() {
+        let cli = Cli::parse_from(["local-code", "mcp", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Mcp {
+                action: McpAction::List
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_mcp_remove_with_name() {
+        let cli = Cli::parse_from(["local-code", "mcp", "remove", "fs"]);
+        match cli.command {
+            Some(Command::Mcp {
+                action: McpAction::Remove { name },
+            }) => assert_eq!(name, "fs"),
+            other => panic!("expected Mcp::Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_mcp_add() {
+        let cli = Cli::parse_from(["local-code", "mcp", "add"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Mcp {
+                action: McpAction::Add
+            })
+        ));
     }
 }
 
@@ -356,5 +629,169 @@ mod headless_cli_tests {
     fn requires_interactive_stdin_false_for_full_auto_and_none() {
         assert!(!requires_interactive_stdin(Some(PermissionTier::FullAuto)));
         assert!(!requires_interactive_stdin(None));
+    }
+}
+
+#[cfg(test)]
+mod skills_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_install_with_global_and_name() {
+        let cli = Cli::parse_from([
+            "local-code",
+            "skills",
+            "install",
+            "owner/repo",
+            "--global",
+            "--name",
+            "foo",
+        ]);
+        if let Some(Command::Skills { action }) = cli.command {
+            if let SkillsAction::Install { spec, global, name } = action {
+                assert_eq!(spec, "owner/repo");
+                assert!(global);
+                assert_eq!(name.as_deref(), Some("foo"));
+            } else {
+                panic!("expected SkillsAction::Install, got a different variant");
+            }
+        } else {
+            panic!("expected Some(Command::Skills)");
+        }
+    }
+
+    #[test]
+    fn parses_list() {
+        let cli = Cli::parse_from(["local-code", "skills", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Skills {
+                action: SkillsAction::List
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_remove_with_global() {
+        let cli = Cli::parse_from(["local-code", "skills", "remove", "foo", "--global"]);
+        if let Some(Command::Skills { action }) = cli.command {
+            if let SkillsAction::Remove { name, global } = action {
+                assert_eq!(name, "foo");
+                assert!(global);
+            } else {
+                panic!("expected SkillsAction::Remove, got a different variant");
+            }
+        } else {
+            panic!("expected Some(Command::Skills)");
+        }
+    }
+}
+
+#[cfg(test)]
+mod marketplace_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_marketplace_add_list_remove() {
+        let cli = Cli::parse_from(["local-code", "marketplace", "add", "acme/plugins"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Marketplace {
+                action: MarketplaceAction::Add { ref spec }
+            }) if spec == "acme/plugins"
+        ));
+
+        let cli = Cli::parse_from(["local-code", "marketplace", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Marketplace {
+                action: MarketplaceAction::List
+            })
+        ));
+
+        let cli = Cli::parse_from(["local-code", "marketplace", "remove", "acme-tools"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Marketplace {
+                action: MarketplaceAction::Remove { ref name }
+            }) if name == "acme-tools"
+        ));
+    }
+
+    #[test]
+    fn parses_plugin_install_with_global() {
+        let cli = Cli::parse_from([
+            "local-code",
+            "plugin",
+            "install",
+            "code-formatter@acme-tools",
+            "--global",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                action: PluginAction::Install { ref spec, global: true }
+            }) if spec == "code-formatter@acme-tools"
+        ));
+    }
+
+    #[test]
+    fn parses_plugin_list_remove_update() {
+        let cli = Cli::parse_from(["local-code", "plugin", "list"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                action: PluginAction::List
+            })
+        ));
+
+        let cli = Cli::parse_from(["local-code", "plugin", "remove", "foo", "--global"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                action: PluginAction::Remove { ref name, global: true }
+            }) if name == "foo"
+        ));
+
+        let cli = Cli::parse_from(["local-code", "plugin", "update", "foo"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                action: PluginAction::Update { ref name, global: false }
+            }) if name == "foo"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod secret_cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_secret_set_rm_ls() {
+        let cli = Cli::parse_from(["local-code", "secret", "set", "gh-token"]);
+        match cli.command {
+            Some(Command::Secret {
+                action: SecretAction::Set { name },
+            }) => assert_eq!(name, "gh-token"),
+            other => panic!("expected Secret::Set, got {other:?}"),
+        }
+        let cli = Cli::parse_from(["local-code", "secret", "rm", "gh-token"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret {
+                action: SecretAction::Rm { .. }
+            })
+        ));
+        let cli = Cli::parse_from(["local-code", "secret", "ls"]);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Secret {
+                action: SecretAction::Ls
+            })
+        ));
     }
 }

@@ -1,5 +1,3 @@
-// src/mcp/tool.rs
-
 use std::sync::Arc;
 
 use daimon::mcp::McpToolBridge;
@@ -29,6 +27,20 @@ impl NamespacedMcpTool {
             inner: Arc::new(inner),
         }
     }
+
+    /// Closes the live MCP server connection behind this tool (shared by
+    /// every tool from the same server). Safe to call more than once — the
+    /// daimon transports tolerate repeated `close()`.
+    pub async fn close_connection(&self) -> daimon::Result<()> {
+        self.inner.close().await
+    }
+
+    /// True when `other` talks through the same live server connection —
+    /// lets shutdown close each connection exactly once (see
+    /// `mcp::connect::close_all`).
+    pub fn shares_connection_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(self.inner.transport(), other.inner.transport())
+    }
 }
 
 impl Tool for NamespacedMcpTool {
@@ -49,43 +61,98 @@ impl Tool for NamespacedMcpTool {
     }
 }
 
+/// Test-only bridge factory shared with sibling modules' tests (e.g.
+/// `tui::rebuild`'s duplicate-tool-name failure test): a minimal in-process
+/// `McpTransport` that answers every request with an empty no-op result
+/// (its consumers only need the bridge's *name*; none ever execute the
+/// tool), wrapped in a real `McpToolBridge` carrying the given tool name.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use daimon::mcp::protocol::{JsonRpcNotification, JsonRpcResponse, McpToolInfo};
+    use daimon::mcp::{McpToolBridge, McpTransport};
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    struct InertTransport;
+
+    impl McpTransport for InertTransport {
+        fn request<'a>(
+            &'a self,
+            _method: &'a str,
+            _params: Option<serde_json::Value>,
+        ) -> Pin<Box<dyn Future<Output = daimon::Result<JsonRpcResponse>> + Send + 'a>> {
+            Box::pin(async {
+                Ok(serde_json::from_value(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "result": { "content": [], "isError": false }
+                }))
+                .unwrap())
+            })
+        }
+
+        fn notify<'a>(
+            &'a self,
+            _notification: &'a JsonRpcNotification,
+        ) -> Pin<Box<dyn Future<Output = daimon::Result<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn close<'a>(&'a self) -> Pin<Box<dyn Future<Output = daimon::Result<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    pub(crate) fn bridge_named(tool_name: &str) -> McpToolBridge {
+        let transport: Arc<dyn McpTransport> = Arc::new(InertTransport);
+        let info = McpToolInfo {
+            name: tool_name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        McpToolBridge::new(transport, info)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use daimon::mcp::protocol::{
-        JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, McpToolInfo,
-    };
     use daimon::mcp::McpTransport;
+    use daimon::mcp::protocol::{JsonRpcNotification, JsonRpcResponse, McpToolInfo};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
 
     /// An in-process fake `McpTransport` for fast, deterministic unit tests —
-    /// no real process/socket involved. Records the last request it received
-    /// and always answers `tools/call` with a fixed text content block, or an
-    /// MCP-level error if `fail_calls` is set.
+    /// no real process/socket involved. Always answers `tools/call` with a
+    /// fixed text content block, or an MCP-level error if `fail_calls` is
+    /// set. Request-id allocation is the transport's job (per
+    /// `McpTransport::request`'s contract); these tests never inspect the
+    /// response id, so a fixed `0` stands in for whatever a real transport
+    /// would allocate.
     struct MockTransport {
         fail_calls: bool,
     }
 
     impl McpTransport for MockTransport {
-        fn send<'a>(
+        fn request<'a>(
             &'a self,
-            request: &'a JsonRpcRequest,
+            _method: &'a str,
+            _params: Option<serde_json::Value>,
         ) -> Pin<Box<dyn Future<Output = daimon::Result<JsonRpcResponse>> + Send + 'a>> {
             let fail_calls = self.fail_calls;
-            let id = request.id;
             Box::pin(async move {
                 let body = if fail_calls {
                     serde_json::json!({
                         "jsonrpc": "2.0",
-                        "id": id,
+                        "id": 0,
                         "error": { "code": -32000, "message": "tool failed" }
                     })
                 } else {
                     serde_json::json!({
                         "jsonrpc": "2.0",
-                        "id": id,
+                        "id": 0,
                         "result": {
                             "content": [{"type": "text", "text": "mock tool output"}],
                             "isError": false
@@ -154,5 +221,18 @@ mod tests {
             .unwrap();
         assert!(output.is_error);
         assert!(output.content.contains("tool failed"));
+    }
+
+    #[tokio::test]
+    async fn tools_cloned_for_rebuilds_share_a_connection_and_close_cleanly() {
+        let tool = NamespacedMcpTool::new("filesystem", bridge(false));
+        // The rebuild path (`/model`, `/resume`) clones tools; clones must
+        // compare as the same connection so shutdown closes it once.
+        let clone = tool.clone();
+        assert!(tool.shares_connection_with(&clone));
+        tool.close_connection().await.unwrap();
+        // Distinct servers (fresh transports) must not compare shared.
+        let other = NamespacedMcpTool::new("other", bridge(false));
+        assert!(!tool.shares_connection_with(&other));
     }
 }

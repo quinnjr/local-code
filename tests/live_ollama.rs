@@ -2,6 +2,7 @@
 //!   - Ollama running locally (default `http://localhost:11434`) with a model
 //!     pulled that supports tool calling (e.g. `llama3.1`).
 //!   - `LOCAL_CODE_TEST_OLLAMA_MODEL` set to that model's name.
+//!
 //! Run with: `cargo test --test live_ollama -- --ignored --nocapture`
 
 use std::sync::Arc;
@@ -19,8 +20,8 @@ use local_code::permissions::types::PermissionTier;
 async fn prompts_a_real_ollama_server_and_gets_a_text_response() {
     let base_url = std::env::var("LOCAL_CODE_TEST_OLLAMA_BASE_URL")
         .unwrap_or_else(|_| "http://localhost:11434".to_string());
-    let model_id = std::env::var("LOCAL_CODE_TEST_OLLAMA_MODEL")
-        .unwrap_or_else(|_| "llama3.1".to_string());
+    let model_id =
+        std::env::var("LOCAL_CODE_TEST_OLLAMA_MODEL").unwrap_or_else(|_| "llama3.1".to_string());
 
     let connection = Connection {
         name: "live-ollama-test".into(),
@@ -28,6 +29,7 @@ async fn prompts_a_real_ollama_server_and_gets_a_text_response() {
         base_url,
         default_model: model_id,
         models: vec![],
+        effort: None,
     };
 
     let model = build_model(&connection, None).expect("model construction should not fail");

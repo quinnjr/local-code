@@ -1,6 +1,6 @@
-// src/memory/search.rs
-
 use crate::memory::{MemoryError, MemoryPaths};
+use chrono::NaiveDate;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,15 @@ pub fn search(memory_dir: &Path, query: &str) -> Result<Vec<MemoryHit>, MemoryEr
         return Ok(hits);
     }
 
-    let query_lower = query.to_lowercase();
+    // A case-insensitive matcher compiled once, instead of allocating a
+    // lowercased copy of every scanned line (the previous
+    // `line.to_lowercase().contains(...)` paid one heap allocation per line
+    // across every memory file). `(?i)` uses Unicode simple case folding,
+    // matching the old `to_lowercase` semantics for practical inputs.
+    let matcher = regex::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .build()
+        .expect("escaped literal query always compiles");
     let paths = MemoryPaths::new(memory_dir);
 
     let mut files: Vec<PathBuf> = Vec::new();
@@ -36,10 +44,11 @@ pub fn search(memory_dir: &Path, query: &str) -> Result<Vec<MemoryHit>, MemoryEr
             source,
         })?;
         let path = entry.path();
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("today-") && name.ends_with(".md") {
-                daily.push(path);
-            }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with("today-")
+            && name.ends_with(".md")
+        {
+            daily.push(path);
         }
     }
     daily.sort();
@@ -54,13 +63,36 @@ pub fn search(memory_dir: &Path, query: &str) -> Result<Vec<MemoryHit>, MemoryEr
     // Deliberately excludes paths.core_memories: core memories are always loaded in
     // full by callers (see read_core_memories), never searched on demand.
 
+    // rollup_and_archive copies every in-window daily file into recent.md
+    // (under a `# YYYY-MM-DD` heading) but deletes only archived files, so
+    // afterwards the same line exists both in recent.md and in its
+    // today-YYYY-MM-DD.md file. Dedup on (date, line) — the date taken from
+    // the daily filename or the current `# `-prefixed date heading — so each
+    // copied line is scanned but reported once.
+    let mut seen: HashSet<(NaiveDate, String)> = HashSet::new();
     for file in files {
         let contents = fs::read_to_string(&file).map_err(|source| MemoryError::Read {
             path: file.clone(),
             source,
         })?;
+        let mut current_date = file.file_name().and_then(|n| n.to_str()).and_then(|name| {
+            name.strip_prefix("today-")
+                .and_then(|s| s.strip_suffix(".md"))
+                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        });
         for (idx, line) in contents.lines().enumerate() {
-            if line.to_lowercase().contains(&query_lower) {
+            if let Some(date) = line
+                .strip_prefix("# ")
+                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            {
+                current_date = Some(date);
+            }
+            if matcher.is_match(line) {
+                if let Some(date) = current_date
+                    && !seen.insert((date, line.to_string()))
+                {
+                    continue;
+                }
                 hits.push(MemoryHit {
                     file: file.clone(),
                     line_number: idx + 1,
@@ -87,7 +119,11 @@ mod tests {
     fn finds_case_insensitive_matches_in_buffer() {
         let dir = tempdir().unwrap();
         let memory_dir = dir.path().join("memory");
-        write(&memory_dir, "now.md", "<!-- buffer-date: 2026-07-06 -->\n\n## 09:00:00Z\nFixed the Flaky test.\n");
+        write(
+            &memory_dir,
+            "now.md",
+            "<!-- buffer-date: 2026-07-06 -->\n\n## 09:00:00Z\nFixed the Flaky test.\n",
+        );
 
         let hits = search(&memory_dir, "flaky").unwrap();
         assert_eq!(hits.len(), 1);
@@ -99,19 +135,62 @@ mod tests {
     fn finds_matches_across_daily_recent_and_archive_files() {
         let dir = tempdir().unwrap();
         let memory_dir = dir.path().join("memory");
-        write(&memory_dir, "today-2026-07-05.md", "## 09:00:00Z\nDaily file mentions widgets.\n");
-        write(&memory_dir, "recent.md", "# 2026-07-06\n\n## 09:00:00Z\nRecent file mentions widgets too.\n");
-        write(&memory_dir, "archive.md", "# 2026-06-01\n\n## 09:00:00Z\nArchived widgets note.\n");
+        write(
+            &memory_dir,
+            "today-2026-07-05.md",
+            "## 09:00:00Z\nDaily file mentions widgets.\n",
+        );
+        write(
+            &memory_dir,
+            "recent.md",
+            "# 2026-07-06\n\n## 09:00:00Z\nRecent file mentions widgets too.\n",
+        );
+        write(
+            &memory_dir,
+            "archive.md",
+            "# 2026-06-01\n\n## 09:00:00Z\nArchived widgets note.\n",
+        );
 
         let hits = search(&memory_dir, "widgets").unwrap();
         assert_eq!(hits.len(), 3);
     }
 
     #[test]
+    fn reports_a_line_once_when_it_is_in_both_a_daily_file_and_recent() {
+        let dir = tempdir().unwrap();
+        let memory_dir = dir.path().join("memory");
+        // What rollup_and_archive leaves behind: the in-window daily file
+        // stays on disk and its content is copied into recent.md under a
+        // `# YYYY-MM-DD` heading.
+        write(
+            &memory_dir,
+            "today-2026-07-09.md",
+            "## 09:00:00Z\nWidgets are restocked.\n",
+        );
+        write(
+            &memory_dir,
+            "recent.md",
+            "# 2026-07-09\n\n## 09:00:00Z\nWidgets are restocked.\n",
+        );
+
+        let hits = search(&memory_dir, "widgets").unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "a line present in both the daily file and recent.md must be reported once: {hits:?}"
+        );
+        assert_eq!(hits[0].line, "Widgets are restocked.");
+    }
+
+    #[test]
     fn does_not_search_core_memories_file() {
         let dir = tempdir().unwrap();
         let memory_dir = dir.path().join("memory");
-        write(&memory_dir, "core-memories.md", "## 2026-06-15\nNever use unwrap() outside tests.\n");
+        write(
+            &memory_dir,
+            "core-memories.md",
+            "## 2026-06-15\nNever use unwrap() outside tests.\n",
+        );
 
         let hits = search(&memory_dir, "unwrap").unwrap();
         assert!(hits.is_empty());
@@ -129,10 +208,29 @@ mod tests {
     fn line_numbers_are_one_indexed() {
         let dir = tempdir().unwrap();
         let memory_dir = dir.path().join("memory");
-        write(&memory_dir, "now.md", "line one\nline two matches HERE\nline three\n");
+        write(
+            &memory_dir,
+            "now.md",
+            "line one\nline two matches HERE\nline three\n",
+        );
 
         let hits = search(&memory_dir, "here").unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].line_number, 2);
+    }
+
+    #[test]
+    fn search_treats_regex_metacharacters_as_literals() {
+        let dir = tempdir().unwrap();
+        let memory_dir = dir.path().join("memory");
+        write(&memory_dir, "recent.md", "config: a.b\nother: axb\n");
+        let hits = search(&memory_dir, "a.b").unwrap();
+        assert_eq!(hits.len(), 1, "the dot must not match 'axb': {hits:?}");
+        assert!(hits[0].line.contains("a.b"));
+        let paren_hits = search(&memory_dir, "(config").unwrap();
+        assert!(
+            paren_hits.is_empty(),
+            "an unbalanced paren query must not panic or match"
+        );
     }
 }

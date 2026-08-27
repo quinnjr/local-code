@@ -7,4 +7,4 @@ pub mod store;
 pub mod types;
 
 pub use store::{list_sessions, load_session, save_session};
-pub use types::{SessionFile, SessionSummary, SESSION_FILE_VERSION};
+pub use types::{SESSION_FILE_VERSION, SessionFile, SessionSummary};

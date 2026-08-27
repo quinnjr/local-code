@@ -1,5 +1,3 @@
-// src/permissions/stdio.rs
-
 use std::future::Future;
 use std::pin::Pin;
 
@@ -10,9 +8,9 @@ use crate::permissions::types::{PermissionDecision, PermissionPrompter, Permissi
 
 /// Renders a [`PermissionRequest`] as plain numbered choices over any
 /// `AsyncBufRead`/`AsyncWrite` pair (real stdin/stdout in production, an in-memory
-/// buffer in tests). The TUI phase will supply a different [`PermissionPrompter`]
-/// impl that renders inline in the transcript instead — this type is not reused
-/// there, but the trait it implements is.
+/// buffer in tests). The TUI supplies a different [`PermissionPrompter`] impl
+/// that renders inline in the transcript (see `crate::tui::permission_prompter`)
+/// — this type is not reused there, but the trait it implements is.
 pub struct StdioPrompter<R, W> {
     input: Mutex<R>,
     output: Mutex<W>,
@@ -34,7 +32,10 @@ where
 impl StdioPrompter<tokio::io::BufReader<tokio::io::Stdin>, tokio::io::Stdout> {
     /// Convenience constructor wired to the real process stdin/stdout.
     pub fn real() -> Self {
-        Self::new(tokio::io::BufReader::new(tokio::io::stdin()), tokio::io::stdout())
+        Self::new(
+            tokio::io::BufReader::new(tokio::io::stdin()),
+            tokio::io::stdout(),
+        )
     }
 }
 
@@ -74,7 +75,9 @@ where
                 "2" => PermissionDecision::AllowAlwaysThisSession,
                 _ => {
                     let mut out = self.output.lock().await;
-                    let _ = out.write_all(b"Feedback (why not / what to do instead): ").await;
+                    let _ = out
+                        .write_all(b"Feedback (why not / what to do instead): ")
+                        .await;
                     let _ = out.flush().await;
                     drop(out);
 
@@ -96,9 +99,7 @@ mod tests {
 
     fn request() -> PermissionRequest {
         PermissionRequest {
-            tool_name: "bash".into(),
             description: "run shell command: rm file.txt".into(),
-            command_preview: Some("rm file.txt".into()),
         }
     }
 

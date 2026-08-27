@@ -1,47 +1,100 @@
-// src/tui/components/transcript.rs
-
 use ntui::props::{FlexDirection, Overflow};
-use ntui::style::{BorderStyle, Color};
-use ntui::{component, element, Element, KeyCode};
+use ntui::style::Color;
+use ntui::widgets::{Spinner, SpinnerProps, Theme};
+use ntui::{Element, KeyCode, component, element};
+
+use crate::tui::theme::TOOL_ACCENT;
+
+use std::sync::Arc;
 
 use crate::permissions::types::PermissionRequest;
 use crate::tui::components::permission_card::render_permission_card;
-use crate::tui::state::TranscriptEntry;
+use crate::tui::state::{TranscriptEntries, TranscriptEntry};
 
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, Default)]
 pub struct TranscriptProps {
-    pub entries: Vec<TranscriptEntry>,
+    pub entries: TranscriptEntries,
     pub pending_permission: Option<PermissionRequest>,
+    /// The in-flight streamed assistant text for the current turn, rendered
+    /// as a trailing pseudo-entry. Kept out of `entries` so every `TextDelta`
+    /// re-render clones one small growing `String` instead of the whole
+    /// transcript (see `run_turn`'s stream loop) — the entry is folded into
+    /// `entries` once the streamed block completes.
+    pub streaming_text: String,
+    /// Whether this transcript's pane has keyboard focus. The workspace
+    /// mounts one `Transcript` per pane (including hidden windows) and ntui
+    /// dispatches each key to every handler in the tree, deepest-first, until
+    /// one stops propagation — so an unfocused transcript must not consume
+    /// scroll keys, or it steals them from the focused pane AND from
+    /// `Workspace`'s `C-b <arrow>` chords (leaving the prefix wedged armed).
+    pub focused: bool,
+    /// Mirror of the workspace's "a `C-b` chord is armed" flag (same handle
+    /// `App` checks in `session_may_handle_input`): while armed, even the
+    /// focused transcript lets arrow keys bubble up so `C-b <Up>/<Down>`
+    /// reach `Workspace` instead of scrolling.
+    pub input_gate: Option<ntui::State<bool>>,
+}
+
+impl PartialEq for TranscriptProps {
+    /// `input_gate` is excluded: handlers read it through the shared
+    /// `ntui::State` at event time, so a gate flip needs no re-render here
+    /// (mirrors `AppProps`'s treatment of the same handle). Field order
+    /// matters: while streaming, `streaming_text` differs on every token, so
+    /// comparing it FIRST short-circuits before the O(n) deep walk of
+    /// `entries` that would otherwise run per token for an always-false
+    /// answer.
+    fn eq(&self, other: &Self) -> bool {
+        self.streaming_text == other.streaming_text
+            && self.focused == other.focused
+            && self.pending_permission == other.pending_permission
+            && entries_eq(&self.entries, &other.entries)
+    }
+}
+
+/// Entry-list equality with an `Arc::ptr_eq` fast path: after the Arc
+/// migration, an unchanged transcript compares as n pointer checks instead of
+/// n deep `String` comparisons (only a genuinely-replaced entry falls back to
+/// a value compare).
+fn entries_eq(a: &[Arc<TranscriptEntry>], b: &[Arc<TranscriptEntry>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y) || x == y)
 }
 
 /// The scrollable, full-width transcript pane. Owns its own `Scroll` handle
 /// (created via `hooks.use_scroll()`) and a `use_input` that only intercepts
-/// Up/Down/PageUp/PageDown, calling `stop_propagation()` for those so they
-/// don't also reach `App`'s own handler, while every other key (typed
+/// Up/Down/PageUp/PageDown — and only while its pane is focused and no
+/// workspace prefix chord is armed — calling `stop_propagation()` for those
+/// so they don't also reach other handlers, while every other key (typed
 /// characters, Enter, digits for permission choices) bubbles up untouched.
 #[component]
 pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
     let scroll = hooks.use_scroll();
     hooks.use_input({
         let scroll = scroll.clone();
-        move |ev, ctx| match ev.code {
-            KeyCode::Up => {
-                scroll.scroll_by(-1);
-                ctx.stop_propagation();
+        let focused = props.focused;
+        let input_gate = props.input_gate.clone();
+        move |ev, ctx| {
+            if !focused || input_gate.as_ref().is_some_and(|gate| gate.get()) {
+                return;
             }
-            KeyCode::Down => {
-                scroll.scroll_by(1);
-                ctx.stop_propagation();
+            match ev.code {
+                KeyCode::Up => {
+                    scroll.scroll_by(-1);
+                    ctx.stop_propagation();
+                }
+                KeyCode::Down => {
+                    scroll.scroll_by(1);
+                    ctx.stop_propagation();
+                }
+                KeyCode::PageUp => {
+                    scroll.scroll_by(-10);
+                    ctx.stop_propagation();
+                }
+                KeyCode::PageDown => {
+                    scroll.scroll_by(10);
+                    ctx.stop_propagation();
+                }
+                _ => {}
             }
-            KeyCode::PageUp => {
-                scroll.scroll_by(-10);
-                ctx.stop_propagation();
-            }
-            KeyCode::PageDown => {
-                scroll.scroll_by(10);
-                ctx.stop_propagation();
-            }
-            _ => {}
         }
     });
 
@@ -55,24 +108,45 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
     // means every earlier (unchanged) entry's rebuild is skipped on every
     // streamed token, rather than being rebuilt from scratch on each
     // `Transcript` render as before.
-    let mut children: Vec<Element> = props
-        .entries
-        .iter()
-        .enumerate()
-        .map(|(i, entry)| {
-            Element::component::<TranscriptEntryView>(EntryProps { entry: entry.clone() })
-                .with_key(i.to_string())
+    let theme = hooks.use_theme();
+    let mut children: Vec<Element> = Vec::with_capacity(props.entries.len() + 2);
+    children.extend(props.entries.iter().enumerate().map(|(i, entry)| {
+        Element::component::<TranscriptEntryView>(EntryProps {
+            entry: entry.clone(),
         })
-        .collect();
+        .with_key(i.to_string())
+    }));
+
+    if !props.streaming_text.is_empty() {
+        // The in-flight turn gets a live spinner under the growing text so
+        // the transcript itself shows work in progress, not just the footer.
+        // The text reuses `render_entry`'s AssistantText arm so in-flight and
+        // settled assistant text can never style differently.
+        let tail = render_entry(
+            &TranscriptEntry::AssistantText {
+                text: props.streaming_text.clone(),
+            },
+            &theme,
+        );
+        children.push(
+            element! {
+                View(flex_direction: FlexDirection::Column) {
+                    #(vec![tail])
+                    Spinner()
+                }
+            }
+            .with_key("streaming-tail"),
+        );
+    }
 
     if let Some(request) = &props.pending_permission {
-        children.push(render_permission_card(request).with_key("pending-permission"));
+        children.push(render_permission_card(request, &theme).with_key("pending-permission"));
     }
 
     element! {
         View(
             flex_direction: FlexDirection::Column,
-            flex_grow: 1.0,
+            flex_grow: 1.0_f32,
             overflow: Overflow::Scroll,
             scroll: Some(scroll),
             padding: 0
@@ -87,29 +161,39 @@ pub fn Transcript(props: &TranscriptProps, hooks: &mut ntui::Hooks) -> Element {
 /// `children` construction above for why). `Default` is only ever exercised
 /// to satisfy `Component::Props`'s bound (this component is always mounted
 /// with a real entry via `element!`/`Element::component`, never defaulted).
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 struct EntryProps {
-    entry: TranscriptEntry,
+    entry: Arc<TranscriptEntry>,
+}
+
+impl PartialEq for EntryProps {
+    /// `Arc::ptr_eq` fast path first: while streaming, every entry except the
+    /// last is the same allocation render-to-render.
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.entry, &other.entry) || self.entry == other.entry
+    }
 }
 
 impl Default for EntryProps {
     fn default() -> Self {
         EntryProps {
-            entry: TranscriptEntry::SystemNotice { text: String::new() },
+            entry: Arc::new(TranscriptEntry::SystemNotice {
+                text: String::new(),
+            }),
         }
     }
 }
 
 #[component]
-fn TranscriptEntryView(props: &EntryProps, _hooks: &mut ntui::Hooks) -> Element {
-    render_entry(&props.entry)
+fn TranscriptEntryView(props: &EntryProps, hooks: &mut ntui::Hooks) -> Element {
+    render_entry(&props.entry, &hooks.use_theme())
 }
 
-fn render_entry(entry: &TranscriptEntry) -> Element {
+fn render_entry(entry: &TranscriptEntry, theme: &Theme) -> Element {
     match entry {
         TranscriptEntry::UserTurn { text } => element! {
-            View(border_style: BorderStyle::Single, border_color: Color::Blue, padding: 1) {
-                Text(content: text.clone(), color: Color::White)
+            View(border_style: theme.border_style, border_color: theme.accent, padding: 1) {
+                Text(content: text.clone(), color: theme.foreground)
             }
         },
         TranscriptEntry::AssistantText { text } => element! {
@@ -117,12 +201,15 @@ fn render_entry(entry: &TranscriptEntry) -> Element {
                 Text(content: text.clone(), color: Color::Reset)
             }
         },
-        TranscriptEntry::ToolCall(call) => render_tool_card(call),
-        TranscriptEntry::PermissionResolved { description, allowed } => {
+        TranscriptEntry::ToolCall(call) => render_tool_card(call, theme),
+        TranscriptEntry::PermissionResolved {
+            description,
+            allowed,
+        } => {
             let (label, color) = if *allowed {
-                ("allowed", Color::Green)
+                ("allowed", theme.success)
             } else {
-                ("denied", Color::Red)
+                ("denied", theme.danger)
             };
             element! {
                 View(padding: 1) {
@@ -132,44 +219,47 @@ fn render_entry(entry: &TranscriptEntry) -> Element {
         }
         TranscriptEntry::SystemNotice { text } => element! {
             View(padding: 1) {
-                Text(content: text.clone(), color: Color::DarkGrey)
+                Text(content: text.clone(), color: theme.muted)
             }
         },
     }
 }
 
-fn render_tool_card(call: &crate::tui::state::ToolCallEntry) -> Element {
-    let header = format!(
-        "{} {}",
-        if call.expanded { "▾" } else { "▸" },
-        call.name
-    );
+fn render_tool_card(call: &crate::tui::state::ToolCallEntry, theme: &Theme) -> Element {
+    let running = call.result.is_none();
+    let header = format!("{} {}", if call.expanded { "▾" } else { "▸" }, call.name);
     if !call.expanded {
+        // A collapsed card still animates while its call is in flight.
+        let header_el: Element = if running {
+            element! { Spinner(label: header, color: Some(TOOL_ACCENT)) }
+        } else {
+            element! { Text(content: header, color: TOOL_ACCENT) }
+        };
         return element! {
-            View(border_style: BorderStyle::Single, border_color: Color::DarkGrey, padding: 0) {
-                Text(content: header, color: Color::Magenta)
+            View(border_style: theme.border_style, border_color: theme.border, padding: 0) {
+                #(vec![header_el])
             }
         };
     }
 
     let mut body: Vec<Element> = vec![element! {
-        Text(content: format!("args: {}", call.arguments_json), color: Color::DarkGrey)
+        Text(content: format!("args: {}", call.arguments_json), color: theme.muted)
     }];
 
     if let Some(result) = &call.result {
-        for line in diff_lines(&call.name, &result.content) {
+        for line in diff_lines(&call.name, &result.content, theme) {
             body.push(line);
         }
         if result.is_error {
-            body.push(element! { Text(content: "(tool reported an error)", color: Color::Red) });
+            body.push(element! { Text(content: "(tool reported an error)", color: theme.danger) });
         }
     } else {
-        body.push(element! { Text(content: "(running…)", color: Color::DarkGrey) });
+        body.push(element! { Spinner(label: "running…".to_string(), color: Some(TOOL_ACCENT)) });
     }
 
     element! {
-        View(flex_direction: FlexDirection::Column, border_style: BorderStyle::Single, border_color: Color::Magenta, padding: 1) {
-            Text(content: header, color: Color::Magenta)
+        View(flex_direction: FlexDirection::Column, border_style: theme.border_style, border_color: TOOL_ACCENT, padding: 1) {
+            Text(content: header, color: TOOL_ACCENT)
             #(body)
         }
     }
@@ -183,13 +273,13 @@ fn render_tool_card(call: &crate::tui::state::ToolCallEntry) -> Element {
 /// so "diff coloring" here colors whole result lines green (success) or red
 /// (error) rather than per-hunk +/-; this is the full extent of diff
 /// information the Phase 2 tool contract exposes today.
-fn diff_lines(tool_name: &str, content: &str) -> Vec<Element> {
+fn diff_lines(tool_name: &str, content: &str, theme: &Theme) -> Vec<Element> {
     let is_mutation = matches!(tool_name, "write_file" | "edit_file" | "bash");
     content
         .lines()
         .map(|line| {
             let (prefix, color) = if is_mutation {
-                ("+ ", Color::Green)
+                ("+ ", theme.success)
             } else {
                 ("  ", Color::Reset)
             };
@@ -204,12 +294,17 @@ mod tests {
     use crate::tui::state::{ToolCallEntry, ToolCallResult};
     use ntui::testing::TestTerminal;
 
-    fn entries_fixture() -> Vec<TranscriptEntry> {
+    /// Any braille spinner frame, not just frame 0 — pinning the first frame
+    /// would couple these tests to the animation phase and the test
+    /// runtime's polling behavior.
+    const SPINNER_FRAMES: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+
+    fn entries_fixture() -> TranscriptEntries {
         vec![
-            TranscriptEntry::UserTurn {
+            Arc::new(TranscriptEntry::UserTurn {
                 text: "fix the bug".into(),
-            },
-            TranscriptEntry::ToolCall(ToolCallEntry {
+            }),
+            Arc::new(TranscriptEntry::ToolCall(ToolCallEntry {
                 id: "1".into(),
                 name: "edit_file".into(),
                 arguments_json: r#"{"path":"x.rs"}"#.into(),
@@ -218,10 +313,10 @@ mod tests {
                     is_error: false,
                 }),
                 expanded: true,
-            }),
-            TranscriptEntry::AssistantText {
+            })),
+            Arc::new(TranscriptEntry::AssistantText {
                 text: "Done, fixed it.".into(),
-            },
+            }),
         ]
     }
 
@@ -229,7 +324,7 @@ mod tests {
     async fn renders_user_turn_tool_card_and_assistant_text() {
         let props = TranscriptProps {
             entries: entries_fixture(),
-            pending_permission: None,
+            ..Default::default()
         };
         let t = TestTerminal::new(60, 20, Element::component::<Transcript>(props)).unwrap();
         let text = t.frame_text();
@@ -242,12 +337,12 @@ mod tests {
     #[tokio::test]
     async fn collapsed_tool_card_hides_its_body() {
         let mut entries = entries_fixture();
-        if let TranscriptEntry::ToolCall(call) = &mut entries[1] {
+        if let TranscriptEntry::ToolCall(call) = Arc::make_mut(&mut entries[1]) {
             call.expanded = false;
         }
         let props = TranscriptProps {
             entries,
-            pending_permission: None,
+            ..Default::default()
         };
         let t = TestTerminal::new(60, 20, Element::component::<Transcript>(props)).unwrap();
         assert!(!t.frame_text().contains("edited x.rs"));
@@ -257,21 +352,63 @@ mod tests {
     async fn renders_pending_permission_card_when_present() {
         let props = TranscriptProps {
             entries: vec![],
+            focused: true,
             pending_permission: Some(PermissionRequest {
-                tool_name: "bash".into(),
                 description: "run shell command: rm x".into(),
-                command_preview: Some("rm x".into()),
             }),
+            ..Default::default()
         };
         let t = TestTerminal::new(60, 10, Element::component::<Transcript>(props)).unwrap();
-        assert!(t.frame_text().contains("Permission requested: run shell command: rm x"));
+        assert!(
+            t.frame_text()
+                .contains("Permission requested: run shell command: rm x")
+        );
+    }
+
+    #[tokio::test]
+    async fn running_tool_call_shows_a_spinner() {
+        let entries: TranscriptEntries = vec![Arc::new(TranscriptEntry::ToolCall(ToolCallEntry {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments_json: r#"{"command":"ls"}"#.into(),
+            result: None,
+            expanded: true,
+        }))];
+        let props = TranscriptProps {
+            entries,
+            ..Default::default()
+        };
+        let t = TestTerminal::new(60, 10, Element::component::<Transcript>(props)).unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("running…"), "{text}");
+        assert!(
+            text.chars().any(|c| SPINNER_FRAMES.contains(c)),
+            "expected a spinner glyph: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_tail_carries_a_live_spinner() {
+        let props = TranscriptProps {
+            entries: vec![],
+            streaming_text: "thinking about it".into(),
+            ..Default::default()
+        };
+        let t = TestTerminal::new(60, 10, Element::component::<Transcript>(props)).unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("thinking about it"));
+        assert!(
+            text.chars().any(|c| SPINNER_FRAMES.contains(c)),
+            "expected a spinner glyph: {text}"
+        );
     }
 
     #[tokio::test]
     async fn up_key_scrolls_without_panicking() {
         let props = TranscriptProps {
             entries: entries_fixture(),
-            pending_permission: None,
+            focused: true,
+            ..Default::default()
         };
         let mut t = TestTerminal::new(60, 3, Element::component::<Transcript>(props)).unwrap();
         t.send_key(ntui::KeyCode::Up).unwrap(); // must not panic even with no scroll headroom

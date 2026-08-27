@@ -1,5 +1,3 @@
-// src/tui/permission_prompter.rs
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -75,7 +73,7 @@ impl PermissionPrompter for NtuiPermissionPrompter {
 mod tests {
     use super::*;
     use ntui::testing::TestTerminal;
-    use ntui::{component, element, Element};
+    use ntui::{Element, component, element};
 
     // `PermissionGate::check` is driven through a spawned task so this test
     // observes the prompter's *async* boundary the same way the real TUI

@@ -1,5 +1,3 @@
-// src/context/mod.rs
-
 use std::path::Path;
 
 use crate::config::paths::Paths;
@@ -14,16 +12,22 @@ pub fn load_project_context(paths: &Paths, project_root: &Path) -> String {
     let candidates = [
         (project_root.join("AGENTS.md"), "Project AGENTS.md"),
         (project_root.join("CLAUDE.md"), "Project CLAUDE.md"),
-        (paths.user_config_dir.join("AGENTS.md"), "User-level AGENTS.md"),
-        (paths.user_config_dir.join("CLAUDE.md"), "User-level CLAUDE.md"),
+        (
+            paths.user_config_dir.join("AGENTS.md"),
+            "User-level AGENTS.md",
+        ),
+        (
+            paths.user_config_dir.join("CLAUDE.md"),
+            "User-level CLAUDE.md",
+        ),
     ];
 
     let mut sections = Vec::new();
     for (path, label) in candidates {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if !content.trim().is_empty() {
-                sections.push(format!("## {label}\n\n{content}"));
-            }
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && !content.trim().is_empty()
+        {
+            sections.push(format!("## {label}\n\n{content}"));
         }
     }
     sections.join("\n\n")
@@ -53,7 +57,11 @@ mod tests {
     #[test]
     fn loads_project_agents_md_when_present() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTS.md"), "Always run tests before committing.").unwrap();
+        std::fs::write(
+            dir.path().join("AGENTS.md"),
+            "Always run tests before committing.",
+        )
+        .unwrap();
         let paths = test_paths(&dir.path().join("user-config"));
         let context = load_project_context(&paths, dir.path());
         assert!(context.contains("Project AGENTS.md"));

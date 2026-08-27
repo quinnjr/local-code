@@ -1,11 +1,20 @@
 use serde::{Deserialize, Serialize};
 
+/// OpenRouter's canonical API endpoint, including the `/api/v1` prefix every
+/// endpoint hangs off. Offered as the default base URL by the `connections
+/// add` wizards for `openrouter` connections (blank accepts it).
+pub const OPENROUTER_DEFAULT_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
     Ollama,
+    // One word, matching OpenRouter's own branding (kebab-case would
+    // otherwise produce "open-router").
+    #[serde(rename = "openrouter")]
+    OpenRouter,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -16,6 +25,12 @@ pub struct Connection {
     pub default_model: String,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Default reasoning effort for this connection (`effort = "high"` in
+    /// connections.toml). `None` sends no `reasoning_effort` field, leaving
+    /// the server's own default in place. A session can override it with
+    /// `/effort` or `--effort` without touching this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::agent::effort::ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -41,12 +56,18 @@ name = "home-ollama"
 provider = "ollama"
 base_url = "http://localhost:11434"
 default_model = "llama3.1"
+
+[[connection]]
+name = "openrouter"
+provider = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+default_model = "anthropic/claude-sonnet-4"
 "#;
 
     #[test]
     fn parses_multiple_connections_from_toml() {
         let file: ConnectionsFile = toml::from_str(TOML_FIXTURE).expect("valid toml");
-        assert_eq!(file.connections.len(), 2);
+        assert_eq!(file.connections.len(), 3);
         assert_eq!(file.connections[0].name, "local-vllm");
         assert_eq!(file.connections[0].provider, ProviderKind::OpenAiCompatible);
         assert_eq!(
@@ -56,11 +77,59 @@ default_model = "llama3.1"
     }
 
     #[test]
+    fn parses_openrouter_provider_kind() {
+        let file: ConnectionsFile = toml::from_str(TOML_FIXTURE).expect("valid toml");
+        assert_eq!(file.connections[2].provider, ProviderKind::OpenRouter);
+    }
+
+    #[test]
     fn models_field_defaults_to_empty_when_omitted() {
         let file: ConnectionsFile = toml::from_str(TOML_FIXTURE).expect("valid toml");
         assert_eq!(file.connections[1].name, "home-ollama");
         assert_eq!(file.connections[1].provider, ProviderKind::Ollama);
         assert!(file.connections[1].models.is_empty());
+    }
+
+    #[test]
+    fn effort_is_optional_and_parses_from_toml() {
+        let file: ConnectionsFile = toml::from_str(TOML_FIXTURE).expect("valid toml");
+        assert!(
+            file.connections.iter().all(|c| c.effort.is_none()),
+            "connections written before `effort` existed must load with no default effort"
+        );
+        let with_effort: ConnectionsFile = toml::from_str(
+            r#"
+[[connection]]
+name = "thinker"
+provider = "openai-compatible"
+base_url = "http://localhost:8080/v1"
+default_model = "gpt-oss-20b"
+effort = "high"
+"#,
+        )
+        .expect("valid toml");
+        assert_eq!(
+            with_effort.connections[0].effort,
+            Some(crate::agent::effort::ReasoningEffort::High)
+        );
+        // `None` is skipped on write (no `effort = ...` line), `Some` is written.
+        let serialized = toml::to_string(&file).unwrap();
+        assert!(!serialized.contains("effort"), "{serialized}");
+        let serialized = toml::to_string(&with_effort).unwrap();
+        assert!(serialized.contains("effort = \"high\""), "{serialized}");
+        assert!(
+            toml::from_str::<ConnectionsFile>(
+                r#"
+[[connection]]
+name = "x"
+provider = "ollama"
+base_url = "http://localhost:11434"
+default_model = "m"
+effort = "extreme"
+"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -88,6 +157,12 @@ pub enum ConnectionsError {
         path: PathBuf,
         #[source]
         source: toml::de::Error,
+    },
+    #[error("failed to write {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -130,11 +205,8 @@ fn load_one(path: &Path) -> Result<ConnectionsFile, ConnectionsError> {
 /// Used by `connections remove` — removal always targets the project-level file
 /// since that's the file this CLI writes to (user-level file is hand-edited or
 /// written by `connections add` when the user chooses to save it there).
-pub fn save_connections(
-    dir: &Path,
-    connections: &[Connection],
-) -> Result<(), ConnectionsError> {
-    fs::create_dir_all(dir).map_err(|source| ConnectionsError::Read {
+pub fn save_connections(dir: &Path, connections: &[Connection]) -> Result<(), ConnectionsError> {
+    fs::create_dir_all(dir).map_err(|source| ConnectionsError::Write {
         path: dir.to_path_buf(),
         source,
     })?;
@@ -142,10 +214,8 @@ pub fn save_connections(
         connections: connections.to_vec(),
     };
     let text = toml::to_string_pretty(&file).expect("Connection serializes without error");
-    fs::write(dir.join("connections.toml"), text).map_err(|source| ConnectionsError::Read {
-        path: dir.to_path_buf(),
-        source,
-    })
+    let path = dir.join("connections.toml");
+    fs::write(&path, text).map_err(|source| ConnectionsError::Write { path, source })
 }
 
 #[cfg(test)]
@@ -231,6 +301,34 @@ default_model = "m2"
     }
 
     #[test]
+    fn save_connections_reports_a_write_error_when_the_target_is_unwritable() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the config DIRECTORY should be: create_dir_all fails.
+        let blocking_file = dir.path().join("not-a-dir");
+        std::fs::write(&blocking_file, "x").unwrap();
+        let target = blocking_file.join("nested");
+        let err = save_connections(&target, &[]).unwrap_err();
+        assert!(
+            matches!(err, ConnectionsError::Write { .. }),
+            "a save failure must be labeled Write, not Read: {err}"
+        );
+    }
+
+    #[test]
+    fn save_connections_write_error_names_the_file_not_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the config FILE should be: fs::write fails.
+        std::fs::create_dir(dir.path().join("connections.toml")).unwrap();
+        let err = save_connections(dir.path(), &[]).unwrap_err();
+        match err {
+            ConnectionsError::Write { path, .. } => {
+                assert_eq!(path, dir.path().join("connections.toml"));
+            }
+            other => panic!("a save failure must be labeled Write, not Read: {other}"),
+        }
+    }
+
+    #[test]
     fn save_then_load_round_trips() {
         let dir = tempdir().unwrap();
         let conn = Connection {
@@ -239,8 +337,9 @@ default_model = "m2"
             base_url: "http://localhost:8000/v1".into(),
             default_model: "m".into(),
             models: vec![],
+            effort: None,
         };
-        save_connections(dir.path(), &[conn.clone()]).unwrap();
+        save_connections(dir.path(), std::slice::from_ref(&conn)).unwrap();
         let loaded = load_connections(Path::new("/nonexistent"), dir.path()).unwrap();
         assert_eq!(loaded, vec![conn]);
     }

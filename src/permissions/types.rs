@@ -1,13 +1,12 @@
-// src/permissions/types.rs
-
 use std::future::Future;
 use std::pin::Pin;
 
 /// How aggressively the agent may act without asking the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionTier {
     /// Every write/edit/bash call prompts (default).
+    #[default]
     Ask,
     /// File writes/edits auto-approved; bash still prompts.
     AutoAcceptEdits,
@@ -30,12 +29,23 @@ pub enum ToolKind {
 ///
 /// Unknown tool names (e.g. future MCP-provided tools) intentionally classify as
 /// [`ToolKind::Edit`] rather than [`ToolKind::ReadOnly`] — the safe default is to
-/// prompt for anything we don't explicitly know is read-only.
+/// prompt for anything we don't explicitly know is read-only. Known built-ins whose
+/// risk profile doesn't match that default (`serve_artifacts`) get an explicit arm
+/// above the catch-all rather than riding it.
 pub fn classify_tool(name: &str) -> ToolKind {
     match name {
         "read_file" | "grep" | "glob" => ToolKind::ReadOnly,
         "write_file" | "edit_file" => ToolKind::Edit,
         "bash" => ToolKind::Bash,
+        // Starting a persistent network listener has a bash-like risk profile —
+        // a side-effecting capability the user should approve — so it classifies
+        // as `Bash` rather than riding the `Edit` catch-all (which auto-approves
+        // in `AutoAcceptEdits`). As `Bash` it prompts in both `Ask` and
+        // `AutoAcceptEdits` and stays automatic in `FullAuto` (see the tier match
+        // in `permissions::gate::check`). The gate's Bash-specific
+        // always_allow/always_deny command-substring handling is a no-op here
+        // because `serve_artifacts` takes no `command` argument.
+        "serve_artifacts" => ToolKind::Bash,
         _ => ToolKind::Edit,
     }
 }
@@ -44,9 +54,7 @@ pub fn classify_tool(name: &str) -> ToolKind {
 /// whatever [`PermissionPrompter`] is in use.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PermissionRequest {
-    pub tool_name: String,
     pub description: String,
-    pub command_preview: Option<String>,
 }
 
 /// What the user decided in response to a [`PermissionRequest`].
@@ -94,6 +102,15 @@ mod tests {
     }
 
     #[test]
+    fn serve_artifacts_classifies_as_bash() {
+        // Starting a persistent network listener must prompt outside FullAuto,
+        // so it classifies as Bash — pinned here so a future refactor can't
+        // silently drop the explicit arm and reclassify it back to the
+        // auto-approving (in AutoAcceptEdits) Edit catch-all.
+        assert_eq!(classify_tool("serve_artifacts"), ToolKind::Bash);
+    }
+
+    #[test]
     fn unknown_tool_defaults_to_edit() {
         assert_eq!(classify_tool("some_future_mcp_tool"), ToolKind::Edit);
     }
@@ -107,7 +124,10 @@ mod tests {
         // what a future edit to `classify_tool` is most likely to touch.
         assert_eq!(classify_tool("filesystem__write_file"), ToolKind::Edit);
         assert_eq!(classify_tool("filesystem__read_file"), ToolKind::Edit);
-        assert_eq!(classify_tool("some_remote_server__delete_everything"), ToolKind::Edit);
+        assert_eq!(
+            classify_tool("some_remote_server__delete_everything"),
+            ToolKind::Edit
+        );
     }
 
     #[test]
