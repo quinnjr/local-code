@@ -7,7 +7,7 @@ pkgdesc="Claude-Code-style terminal coding agent for local OpenAI-compatible LLM
 arch=('x86_64' 'aarch64')
 url="https://github.com/quinnjr/local-code"
 license=('MIT OR Apache-2.0')
-depends=('glibc' 'dbus')
+depends=('glibc' 'dbus' 'gpgme')
 makedepends=('cargo' 'pkgconf')
 # Rust handles LTO itself; makepkg's -flto CFLAGS break the aws-lc-sys C/asm build.
 options=('!lto')

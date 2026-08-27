@@ -10,6 +10,7 @@ pkgbase = local-code
 	makedepends = pkgconf
 	depends = glibc
 	depends = dbus
+	depends = gpgme
 	optdepends = pass: password-store fallback for API keys when no Secret Service daemon is running
 	optdepends = gnome-keyring: Secret Service backend for API-key storage
 	optdepends = kwallet: Secret Service backend for API-key storage
