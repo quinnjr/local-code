@@ -25,6 +25,12 @@ pub struct Connection {
     pub default_model: String,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Default reasoning effort for this connection (`effort = "high"` in
+    /// connections.toml). `None` sends no `reasoning_effort` field, leaving
+    /// the server's own default in place. A session can override it with
+    /// `/effort` or `--effort` without touching this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::agent::effort::ReasoningEffort>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -82,6 +88,48 @@ default_model = "anthropic/claude-sonnet-4"
         assert_eq!(file.connections[1].name, "home-ollama");
         assert_eq!(file.connections[1].provider, ProviderKind::Ollama);
         assert!(file.connections[1].models.is_empty());
+    }
+
+    #[test]
+    fn effort_is_optional_and_parses_from_toml() {
+        let file: ConnectionsFile = toml::from_str(TOML_FIXTURE).expect("valid toml");
+        assert!(
+            file.connections.iter().all(|c| c.effort.is_none()),
+            "connections written before `effort` existed must load with no default effort"
+        );
+        let with_effort: ConnectionsFile = toml::from_str(
+            r#"
+[[connection]]
+name = "thinker"
+provider = "openai-compatible"
+base_url = "http://localhost:8080/v1"
+default_model = "gpt-oss-20b"
+effort = "high"
+"#,
+        )
+        .expect("valid toml");
+        assert_eq!(
+            with_effort.connections[0].effort,
+            Some(crate::agent::effort::ReasoningEffort::High)
+        );
+        // `None` is skipped on write (no `effort = ...` line), `Some` is written.
+        let serialized = toml::to_string(&file).unwrap();
+        assert!(!serialized.contains("effort"), "{serialized}");
+        let serialized = toml::to_string(&with_effort).unwrap();
+        assert!(serialized.contains("effort = \"high\""), "{serialized}");
+        assert!(
+            toml::from_str::<ConnectionsFile>(
+                r#"
+[[connection]]
+name = "x"
+provider = "ollama"
+base_url = "http://localhost:11434"
+default_model = "m"
+effort = "extreme"
+"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -289,6 +337,7 @@ default_model = "m2"
             base_url: "http://localhost:8000/v1".into(),
             default_model: "m".into(),
             models: vec![],
+            effort: None,
         };
         save_connections(dir.path(), std::slice::from_ref(&conn)).unwrap();
         let loaded = load_connections(Path::new("/nonexistent"), dir.path()).unwrap();

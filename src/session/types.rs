@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::agent::effort::ReasoningEffort;
 use crate::permissions::types::PermissionTier;
 use crate::tui::state::TranscriptEntry;
 use daimon::model::types::Message;
@@ -27,6 +28,11 @@ pub struct SessionFile {
     pub connection_name: String,
     pub model_name: String,
     pub tier: PermissionTier,
+    /// The session-level reasoning-effort override (`/effort`, `--effort`),
+    /// restored by `/resume`. `#[serde(default)]` so pre-effort session
+    /// files still load.
+    #[serde(default)]
+    pub effort: Option<ReasoningEffort>,
     pub created_at: String,
     pub updated_at: String,
     pub entries: Vec<TranscriptEntry>,
@@ -48,6 +54,7 @@ pub struct SessionFileView<'a> {
     pub connection_name: &'a str,
     pub model_name: &'a str,
     pub tier: PermissionTier,
+    pub effort: Option<ReasoningEffort>,
     pub created_at: &'a str,
     pub updated_at: &'a str,
     pub entries: &'a [std::sync::Arc<TranscriptEntry>],
@@ -68,6 +75,7 @@ impl SessionFile {
             connection_name,
             model_name,
             tier,
+            effort: None,
             created_at: created_at.clone(),
             updated_at: created_at,
             entries: Vec::new(),
@@ -83,6 +91,7 @@ impl PartialEq for SessionFile {
             && self.connection_name == other.connection_name
             && self.model_name == other.model_name
             && self.tier == other.tier
+            && self.effort == other.effort
             && self.created_at == other.created_at
             && self.updated_at == other.updated_at
             && self.entries == other.entries
@@ -138,6 +147,38 @@ mod tests {
         let json = serde_json::to_string_pretty(&session).unwrap();
         let back: SessionFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back, session);
+    }
+
+    #[test]
+    fn effort_round_trips_and_is_absent_from_pre_effort_files() {
+        let mut session = SessionFile::new(
+            "/proj".into(),
+            "conn".into(),
+            "model".into(),
+            PermissionTier::Ask,
+            "2026-07-06T10:00:00Z".into(),
+        );
+        assert_eq!(session.effort, None);
+        session.effort = Some(ReasoningEffort::Low);
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(json.contains("\"effort\":\"low\""), "{json}");
+        let back: SessionFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.effort, Some(ReasoningEffort::Low));
+
+        // A session saved before `effort` existed has no such key at all.
+        let legacy = serde_json::json!({
+            "version": SESSION_FILE_VERSION,
+            "project_root": "/proj",
+            "connection_name": "conn",
+            "model_name": "model",
+            "tier": "ask",
+            "created_at": "2026-07-06T10:00:00Z",
+            "updated_at": "2026-07-06T10:00:00Z",
+            "entries": [],
+            "messages": []
+        });
+        let back: SessionFile = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.effort, None);
     }
 
     #[test]

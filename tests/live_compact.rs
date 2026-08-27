@@ -21,6 +21,7 @@ async fn summarization_call_returns_nonempty_text() {
         base_url,
         default_model: model_id,
         models: vec![],
+        effort: None,
     };
     let model = build_model(&connection, None).expect("model construction should not fail");
 

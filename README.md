@@ -29,7 +29,11 @@ cloud calls or API keys required for local inference.
   `c` new window, `n`/`p`/`0-9` switch, `%`/`"` split, arrows/`o` move
   pane focus, `x` close. Background windows keep streaming (the tab bar
   marks them `✻`), and every pane is its own resumable session
-- Slash commands: `/model`, `/permissions`, `/connections`, `/init`,
+- Reasoning effort: `/effort low|medium|high|off` (or a digit menu with bare `/effort`),
+  `--effort` on the CLI, or `effort = "high"` on a connection in `connections.toml`.
+  Sent as the OpenAI-standard `reasoning_effort` field to openai-compatible connections
+  (llama.cpp, vLLM, LM Studio); ignored for Ollama/OpenRouter connections.
+- Slash commands: `/model`, `/effort`, `/permissions`, `/connections`, `/init`,
   `/compact`, `/resume`, `/clear`, `/help`
 - Session persistence — every turn is saved, and sessions can be resumed
   in-TUI or via `local-code --resume`

@@ -6,6 +6,7 @@ pub mod plugin;
 pub mod secret;
 pub mod skills;
 
+use crate::agent::effort::ReasoningEffort;
 use crate::agent::headless::run_headless;
 use crate::config::paths::Paths;
 use crate::permissions::types::PermissionTier;
@@ -30,6 +31,12 @@ pub struct Cli {
     /// Overrides the permission tier for `-p` (defaults to full-auto in headless mode).
     #[arg(long = "permission-mode", value_enum)]
     pub permission_mode: Option<PermissionModeArg>,
+
+    /// Reasoning effort to request from the model (low, medium, high). Overrides
+    /// the connection's configured default for this run; `/effort` changes it
+    /// in-TUI. Only sent to openai-compatible connections.
+    #[arg(long, value_enum)]
+    pub effort: Option<ReasoningEffort>,
 
     /// Resume a previous session for this project: lists recent sessions and
     /// prompts for a choice (reading a line from stdin), or reopens the most
@@ -231,6 +238,7 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
             &project_root,
             cli.connection.as_deref(),
             tier_override,
+            cli.effort,
             prompt,
         )
         .await?;
@@ -347,6 +355,7 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
                             tier: session.tier,
                             connection_name: session.connection_name,
                             model_name: session.model_name,
+                            effort: session.effort,
                             created_at: session.created_at,
                         })
                     }
@@ -361,6 +370,7 @@ pub async fn run(cli: Cli, project_root: PathBuf) -> anyhow::Result<()> {
                 &project_root,
                 cli.connection.as_deref(),
                 cli.permission_mode.map(PermissionModeArg::into_tier),
+                cli.effort,
                 resume,
             )
             .await?;

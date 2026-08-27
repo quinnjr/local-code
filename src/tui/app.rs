@@ -30,6 +30,11 @@ pub struct AppProps {
     pub model: Option<SharedModel>,
     pub connection_name: String,
     pub model_name: String,
+    /// The session-level reasoning-effort override in force at launch
+    /// (`--effort`, or a resumed session's saved `/effort`). `None` means
+    /// "use the connection's configured default". Seeds `App`'s `effort`
+    /// state, which `/effort` mutates and every turn persists.
+    pub effort: Option<crate::agent::effort::ReasoningEffort>,
     pub always_allow: Vec<String>,
     pub always_deny: Vec<String>,
     pub initial_tier: PermissionTier,
@@ -116,6 +121,7 @@ impl Default for AppProps {
             model: None,
             connection_name: String::new(),
             model_name: String::new(),
+            effort: None,
             always_allow: Vec::new(),
             always_deny: Vec::new(),
             initial_tier: PermissionTier::Ask,
@@ -229,6 +235,8 @@ fn tier_label(tier: PermissionTier) -> &'static str {
 enum PendingMenu {
     None,
     ModelChoice(Vec<(crate::config::connection::Connection, String)>),
+    /// `/effort` with no argument: 1) low 2) medium 3) high 4) off.
+    EffortChoice,
     PermissionsMenu,
     ResumeChoice(Vec<crate::session::types::SessionSummary>),
     /// A `/mcp add` wizard is mid-flow, waiting for the next line of free-text
@@ -371,6 +379,14 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let initial = props.model_name.clone();
         move || initial
     });
+    // The session-level reasoning-effort override (`/effort`), kept in
+    // lockstep with `current_model` at every switch site (the value is baked
+    // into the model at build time) and persisted by `run_turn` so `/resume`
+    // restores it. `None` = the connection's configured default.
+    let effort = hooks.use_state({
+        let initial = props.effort;
+        move || initial
+    });
 
     let agent_and_responder = hooks.use_state({
         let model = props.model.clone().expect("AppProps::model is always Some");
@@ -465,6 +481,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         // rebuilt against the wrong provider.
         let connection_name = connection_display.clone();
         let model_name = model_display.clone();
+        let effort = effort.clone();
         let tier = tier.clone();
         let project_root = props.project_root.clone();
         move || {
@@ -483,6 +500,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                 created_at.clone(),
                 connection_name.clone(),
                 model_name.clone(),
+                effort.clone(),
                 tier.get(),
                 project_root.clone(),
             ));
@@ -516,6 +534,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
         let current_model = current_model.clone();
         let connection_display = connection_display.clone();
         let model_display = model_display.clone();
+        let effort = effort.clone();
         let focused = props.focused;
         let input_gate = props.input_gate.clone();
         let background_tasks = background_tasks.clone();
@@ -551,97 +570,65 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     };
                     let (connection, model_name) = choices[idx].clone();
                     pending_menu.set(PendingMenu::None);
-                    let agent_for_history = agent.clone();
-                    let pending_permission_for_rebuild = pending_permission.clone();
-                    let agent_and_responder = agent_and_responder.clone();
-                    let current_model = current_model.clone();
-                    let transcript_for_notice = transcript.clone();
-                    let tier_value = tier.get();
-                    let always_allow = always_allow_snapshot.clone();
-                    let always_deny = always_deny_snapshot.clone();
-                    let system_context = system_context.clone();
-                    let mcp_tools = mcp_tools_state.get();
-                    let skills = skills_snapshot.clone();
-                    let connection_display = connection_display.clone();
-                    let model_display = model_display.clone();
-                    let connection_name_for_display = connection.name.clone();
-                    let model_name_for_display = model_name.clone();
-                    tokio::spawn(async move {
-                        // The keyring read is a blocking Secret Service/DBus
-                        // round trip — keep it off the event thread, same as
-                        // the startup path in `tui::run_tui`.
-                        let api_key = tokio::task::spawn_blocking({
-                            let name = connection.name.clone();
-                            move || crate::config::secrets::SecretStore::get_api_key(&name)
-                        })
-                        .await
-                        .ok()
-                        .and_then(|r| r.ok())
-                        .flatten();
-                        let new_model =
-                            match crate::agent::provider::build_model(&connection, api_key) {
-                                Ok(m) => m,
-                                Err(e) => {
-                                    transcript_for_notice.update(|entries| {
-                                        entries.push_entry(TranscriptEntry::SystemNotice {
-                                            text: format!("failed to switch model: {e}"),
-                                        });
-                                    });
-                                    return;
-                                }
-                            };
-                        let model_for_state = new_model.clone();
-                        let permission_settings =
-                            crate::permissions::settings::PermissionSettings {
-                                always_allow,
-                                always_deny,
-                            };
-                        let rebuilt = match crate::tui::rebuild::rebuild_agent_from_history(
-                            &agent_for_history,
-                            new_model,
-                            tier_value,
-                            permission_settings,
-                            &system_context,
-                            mcp_tools,
-                            skills,
-                            pending_permission_for_rebuild,
-                        )
-                        .await
-                        {
-                            Ok(rebuilt) => rebuilt,
-                            Err(e) => {
-                                // Keep the old agent live; a failed
-                                // switch must not panic the TUI.
-                                transcript_for_notice.update(|entries| {
-                                    entries.push_entry(TranscriptEntry::SystemNotice {
-                                        text: format!("failed to switch model: {e}"),
-                                    });
-                                });
-                                return;
-                            }
-                        };
-                        // Last-write-wins: if multiple `/model` selections somehow
-                        // overlap in flight, whichever `set` call completes last
-                        // wins regardless of submission order. Narrow window today
-                        // since rebuild does no real I/O, but worth revisiting if it grows any.
-                        agent_and_responder.set(rebuilt);
-                        // Kept in lockstep with `agent_and_responder` above (Bug 2
-                        // fix): without this, `SlashContext.model` (built from
-                        // `current_model.get()` in the `Enter` branch below) would
-                        // keep pointing at the pre-switch model forever.
-                        current_model.set(model_for_state);
-                        // Kept in lockstep alongside `current_model` above: the
-                        // Dashboard reads from these, not from `props`, so without
-                        // this it would keep showing the pre-switch connection
-                        // and model name forever after a successful `/model`.
-                        connection_display.set(connection_name_for_display);
-                        model_display.set(model_name_for_display);
-                        transcript_for_notice.update(|entries| {
-                            entries.push_entry(TranscriptEntry::SystemNotice {
-                                text: format!("switched to {} · {}", connection.name, model_name),
-                            });
-                        });
-                    });
+                    let notice = format!("switched to {} · {}", connection.name, model_name);
+                    spawn_model_switch(
+                        ModelSwitchContext {
+                            agent: agent.clone(),
+                            pending_permission: pending_permission.clone(),
+                            agent_and_responder: agent_and_responder.clone(),
+                            current_model: current_model.clone(),
+                            transcript: transcript.clone(),
+                            tier: tier.get(),
+                            always_allow: always_allow_snapshot.clone(),
+                            always_deny: always_deny_snapshot.clone(),
+                            system_context: system_context.clone(),
+                            mcp_tools: mcp_tools_state.get(),
+                            skills: skills_snapshot.clone(),
+                            connection_display: connection_display.clone(),
+                            model_display: model_display.clone(),
+                            effort: effort.clone(),
+                        },
+                        connection,
+                        model_name,
+                        // A `/model` switch keeps the session's `/effort`
+                        // override; only `/effort` itself changes it.
+                        effort.get(),
+                        notice,
+                    );
+                    return;
+                }
+                PendingMenu::EffortChoice => {
+                    let Some(idx) = digit_key_to_index(ev.code, 4) else {
+                        return;
+                    };
+                    pending_menu.set(PendingMenu::None);
+                    let new_effort = match idx {
+                        0 => Some(crate::agent::effort::ReasoningEffort::Low),
+                        1 => Some(crate::agent::effort::ReasoningEffort::Medium),
+                        2 => Some(crate::agent::effort::ReasoningEffort::High),
+                        _ => None,
+                    };
+                    apply_effort(
+                        ModelSwitchContext {
+                            agent: agent.clone(),
+                            pending_permission: pending_permission.clone(),
+                            agent_and_responder: agent_and_responder.clone(),
+                            current_model: current_model.clone(),
+                            transcript: transcript.clone(),
+                            tier: tier.get(),
+                            always_allow: always_allow_snapshot.clone(),
+                            always_deny: always_deny_snapshot.clone(),
+                            system_context: system_context.clone(),
+                            mcp_tools: mcp_tools_state.get(),
+                            skills: skills_snapshot.clone(),
+                            connection_display: connection_display.clone(),
+                            model_display: model_display.clone(),
+                            effort: effort.clone(),
+                        },
+                        &user_config_dir,
+                        &project_config_dir,
+                        new_effort,
+                    );
                     return;
                 }
                 PendingMenu::PermissionsMenu => {
@@ -672,6 +659,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                     let current_model = current_model.clone();
                     let connection_display = connection_display.clone();
                     let model_display = model_display.clone();
+                    let effort = effort.clone();
                     let tier = tier.clone();
                     let session_path = session_path.clone();
                     let created_at = created_at.clone();
@@ -709,6 +697,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                                 )
                             })?;
                             connection.default_model = session.model_name.clone();
+                            connection.effort = session.effort.or(connection.effort);
                             let api_key =
                                 crate::config::secrets::SecretStore::get_api_key(&connection.name)
                                     .ok()
@@ -764,6 +753,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                         // connection/model name forever.
                         connection_display.set(connection_name);
                         model_display.set(session.model_name.clone());
+                        effort.set(session.effort);
                         tier.set(session.tier);
                         created_at.set(session.created_at.clone());
                         transcript.set(session.entries.into_iter().map(Arc::new).collect());
@@ -1299,6 +1289,22 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             pending_permission: pending_permission.clone(),
                             skills: skills_snapshot.clone(),
                             system_context: system_context.clone(),
+                            model_switch: ModelSwitchContext {
+                                agent: agent.clone(),
+                                pending_permission: pending_permission.clone(),
+                                agent_and_responder: agent_and_responder.clone(),
+                                current_model: current_model.clone(),
+                                transcript: transcript.clone(),
+                                tier: tier.get(),
+                                always_allow: always_allow_snapshot.clone(),
+                                always_deny: always_deny_snapshot.clone(),
+                                system_context: system_context.clone(),
+                                mcp_tools: mcp_tools_state.get(),
+                                skills: skills_snapshot.clone(),
+                                connection_display: connection_display.clone(),
+                                model_display: model_display.clone(),
+                                effort: effort.clone(),
+                            },
                         });
                         return;
                     }
@@ -1321,6 +1327,7 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
             Dashboard(
                 connection_name: connection_display.get(),
                 model_name: model_display.get(),
+                effort: effort.get(),
                 tier_label: tier_label(tier.get()).to_string(),
                 tier: tier.get(),
                 usage: usage.get(),
@@ -1424,6 +1431,185 @@ struct SlashContext {
     pending_permission: ntui::State<Option<crate::permissions::types::PermissionRequest>>,
     skills: Vec<crate::skills::types::Skill>,
     system_context: String,
+    /// Everything `/effort` needs to rebuild the agent against a model with
+    /// a different `reasoning_effort` — the same bundle the `/model` digit
+    /// handler passes to `spawn_model_switch`.
+    model_switch: ModelSwitchContext,
+}
+
+/// The `App` state a model switch (`/model`, `/effort`) reads and writes,
+/// cloned once at the dispatch site so the async switch task owns
+/// everything it needs. Both switch paths funnel through
+/// `spawn_model_switch` so they can't drift apart (e.g. one forgetting to
+/// update `current_model` or `model_display`).
+#[derive(Clone)]
+struct ModelSwitchContext {
+    agent: Arc<Agent>,
+    pending_permission: ntui::State<Option<crate::permissions::types::PermissionRequest>>,
+    agent_and_responder: ntui::State<(
+        Arc<Agent>,
+        Arc<crate::permissions::gate::PermissionGate>,
+        crate::tui::rebuild::ResponderHandle,
+    )>,
+    current_model: ntui::State<SharedModel>,
+    transcript: ntui::State<TranscriptEntries>,
+    tier: PermissionTier,
+    always_allow: Vec<String>,
+    always_deny: Vec<String>,
+    system_context: String,
+    mcp_tools: Vec<crate::mcp::tool::NamespacedMcpTool>,
+    skills: Vec<crate::skills::types::Skill>,
+    connection_display: ntui::State<String>,
+    model_display: ntui::State<String>,
+    effort: ntui::State<Option<crate::agent::effort::ReasoningEffort>>,
+}
+
+/// Rebuilds the agent against `connection`/`model_name` with the session
+/// effort override `effort` applied (`None` falls back to the connection's
+/// configured default), preserving history, then updates every piece of
+/// `App` state that mirrors the active model. On any failure the old agent
+/// stays live and a notice is posted instead — a failed switch must never
+/// panic the TUI.
+fn spawn_model_switch(
+    sw: ModelSwitchContext,
+    mut connection: crate::config::connection::Connection,
+    model_name: String,
+    effort: Option<crate::agent::effort::ReasoningEffort>,
+    success_notice: String,
+) {
+    connection.default_model = model_name.clone();
+    connection.effort = effort.or(connection.effort);
+    tokio::spawn(async move {
+        // The keyring read is a blocking Secret Service/DBus round trip —
+        // keep it off the event thread, same as the startup path in
+        // `tui::run_tui`.
+        let api_key = tokio::task::spawn_blocking({
+            let name = connection.name.clone();
+            move || crate::config::secrets::SecretStore::get_api_key(&name)
+        })
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten();
+        let new_model = match crate::agent::provider::build_model(&connection, api_key) {
+            Ok(m) => m,
+            Err(e) => {
+                sw.transcript.update(|entries| {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
+                        text: format!("failed to switch model: {e}"),
+                    });
+                });
+                return;
+            }
+        };
+        let model_for_state = new_model.clone();
+        let permission_settings = crate::permissions::settings::PermissionSettings {
+            always_allow: sw.always_allow,
+            always_deny: sw.always_deny,
+        };
+        let rebuilt = match crate::tui::rebuild::rebuild_agent_from_history(
+            &sw.agent,
+            new_model,
+            sw.tier,
+            permission_settings,
+            &sw.system_context,
+            sw.mcp_tools,
+            sw.skills,
+            sw.pending_permission,
+        )
+        .await
+        {
+            Ok(rebuilt) => rebuilt,
+            Err(e) => {
+                // Keep the old agent live; a failed switch must not panic
+                // the TUI.
+                sw.transcript.update(|entries| {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
+                        text: format!("failed to switch model: {e}"),
+                    });
+                });
+                return;
+            }
+        };
+        // Last-write-wins: if multiple switches somehow overlap in flight,
+        // whichever `set` call completes last wins regardless of submission
+        // order. Narrow window today since rebuild does no real I/O, but
+        // worth revisiting if it grows any.
+        sw.agent_and_responder.set(rebuilt);
+        // Kept in lockstep with `agent_and_responder` above (Bug 2 fix):
+        // without this, `SlashContext.model` (built from
+        // `current_model.get()` in the `Enter` branch) would keep pointing
+        // at the pre-switch model forever.
+        sw.current_model.set(model_for_state);
+        // Kept in lockstep alongside `current_model` above: the Dashboard
+        // reads from these, not from `props`, so without this it would keep
+        // showing the pre-switch connection/model/effort forever.
+        sw.connection_display.set(connection.name.clone());
+        sw.model_display.set(model_name);
+        sw.effort.set(effort);
+        sw.transcript.update(|entries| {
+            entries.push_entry(TranscriptEntry::SystemNotice {
+                text: success_notice,
+            });
+        });
+    });
+}
+
+/// `/effort <level>` / the `/effort` menu: re-resolves the active connection
+/// by name (so a connection edited on disk since launch is picked up, exactly
+/// like `/resume` does), then rebuilds against it with `new_effort` as the
+/// session override. Runs synchronously up to the spawn — `load_connections`
+/// is the same small file read `/model` itself does inline.
+fn apply_effort(
+    sw: ModelSwitchContext,
+    user_config_dir: &std::path::Path,
+    project_config_dir: &std::path::Path,
+    new_effort: Option<crate::agent::effort::ReasoningEffort>,
+) {
+    let connection_name = sw.connection_display.get();
+    let model_name = sw.model_display.get();
+    let connection =
+        match crate::config::connection::load_connections(user_config_dir, project_config_dir) {
+            Ok(connections) => connections.into_iter().find(|c| c.name == connection_name),
+            Err(e) => {
+                sw.transcript.update(|entries| {
+                    entries.push_entry(TranscriptEntry::SystemNotice {
+                        text: format!("failed to load connections: {e}"),
+                    });
+                });
+                return;
+            }
+        };
+    let Some(connection) = connection else {
+        sw.transcript.update(|entries| {
+            entries.push_entry(TranscriptEntry::SystemNotice {
+                text: format!(
+                    "connection '{connection_name}' no longer exists; run `local-code connections list`"
+                ),
+            });
+        });
+        return;
+    };
+    let mut notice = match new_effort {
+        Some(level) => format!("reasoning effort set to {level}"),
+        None => match connection.effort {
+            Some(default) => format!(
+                "reasoning effort override cleared (using '{}' default: {default})",
+                connection.name
+            ),
+            None => format!(
+                "reasoning effort override cleared ('{}' has no default; the server decides)",
+                connection.name
+            ),
+        },
+    };
+    if !crate::agent::effort::supports_effort(connection.provider) {
+        notice.push_str(&format!(
+            "\nnote: effort is only sent to openai-compatible connections; '{}' is {:?}, so it is remembered for this session but not sent",
+            connection.name, connection.provider
+        ));
+    }
+    spawn_model_switch(sw, connection, model_name, new_effort, notice);
 }
 
 /// Registers a fire-and-forget slash-command task with the pane's abort
@@ -1439,6 +1625,7 @@ fn register_background_task(
 
 const HELP_TEXT: &str = "\
 /model                     switch the active connection/model (history is kept)
+/effort [low|medium|high|off] set the reasoning effort for this session (menu if omitted)
 /connections list          list configured connections
 /connections remove <name> remove a configured connection
 /connections add           add a connection via a step-by-step wizard (Esc to cancel)
@@ -1558,6 +1745,34 @@ fn dispatch_slash_command(command: crate::tui::slash::SlashCommand, ctx: &SlashC
                     });
                 }
             }
+        }
+        SlashCommand::Effort { level: Some(level) } => {
+            let new_effort = match level {
+                crate::tui::slash::EffortArg::Level(level) => Some(level),
+                crate::tui::slash::EffortArg::Off => None,
+            };
+            apply_effort(
+                ctx.model_switch.clone(),
+                &ctx.user_config_dir,
+                &ctx.project_config_dir,
+                new_effort,
+            );
+        }
+        SlashCommand::Effort { level: None } => {
+            let current = match ctx.model_switch.effort.get() {
+                Some(level) => level.to_string(),
+                None => "connection default".to_string(),
+            };
+            ctx.transcript.update(|entries| {
+                entries.push_entry(TranscriptEntry::SystemNotice {
+                    text: format!(
+                        "Current reasoning effort: {current}\n\
+                         1) low\n2) medium\n3) high\n4) off (use the connection default)\n\
+                         (press a digit key to select; only sent to openai-compatible connections)"
+                    ),
+                });
+            });
+            ctx.pending_menu.set(PendingMenu::EffortChoice);
         }
         SlashCommand::Permissions => {
             let current = ctx.tier.get();
@@ -2026,6 +2241,7 @@ async fn run_turn(
     created_at: ntui::State<String>,
     connection_name: ntui::State<String>,
     model_name: ntui::State<String>,
+    effort: ntui::State<Option<crate::agent::effort::ReasoningEffort>>,
     tier: PermissionTier,
     project_root: std::path::PathBuf,
 ) {
@@ -2142,6 +2358,7 @@ async fn run_turn(
         let entries = transcript.get();
         let connection_name_value = connection_name.get();
         let model_name_value = model_name.get();
+        let effort_value = effort.get();
         let created_at_value = created_at.get();
         // Serialize + write on the blocking pool: the session grows with the
         // conversation, and doing this inline stalled the single-threaded
@@ -2156,6 +2373,7 @@ async fn run_turn(
                 connection_name: &connection_name_value,
                 model_name: &model_name_value,
                 tier,
+                effort: effort_value,
                 created_at: &created_at_value,
                 updated_at: &now,
                 entries: &entries,
@@ -3122,6 +3340,7 @@ mod tests {
         let created_at = hooks.use_state(|| "2026-01-01T00:00:00Z".to_string());
         let connection_name = hooks.use_state(|| "local-vllm".to_string());
         let model_name = hooks.use_state(|| "qwen2.5-coder-32b".to_string());
+        let effort = hooks.use_state(|| None);
 
         hooks.use_effect((), {
             let slot = props.slot.clone();
@@ -3135,6 +3354,7 @@ mod tests {
             let created_at = created_at.clone();
             let connection_name = connection_name.clone();
             let model_name = model_name.clone();
+            let effort = effort.clone();
             move || {
                 let agent = Arc::new(match mode {
                     HarnessMode::ToolCall => Agent::builder()
@@ -3159,6 +3379,7 @@ mod tests {
                     created_at,
                     connection_name,
                     model_name,
+                    effort,
                     PermissionTier::FullAuto,
                     std::env::temp_dir(),
                 ));
@@ -3588,6 +3809,82 @@ mod tests {
             "{}",
             t.frame_text()
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn effort_command_switches_model_updates_dashboard_and_persists_to_session() {
+        use_mock_keyring();
+        let dir = tempfile::tempdir().unwrap();
+        // The active connection must exist on disk: `/effort` re-resolves it
+        // by name (like `/resume`) before rebuilding the model against it.
+        crate::config::connection::save_connections(
+            dir.path(),
+            &[crate::config::connection::Connection {
+                name: "local-vllm".into(),
+                provider: crate::config::connection::ProviderKind::OpenAiCompatible,
+                base_url: "http://127.0.0.1:9/v1".into(),
+                default_model: "qwen2.5-coder-32b".into(),
+                models: vec![],
+                effort: None,
+            }],
+        )
+        .unwrap();
+        let mut props = test_props_with_config_dir(dir.path());
+        props.session_path = dir.path().join("session.json");
+        let session_path = props.session_path.clone();
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(props)).unwrap();
+
+        // Direct form: `/effort high` rebuilds and the dashboard reflects it.
+        type_and_submit(&mut t, "/effort high").await;
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        let text = t.frame_text();
+        assert!(text.contains("reasoning effort set to high"), "{text}");
+        assert!(
+            text.contains("local-vllm · qwen2.5-coder-32b · effort high"),
+            "{text}"
+        );
+
+        // A turn persists the override into the session file. (The switched
+        // model points at a dead port, so the turn itself errors — the save
+        // still happens, and that's all this asserts.)
+        type_and_submit(&mut t, "hi").await;
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            t.tick().await.unwrap();
+        }
+        let saved = crate::session::store::load_session(&session_path).unwrap();
+        assert_eq!(
+            saved.effort,
+            Some(crate::agent::effort::ReasoningEffort::High)
+        );
+
+        // Menu form: bare `/effort` shows the current level, a digit selects.
+        type_and_submit(&mut t, "/effort").await;
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("Current reasoning effort: high"), "{text}");
+        assert!(text.contains("1) low"), "{text}");
+        t.send_key(KeyCode::Char('4')).unwrap();
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.tick().await.unwrap();
+        }
+        let text = t.frame_text();
+        assert!(text.contains("reasoning effort override cleared"), "{text}");
+        assert!(!text.contains("· effort"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn effort_command_rejects_unknown_levels() {
+        let mut t = TestTerminal::new(80, 24, Element::component::<App>(test_props())).unwrap();
+        type_and_submit(&mut t, "/effort extreme").await;
+        t.tick().await.unwrap();
+        let text = t.frame_text();
+        assert!(text.contains("/effort extreme"), "{text}");
+        assert!(!text.contains("reasoning effort set"), "{text}");
     }
 
     #[tokio::test(start_paused = true)]

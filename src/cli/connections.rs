@@ -100,6 +100,7 @@ pub fn add<R: BufRead, W: Write>(
         base_url,
         default_model,
         models: vec![],
+        effort: None,
     };
 
     let mut connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
@@ -169,6 +170,7 @@ mod tests {
                 base_url: "http://localhost:8000/v1".into(),
                 default_model: "m".into(),
                 models: vec![],
+                effort: None,
             }],
         )
         .unwrap();
@@ -193,6 +195,7 @@ mod tests {
                 base_url: "http://localhost:11434".into(),
                 default_model: "llama3.1".into(),
                 models: vec![],
+                effort: None,
             }],
         )
         .unwrap();

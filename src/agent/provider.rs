@@ -32,6 +32,14 @@ pub fn build_model(
                 OpenAiCompatible::new(normalize_openai_compatible_base_url(&connection.base_url))
                     .with_model(connection.default_model.clone())
                     .with_timeout(std::time::Duration::from_secs(300));
+            // The OpenAI-standard field; llama.cpp, vLLM and LM Studio all
+            // honor it for reasoning models and ignore it otherwise. The
+            // Ollama/OpenRouter arms below have no equivalent hook in daimon
+            // 0.23 (see `effort::supports_effort`), so the setting is
+            // silently unused there — callers surface that themselves.
+            if let Some(effort) = connection.effort {
+                m = m.with_extra_field("reasoning_effort", serde_json::json!(effort.as_str()));
+            }
             if let Some(key) = api_key.filter(|k| !k.is_empty()) {
                 // Since daimon 0.22, sending an API key over plaintext `http://` is a
                 // hard error unless explicitly allowed. This binary only ever talks to
@@ -195,6 +203,7 @@ mod tests {
             base_url: "http://localhost:8000/v1".into(),
             default_model: "qwen2.5-coder-32b".into(),
             models: vec![],
+            effort: None,
         }
     }
 
@@ -205,6 +214,7 @@ mod tests {
             base_url: "http://localhost:11434".into(),
             default_model: "llama3.1".into(),
             models: vec![],
+            effort: None,
         }
     }
 
@@ -215,6 +225,7 @@ mod tests {
             base_url: "https://openrouter.ai/api/v1".into(),
             default_model: "anthropic/claude-sonnet-4".into(),
             models: vec![],
+            effort: None,
         }
     }
 
@@ -259,6 +270,64 @@ mod tests {
         // failure surfaces later as a 401 from OpenRouter itself.
         let result = build_model(&openrouter_connection(), None);
         assert!(result.is_ok());
+    }
+
+    /// Serves one canned chat completion and records whether the request
+    /// body carried `reasoning_effort` — the only observable effect of
+    /// `Connection.effort`, since `OpenAiCompatible`'s fields are private.
+    async fn chat_completion_server(expect_effort: Option<&str>) -> wiremock::MockServer {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "qwen3",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        }));
+        let mock = Mock::given(method("POST")).and(path("/v1/chat/completions"));
+        let mock = match expect_effort {
+            Some(effort) => mock.and(body_partial_json(
+                serde_json::json!({"reasoning_effort": effort}),
+            )),
+            None => mock.and(|req: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                body.get("reasoning_effort").is_none()
+            }),
+        };
+        mock.respond_with(response).expect(1).mount(&server).await;
+        server
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_sends_reasoning_effort_when_set() {
+        let server = chat_completion_server(Some("high")).await;
+        let mut conn = openai_connection();
+        conn.base_url = format!("{}/v1", server.uri());
+        conn.effort = Some(crate::agent::effort::ReasoningEffort::High);
+        let model = build_model(&conn, None).unwrap();
+        let request =
+            daimon::model::types::ChatRequest::new(vec![daimon::model::types::Message::user("hi")]);
+        let response = model.generate_erased(&request).await.unwrap();
+        assert_eq!(response.text(), "ok");
+        // `.expect(1)` on the mock verifies the matcher (effort present) on drop.
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_omits_reasoning_effort_when_unset() {
+        let server = chat_completion_server(None).await;
+        let mut conn = openai_connection();
+        conn.base_url = format!("{}/v1", server.uri());
+        let model = build_model(&conn, None).unwrap();
+        let request =
+            daimon::model::types::ChatRequest::new(vec![daimon::model::types::Message::user("hi")]);
+        let response = model.generate_erased(&request).await.unwrap();
+        assert_eq!(response.text(), "ok");
     }
 
     #[test]

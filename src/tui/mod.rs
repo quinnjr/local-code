@@ -18,6 +18,7 @@ pub use workspace::{Workspace, WorkspaceProps};
 
 use std::path::Path;
 
+use crate::agent::effort::{ReasoningEffort, supports_effort};
 use crate::agent::provider::build_model;
 use crate::config::connection::{Connection, load_connections};
 use crate::config::mcp_servers::load_mcp_servers;
@@ -70,6 +71,9 @@ pub struct ResumedSession {
     /// falling back to `--connection`/the single-connection default.
     pub connection_name: String,
     pub model_name: String,
+    /// The session-level `/effort` override in force when the session was
+    /// last saved (`SessionFile::effort`); re-applied on resume.
+    pub effort: Option<ReasoningEffort>,
     /// The session's original creation timestamp (`SessionFile::created_at`),
     /// carried through so `run_tui` can seed `App`'s `created_at` state
     /// without re-reading the session file it already loaded here.
@@ -148,10 +152,11 @@ pub async fn run_tui(
     project_root: &Path,
     connection_name: Option<&str>,
     permission_mode_override: Option<PermissionTier>,
+    effort_override: Option<ReasoningEffort>,
     resume: Option<ResumedSession>,
 ) -> Result<(), TuiSessionError> {
     let connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
-    let connection = match &resume {
+    let mut connection = match &resume {
         Some(resumed) => resolve_connection_for_resume(
             &connections,
             &resumed.connection_name,
@@ -159,6 +164,20 @@ pub async fn run_tui(
         )?,
         None => select_connection(&connections, connection_name)?,
     };
+    // Precedence: `--effort` > the resumed session's `/effort` override >
+    // the connection's configured default. `session_effort` is what `App`
+    // tracks (and persists) as the session-level override; the connection
+    // default stays on `Connection.effort` and is reloaded on every switch.
+    let session_effort = effort_override.or(resume.as_ref().and_then(|r| r.effort));
+    if let Some(effort) = session_effort {
+        if !supports_effort(connection.provider) {
+            eprintln!(
+                "warning: effort is only sent to openai-compatible connections; '{}' is {:?}, so it is ignored",
+                connection.name, connection.provider
+            );
+        }
+        connection.effort = Some(effort);
+    }
 
     // Kick off the two slow, independent initializations first — the keyring
     // read (a blocking Secret Service/DBus round trip, on the blocking pool
@@ -237,6 +256,7 @@ pub async fn run_tui(
         model: Some(model),
         connection_name: connection.name.clone(),
         model_name: connection.default_model.clone(),
+        effort: session_effort,
         always_allow: settings.always_allow,
         always_deny: settings.always_deny,
         initial_tier,
@@ -275,6 +295,7 @@ mod tests {
             base_url: "http://localhost:8000/v1".into(),
             default_model: "m".into(),
             models: vec![],
+            effort: None,
         }
     }
 

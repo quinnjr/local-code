@@ -20,6 +20,7 @@ async fn generates_nonempty_agents_md_for_this_repo() {
         base_url,
         default_model: model_id,
         models: vec![],
+        effort: None,
     };
     let model = build_model(&connection, None).expect("model construction should not fail");
 
