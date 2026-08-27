@@ -109,6 +109,16 @@ cargo test --test live_ollama -- --ignored --nocapture
     (`agent/skill_tool.rs`, holds the discovered skill list) and `ServeArtifacts`
     (`artifacts/tool.rs`, stateless — server state lives in `artifacts::server`'s process-wide
     registry).
+  - `effort.rs` — `ReasoningEffort` (low/medium/high) and `supports_effort`. Effort has two
+    layers: a per-connection default (`Connection.effort`, `effort = "high"` in
+    connections.toml) and a session-level override (`--effort`, `/effort`, persisted in
+    `SessionFile.effort` so `/resume` restores it). `provider::build_model` reads
+    `Connection.effort` and sends it as the OpenAI-standard `reasoning_effort` body field via
+    `OpenAiCompatible::with_extra_field`; daimon 0.23's `Ollama`/`OpenRouter` builders have no
+    extra-field hook, so `supports_effort` is false for them and every switch site posts a
+    "remembered but not sent" notice instead of silently dropping it. In the TUI, `/model` and
+    `/effort` both go through `app.rs::spawn_model_switch` (one `ModelSwitchContext` bundle)
+    so the two switch paths can't drift.
   - `headless.rs` — the `-p/--prompt` non-interactive path (`run_headless`), used by both the CLI
     and by `local-code`'s own live integration tests.
 - `artifacts/` — localhost HTTP serving of agent-created artifacts (HTML/CSS/JS mockups and more)

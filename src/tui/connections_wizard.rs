@@ -227,6 +227,7 @@ pub fn advance(wizard: ConnectionsAddWizard, line: &str) -> Advance {
                     // Finalize and save; local providers keep this empty
                     // until the user fills `models` in connections.toml.
                     models: vec![],
+                    effort: None,
                 },
                 pending_api_key,
             })
@@ -346,6 +347,7 @@ mod tests {
                         base_url: crate::config::connection::OPENROUTER_DEFAULT_BASE_URL.into(),
                         default_model: "anthropic/claude-sonnet-4".into(),
                         models: vec![],
+                        effort: None,
                     }
                 );
                 assert_eq!(
@@ -397,6 +399,7 @@ mod tests {
                         base_url: "http://localhost:11434".into(),
                         default_model: "llama3.1".into(),
                         models: vec![],
+                        effort: None,
                     }
                 );
                 assert_eq!(output.pending_api_key, None);

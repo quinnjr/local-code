@@ -29,6 +29,7 @@ async fn prompts_a_real_ollama_server_and_gets_a_text_response() {
         base_url,
         default_model: model_id,
         models: vec![],
+        effort: None,
     };
 
     let model = build_model(&connection, None).expect("model construction should not fail");

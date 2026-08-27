@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::agent::build::build_agent_with_mcp_tools;
+use crate::agent::effort::{ReasoningEffort, supports_effort};
 use crate::agent::provider::build_model;
 use crate::config::connection::{Connection, load_connections};
 use crate::config::mcp_servers::load_mcp_servers;
@@ -95,10 +96,20 @@ pub async fn run_headless(
     project_root: &Path,
     connection_name: Option<&str>,
     permission_mode_override: Option<PermissionTier>,
+    effort_override: Option<ReasoningEffort>,
     prompt: &str,
 ) -> Result<String, HeadlessError> {
     let connections = load_connections(&paths.user_config_dir, &paths.project_config_dir)?;
-    let connection = select_connection(&connections, connection_name)?;
+    let mut connection = select_connection(&connections, connection_name)?;
+    if let Some(effort) = effort_override {
+        if !supports_effort(connection.provider) {
+            eprintln!(
+                "warning: --effort is only sent to openai-compatible connections; '{}' is {:?}, so it is ignored",
+                connection.name, connection.provider
+            );
+        }
+        connection.effort = Some(effort);
+    }
 
     // Start the MCP network connect (the dominant tail latency, up to 15s
     // per server) before the local fs/keyring work, so startup pays
@@ -162,6 +173,7 @@ mod tests {
             base_url: "http://localhost:8000/v1".into(),
             default_model: "m".into(),
             models: vec![],
+            effort: None,
         }
     }
 

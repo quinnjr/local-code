@@ -14,6 +14,9 @@ use crate::tui::theme::{BRAND_FROM, BRAND_TO, ChipBackground, ON_WARN, WARN, chi
 pub struct DashboardProps {
     pub connection_name: String,
     pub model_name: String,
+    /// The session's reasoning-effort override, shown after the model name
+    /// when set (`None` = connection default, shown as nothing).
+    pub effort: Option<crate::agent::effort::ReasoningEffort>,
     /// Display text for the tier chip. Derived from `tier` by the caller
     /// (`tier_label`); kept separate so the label can change without
     /// affecting the severity styling, which keys off the enum.
@@ -57,7 +60,13 @@ pub fn Dashboard(props: &DashboardProps, hooks: &mut ntui::Hooks) -> ntui::Eleme
         props.model_name.clone()
     };
     let brand = format!("◆ local-code v{}", env!("CARGO_PKG_VERSION"));
-    let endpoint = format!("{} · {}", props.connection_name, model_label);
+    let endpoint = match props.effort {
+        Some(effort) => format!(
+            "{} · {} · effort {}",
+            props.connection_name, model_label, effort
+        ),
+        None => format!("{} · {}", props.connection_name, model_label),
+    };
     let tokens = format!(
         "{} in / {} out",
         props.usage.input_tokens, props.usage.output_tokens
@@ -105,6 +114,7 @@ mod tests {
         DashboardProps {
             connection_name: "local-vllm".into(),
             model_name: "qwen2.5-coder-32b".into(),
+            effort: None,
             tier_label: "ask".into(),
             tier: PermissionTier::Ask,
             usage: UsageSummary {
