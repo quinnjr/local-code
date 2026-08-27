@@ -1,0 +1,48 @@
+# Maintainer: Joseph R. Quinn <quinn.josephr@gmail.com>
+
+pkgname=local-code
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Claude-Code-style terminal coding agent for local OpenAI-compatible LLM servers (llama.cpp, vLLM, LM Studio, Ollama), with optional OpenRouter access"
+arch=('x86_64' 'aarch64')
+url="https://github.com/quinnjr/local-code"
+# The repository ships no LICENSE file and Cargo.toml declares no license field.
+license=('LicenseRef-Unspecified')
+depends=('glibc' 'dbus')
+makedepends=('cargo' 'pkgconf')
+# Rust handles LTO itself; makepkg's -flto CFLAGS break the aws-lc-sys C/asm build.
+options=('!lto')
+optdepends=(
+  'pass: password-store fallback for API keys when no Secret Service daemon is running'
+  'gnome-keyring: Secret Service backend for API-key storage'
+  'kwallet: Secret Service backend for API-key storage'
+)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('8d60eaae200a3f22216b69878b4766a6fa6e3ba8f524e39bbc6b93517e695b88')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  # Live tests (tests/live_*.rs) are #[ignore]d and need a running LLM server; they stay skipped.
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+}
