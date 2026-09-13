@@ -224,7 +224,7 @@ pub async fn run_tui(
     // are reaped by process teardown instead — see TODO.md.)
     let mcp_tools_for_shutdown = mcp_tools.clone();
 
-    let (initial_tier, initial_entries, initial_messages, session_path, created_at) = match resume {
+    let (initial_tier, entries, initial_messages, session_path, created_at) = match resume {
         Some(resumed) => (
             permission_mode_override.unwrap_or(resumed.tier),
             resumed.entries,
@@ -246,12 +246,41 @@ pub async fn run_tui(
             (tier, Vec::new(), Vec::new(), path, created_at)
         }
     };
+    // Peer registration below appends a notice to the seeded transcript on
+    // failure, so the binding must be mutable.
+    let mut initial_entries = entries;
 
     // The initial session's props double as the template `Workspace` stamps
     // new tabs/panes from (fresh transcript + fresh session file, everything
     // else inherited). `focused`/`input_gate`/`session_tag`/`streaming_flags`
     // keep their defaults here — `Workspace` overrides them per pane on every
     // render.
+    //
+    // The peer runtime is the one exception `new_session_props` must NOT
+    // inherit: each pane needs its own handle/inbox, so it is replaced there.
+    // A failure to register degrades to `None` (peer tools absent) rather than
+    // failing the whole TUI.
+    let peer = match crate::peers::runtime::PeerRuntime::create(
+        crate::peers::registry::peers_root(&paths.user_state_dir),
+        project_root,
+        &session_path,
+        &connection.name,
+        &connection.default_model,
+        "",
+    ) {
+        Ok(runtime) => Some(runtime),
+        Err(e) => {
+            // Degrade to no peer messaging rather than fail startup; surface
+            // the failure in the transcript instead of stderr, which the
+            // running TUI no longer owns.
+            initial_entries.push(crate::tui::state::TranscriptEntry::SystemNotice {
+                text: format!("peer messaging unavailable: {e}"),
+            });
+            None
+        }
+    };
+    let peer_for_shutdown = peer.clone();
+
     let template = AppProps {
         model: Some(model),
         connection_name: connection.name.clone(),
@@ -271,6 +300,7 @@ pub async fn run_tui(
         project_config_dir: paths.project_config_dir.clone(),
         project_root: project_root.to_path_buf(),
         created_at,
+        peer,
         ..AppProps::default()
     };
 
@@ -279,6 +309,12 @@ pub async fn run_tui(
     // waiting for process teardown to break their pipes.
     let render_result = ntui::render(ntui::element!(Workspace(template: template))).await;
     crate::mcp::connect::close_all(&mcp_tools_for_shutdown).await;
+    // `ntui` never unmounts its tree on exit, so the pane cleanup that removes
+    // a peer dir does not run here; remove the template runtime's dir
+    // explicitly (other panes' dirs go stale and are reaped on next launch).
+    if let Some(runtime) = &peer_for_shutdown {
+        runtime.remove_dir();
+    }
     render_result?;
     Ok(())
 }

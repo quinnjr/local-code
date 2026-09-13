@@ -222,6 +222,20 @@ fn render_entry(entry: &TranscriptEntry, theme: &Theme) -> Element {
                 Text(content: text.clone(), color: theme.muted)
             }
         },
+        TranscriptEntry::PeerMessage { from, text } => {
+            // `from` and `text` originate in another process and are untrusted,
+            // so sanitize both before interpolating them into the rendered card.
+            let label = format!("← peer {}", crate::peers::message::sanitize_peer_text(from));
+            let body = format!(
+                "{label}\n{}",
+                crate::peers::message::sanitize_peer_text(text)
+            );
+            element! {
+                View(border_style: theme.border_style, border_color: theme.success, padding: 1) {
+                    Text(content: body, color: theme.foreground)
+                }
+            }
+        }
     }
 }
 

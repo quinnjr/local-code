@@ -143,12 +143,19 @@ pub async fn run_headless(
     // Cheap Arc clones retained so the connections can be closed after the
     // prompt completes (orderly stdio-server shutdown, matching run_tui).
     let mcp_tools_for_shutdown = mcp_report.tools.clone();
+    // Headless is send-only: it can message running TUI sessions but has no
+    // inbox, is not listed as a live peer, and cannot receive replies.
+    let peer = Some(crate::peers::runtime::PeerRuntime::send_only(
+        crate::peers::registry::peers_root(&paths.user_state_dir),
+        project_root,
+    ));
     let agent = build_agent_with_mcp_tools(
         model,
         gate,
         mcp_report.tools,
         discovered_skills,
         &system_context,
+        peer,
     )?;
     let response = agent.prompt(prompt).await;
     crate::mcp::connect::close_all(&mcp_tools_for_shutdown).await;
@@ -272,7 +279,7 @@ mod tests {
 
         // The whole point: a fully-failed MCP discovery report still produces
         // a working agent with just the built-in tools.
-        let agent = build_agent_with_mcp_tools(model, gate, report.tools, Vec::new(), "");
+        let agent = build_agent_with_mcp_tools(model, gate, report.tools, Vec::new(), "", None);
         assert!(agent.is_ok());
     }
 }

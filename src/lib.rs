@@ -8,6 +8,7 @@ pub mod init;
 pub mod marketplace;
 pub mod mcp;
 pub mod memory;
+pub mod peers;
 pub mod permissions;
 pub mod session;
 pub mod skills;

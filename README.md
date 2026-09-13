@@ -29,12 +29,19 @@ cloud calls or API keys required for local inference.
   `c` new window, `n`/`p`/`0-9` switch, `%`/`"` split, arrows/`o` move
   pane focus, `x` close. Background windows keep streaming (the tab bar
   marks them `✻`), and every pane is its own resumable session
+- Inter-session peer messaging: running sessions find each other through
+  per-session filesystem mailboxes, and the `send_message`/`list_peers` tools
+  let the model message another session or see who is running (`/sessions`
+  lists them too). Inbound messages are gated behind per-sender consent, and
+  peer-initiated turns are read-only — the agent can inspect but not edit the
+  repo, run shell commands, or send replies on its own (the human relays);
+  headless `-p` sessions build a send-only runtime
 - Reasoning effort: `/effort low|medium|high|off` (or a digit menu with bare `/effort`),
   `--effort` on the CLI, or `effort = "high"` on a connection in `connections.toml`.
   Sent as the OpenAI-standard `reasoning_effort` field to openai-compatible connections
   (llama.cpp, vLLM, LM Studio); ignored for Ollama/OpenRouter connections.
-- Slash commands: `/model`, `/effort`, `/permissions`, `/connections`, `/init`,
-  `/compact`, `/resume`, `/clear`, `/help`
+- Slash commands: `/model`, `/effort`, `/permissions`, `/connections`, `/sessions`,
+  `/init`, `/compact`, `/resume`, `/clear`, `/help`
 - Session persistence — every turn is saved, and sessions can be resumed
   in-TUI or via `local-code --resume`
 - MCP (Model Context Protocol) client support (stdio/HTTP/SSE/WebSocket)
