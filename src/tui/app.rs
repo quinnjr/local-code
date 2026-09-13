@@ -598,7 +598,16 @@ pub fn App(props: &AppProps, hooks: &mut Hooks) -> Element {
                             .as_ref()
                             .map(|m| m.project_root.display().to_string())
                             .unwrap_or_default();
-                        if watch_runtime.is_approved(&msg.from) {
+                        // An approved sender injects only when it is still
+                        // verifiable: a live registered peer (`meta` present) or
+                        // a send-only sender (which legitimately owns no
+                        // directory and cannot receive replies). An approved
+                        // handle that claims to be repliable but has no live
+                        // entry is treated as unverified and re-offered for
+                        // consent, so a spoofed `from` cannot inherit a prior
+                        // approval.
+                        let sender_verified = meta.is_some() || !msg.can_reply;
+                        if watch_runtime.is_approved(&msg.from) && sender_verified {
                             inject_peer_message(&inject_ctx, &msg, &project);
                         } else if meta.is_none()
                             && !crate::peers::message::is_acceptable_handle(&msg.from)

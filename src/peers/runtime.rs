@@ -198,15 +198,24 @@ mod tests {
     }
 
     fn inbox_files(dir: &Path) -> Vec<PathBuf> {
-        std::fs::read_dir(dir)
+        // Sort so assertions don't depend on filesystem `read_dir` order
+        // (hash-ordered on btrfs/XFS/overlayfs); filenames are lexicographically
+        // chronological, so the last entry is the newest message.
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
             .map(|it| it.flatten().map(|e| e.path()).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        files.sort();
+        files
     }
 
     fn first_message(dir: &Path) -> PeerMessage {
         let files = inbox_files(dir);
-        let text = std::fs::read_to_string(&files[0]).unwrap();
-        serde_json::from_str(&text).unwrap()
+        serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap()
+    }
+
+    fn newest_message(dir: &Path) -> PeerMessage {
+        let files = inbox_files(dir);
+        serde_json::from_str(&std::fs::read_to_string(files.last().unwrap()).unwrap()).unwrap()
     }
 
     #[test]
@@ -252,7 +261,7 @@ mod tests {
         a.send(None, "reply").unwrap();
         let msgs = inbox_files(&b_inbox);
         assert_eq!(msgs.len(), 2);
-        let latest = first_message(&b_inbox);
+        let latest = newest_message(&b_inbox);
         assert_eq!(latest.hops, MAX_HOPS - 1);
     }
 
