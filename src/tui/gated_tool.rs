@@ -7,6 +7,7 @@ use crate::agent::build::register_all_tools;
 #[cfg(test)]
 use crate::agent::gated_tool::GatedTool;
 use crate::mcp::tool::NamespacedMcpTool;
+use crate::peers::runtime::PeerRuntime;
 use crate::permissions::gate::PermissionGate;
 use crate::skills::types::Skill;
 use crate::tui::memory_seed::SeededMemory;
@@ -18,11 +19,13 @@ use daimon::model::types::Message;
 /// empty string if none was found) to the system prompt, and (c) registers
 /// `mcp_tools` (already-discovered `NamespacedMcpTool`s — see
 /// `local_code::mcp::connect::connect_all`, Phase 5, called once at `run_tui`
-/// startup, Task 6) alongside the built-ins. Tool registration itself goes
-/// through `local_code::agent::build::register_all_tools` — the exact same
-/// function headless mode's `build_agent_with_mcp_tools` (Phase 5) calls —
-/// rather than re-listing `GatedTool`-wrapped built-ins by hand, so the TUI
-/// and headless paths can never register a different tool set from each
+/// startup, Task 6) alongside the built-ins. `peer` is the session's peer
+/// runtime; when `Some`, the `send_message`/`list_peers` tools are registered
+/// and the peer paragraph is added to the system prompt. Tool registration
+/// itself goes through `local_code::agent::build::register_all_tools` — the
+/// exact same function headless mode's `build_agent_with_mcp_tools` (Phase 5)
+/// calls — rather than re-listing `GatedTool`-wrapped built-ins by hand, so the
+/// TUI and headless paths can never register a different tool set from each
 /// other. Used by every call site added in this plan (`App`'s mount, `/model`,
 /// `/resume`, `/mcp add`).
 ///
@@ -38,14 +41,16 @@ pub fn build_streaming_agent_with_history(
     extra_system_context: &str,
     mcp_tools: Vec<NamespacedMcpTool>,
     skills: Vec<Skill>,
+    peer: Option<Arc<PeerRuntime>>,
 ) -> daimon::Result<Agent> {
-    let system_prompt = crate::agent::build::composed_system_prompt(extra_system_context);
+    let system_prompt =
+        crate::agent::build::composed_system_prompt(extra_system_context, peer.as_deref());
 
     let builder = AgentBuilder::new()
         .shared_model(model)
         .system_prompt(system_prompt)
         .memory(SeededMemory::new(initial_messages));
-    register_all_tools(builder, gate, mcp_tools, skills).build()
+    register_all_tools(builder, gate, mcp_tools, skills, peer).build()
 }
 
 #[cfg(test)]
@@ -164,8 +169,15 @@ mod tests {
     fn build_streaming_agent_succeeds_with_all_six_tools() {
         let model: SharedModel = Arc::new(EchoModel);
         let gate = gate_with(PermissionTier::FullAuto, PermissionDecision::Allow);
-        let agent =
-            build_streaming_agent_with_history(model, gate, Vec::new(), "", Vec::new(), Vec::new());
+        let agent = build_streaming_agent_with_history(
+            model,
+            gate,
+            Vec::new(),
+            "",
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
         assert!(agent.is_ok());
     }
 
@@ -175,9 +187,16 @@ mod tests {
 
         let model: SharedModel = Arc::new(EchoModel);
         let gate = gate_with(PermissionTier::FullAuto, PermissionDecision::Allow);
-        let agent =
-            build_streaming_agent_with_history(model, gate, Vec::new(), "", Vec::new(), Vec::new())
-                .unwrap();
+        let agent = build_streaming_agent_with_history(
+            model,
+            gate,
+            Vec::new(),
+            "",
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
         let mut stream = agent.prompt_stream("hello").await.unwrap();
         let mut texts = Vec::new();
         while let Some(event) = stream.next().await {
@@ -244,9 +263,16 @@ mod with_history_tests {
             Message::user("earlier turn"),
             Message::assistant("earlier reply"),
         ];
-        let agent =
-            build_streaming_agent_with_history(model, gate(), initial, "", Vec::new(), Vec::new())
-                .unwrap();
+        let agent = build_streaming_agent_with_history(
+            model,
+            gate(),
+            initial,
+            "",
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
 
         let response = agent.prompt("new turn").await.unwrap();
         // system prompt + 2 seeded + new user turn = 4 messages sent to the model
@@ -292,6 +318,7 @@ mod with_history_tests {
             "Project rule: never use unwrap().",
             Vec::new(),
             Vec::new(),
+            None,
         )
         .unwrap();
         let response = agent.prompt("hi").await.unwrap();
@@ -367,9 +394,16 @@ mod with_history_tests {
         let model: SharedModel = Arc::new(ToolCallingModel {
             call_count: AtomicUsize::new(0),
         });
-        let agent =
-            build_streaming_agent_with_history(model, gate(), vec![], "", Vec::new(), vec![skill])
-                .unwrap();
+        let agent = build_streaming_agent_with_history(
+            model,
+            gate(),
+            vec![],
+            "",
+            Vec::new(),
+            vec![skill],
+            None,
+        )
+        .unwrap();
 
         let response = agent.prompt("please use the test skill").await.unwrap();
         assert!(

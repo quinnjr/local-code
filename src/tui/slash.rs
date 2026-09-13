@@ -13,6 +13,7 @@ pub enum EffortArg {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum SlashCommand {
     Model,
     /// `/effort` (menu) or `/effort low|medium|high|off`.
@@ -33,6 +34,7 @@ pub enum SlashCommand {
     Permissions,
     Compact,
     Resume,
+    Sessions,
     Clear,
     Help,
     Unknown {
@@ -97,6 +99,7 @@ pub fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "permissions" => SlashCommand::Permissions,
         "compact" => SlashCommand::Compact,
         "resume" => SlashCommand::Resume,
+        "sessions" => SlashCommand::Sessions,
         "clear" => SlashCommand::Clear,
         "help" => SlashCommand::Help,
         _ => SlashCommand::Unknown {
@@ -142,6 +145,10 @@ mod tests {
         );
         assert_eq!(parse_slash_command("/compact"), Some(SlashCommand::Compact));
         assert_eq!(parse_slash_command("/resume"), Some(SlashCommand::Resume));
+        assert_eq!(
+            parse_slash_command("/sessions"),
+            Some(SlashCommand::Sessions)
+        );
         assert_eq!(parse_slash_command("/clear"), Some(SlashCommand::Clear));
         assert_eq!(parse_slash_command("/help"), Some(SlashCommand::Help));
     }

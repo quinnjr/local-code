@@ -147,6 +147,17 @@ cargo test --test live_ollama -- --ignored --nocapture
   `fixture_server.rs` is a hidden stdio MCP server the binary can turn itself into
   (`__mcp_fixture_server` arg, wired in `main.rs`) purely so integration tests can spawn a real
   child-process MCP server without a second `[[bin]]` target.
+- `peers/` — inter-session peer messaging: every running session registers a per-session mailbox
+  directory under `<state>/peers/` (`registry.rs`) and exchanges messages by dropping JSON files
+  into each other's `inbox/` (`message.rs`) — no server or network transport. `runtime.rs::PeerRuntime`
+  is the per-session handle shared by the App, the watcher/heartbeat tasks, and the agent's tools;
+  `watch.rs` drains the inbox and the TUI injects approved messages as interrupting turns, gated
+  behind per-sender consent; peer-initiated turns run with the permission gate restricted to
+  read-only tools (writes, shell, and `send_message` are denied), so the human relays any reply.
+  `tool.rs` exposes `send_message`/`list_peers` to the model, registered
+  through `agent::build::register_all_tools`, which now takes a `peer: Option<Arc<PeerRuntime>>`
+  (TUI: full runtime; headless: send-only runtime) and registers the peer tools only when it is
+  `Some`.
 - `skills/` — downloadable skills (Claude-Code-style `SKILL.md` + supporting files), installable
   from GitHub, GitLab, or Bitbucket.
   - `spec.rs::parse_spec` is the unified entry point for all skill source specs: `gh:`/`gl:`/`bb:`

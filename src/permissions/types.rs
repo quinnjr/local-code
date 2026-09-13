@@ -34,7 +34,7 @@ pub enum ToolKind {
 /// above the catch-all rather than riding it.
 pub fn classify_tool(name: &str) -> ToolKind {
     match name {
-        "read_file" | "grep" | "glob" => ToolKind::ReadOnly,
+        "read_file" | "grep" | "glob" | "list_peers" => ToolKind::ReadOnly,
         "write_file" | "edit_file" => ToolKind::Edit,
         "bash" => ToolKind::Bash,
         // Starting a persistent network listener has a bash-like risk profile —
@@ -46,6 +46,11 @@ pub fn classify_tool(name: &str) -> ToolKind {
         // always_allow/always_deny command-substring handling is a no-op here
         // because `serve_artifacts` takes no `command` argument.
         "serve_artifacts" => ToolKind::Bash,
+        // Sending a message into another running agent is a side-effecting
+        // capability with the same "should prompt outside FullAuto" profile as
+        // `serve_artifacts`; the gate keys its session approval on the `to`
+        // target (see `permissions::gate::session_key`).
+        "send_message" => ToolKind::Bash,
         _ => ToolKind::Edit,
     }
 }
@@ -113,6 +118,14 @@ mod tests {
     #[test]
     fn unknown_tool_defaults_to_edit() {
         assert_eq!(classify_tool("some_future_mcp_tool"), ToolKind::Edit);
+    }
+
+    #[test]
+    fn peer_tools_classify_as_read_only_list_and_bash_send() {
+        // Discovery is read-only; sending is a side-effecting capability that
+        // must prompt outside FullAuto (matching serve_artifacts' rationale).
+        assert_eq!(classify_tool("list_peers"), ToolKind::ReadOnly);
+        assert_eq!(classify_tool("send_message"), ToolKind::Bash);
     }
 
     #[test]

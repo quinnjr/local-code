@@ -123,3 +123,46 @@ persistence) code review — not bugs, but gaps worth revisiting post-v1.
     OSC 52): after the bump, also wire a keybinding (e.g. Ctrl+Y) that yanks the last
     assistant message to the system clipboard. (Mouse-selection copy already works today —
     ntui never captures the mouse.)
+
+18. **Inter-session peer messaging v1 limitations.** Running sessions discover each other through
+    per-session mailbox directories under `<state>/peers/` and exchange messages by dropping JSON
+    files into each other's `inbox/`; there is no server or network transport.
+    - **Latency/coalescing.** Inboxes are polled every 250 ms; two messages handled in the same
+      tick both inject, each aborting the previous turn — only the latest effectively runs.
+    - **At-most-once delivery.** A crash between moving a message to `inbox/processed/` and the
+      turn durably starting can lose it; a concurrent reap/deliver race can drop one.
+    - **Consent is in-memory.** Per-sender approvals reset each TUI session and are per-pane, not
+      shared across panes or persisted.
+    - **Always-interrupt.** Once a sender is approved, every message aborts the recipient's
+      in-flight turn (discarding partial output) with no coalescing; the global consent queue is
+      capped at 16.
+    - **Loop/flood guard.** Only reply chains are hop-bounded (`MAX_HOPS = 6`); fresh sends reset
+      the budget, so the per-sender consent gate and inbox caps (8/tick, 64 pending, 5-minute
+      age) are the only flood guard — no rate limit.
+    - **Trust.** The channel is same-user and unauthenticated: any same-user process can claim any
+      `from` and read peer metadata (`meta.json` exposes project path and first-prompt preview).
+      On unix the peer dirs are `0700`; Windows/macOS rely on the per-user profile.
+    - **Headless.** `-p` sessions build a send-only runtime: they can message running TUI sessions
+      but are not listed as live peers and cannot receive replies. A send-only sender with no
+      registry entry is still offered to the recipient's consent gate rather than discarded, so
+      the recipient can approve it for the session.
+    - **Handle reuse.** A handle derives from the session path, so `/resume` reclaims it; a delayed
+      reply could reach a later process lifetime (mitigated by a deliver-time meta check).
+    - **Untrusted text.** Peer message text is injected as a user turn and rendered with control
+      characters (including ESC) stripped.
+    - **Prompt-injection resistance is instruction-only.** Peer text is wrapped and labelled as
+      untrusted data, not an instruction, in both the system prompt and the injected turn, and
+      peer-initiated turns are confined to read-only tools by the permission gate (writes, shell,
+      and `send_message` are denied), so a successful injection cannot edit the repo or send
+      replies autonomously. There is still no isolation limiting what a determined injected
+      instruction can *read*. Accepted as a human-trust trade-off, not a technical control.
+    - **Inbox hygiene.** Inbound filenames embed the delivering process's pid and a process-global
+      sequence number, so two panes in one process cannot collide; `inbox/processed/` keeps only
+      the newest 64 archived messages and prunes the rest.
+    - **Reply approvals are allow-once.** `/permissions` "always allow" does not cache replies
+      (`send_message` with no target), so every reply re-prompts; only targeted sends can be
+      remembered for the session.
+    - **Non-unix liveness is heartbeat-only.** Where the pid-liveness check is unavailable
+      (macOS/Windows), a peer is considered dead once its heartbeat goes stale, so a stopped or
+      suspended session can be reaped while its pid is still alive; unix keeps the safer
+      stale-heartbeat + pid-alive = alive behavior.

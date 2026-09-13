@@ -43,7 +43,9 @@ impl PartialEq for WorkspaceProps {
 
 /// Stamps a brand-new session's `AppProps` from the template: fresh session
 /// file on disk (via the same `create_fresh_session` recipe `run_tui` uses
-/// at startup), empty transcript/history, everything else inherited.
+/// at startup), empty transcript/history, a fresh peer runtime (new handle +
+/// inbox — never the template's, which pane 0 already owns), everything else
+/// inherited.
 fn new_session_props(template: &AppProps) -> Result<AppProps, String> {
     let (path, created_at) = create_fresh_session(
         &template.user_state_dir,
@@ -54,11 +56,32 @@ fn new_session_props(template: &AppProps) -> Result<AppProps, String> {
         chrono::Utc::now(),
     )
     .map_err(|e| e.to_string())?;
+    // A pane without peer messaging is better than a pane that cannot open;
+    // degrade to `None` if the handle/dir can't be created, seeding a
+    // transcript notice so the failure is visible — never stderr, which the
+    // running TUI no longer owns.
+    let (peer, initial_entries) = match crate::peers::runtime::PeerRuntime::create(
+        crate::peers::registry::peers_root(&template.user_state_dir),
+        &template.project_root,
+        &path,
+        &template.connection_name,
+        &template.model_name,
+        "",
+    ) {
+        Ok(runtime) => (Some(runtime), Vec::new()),
+        Err(e) => (
+            None,
+            vec![crate::tui::state::TranscriptEntry::SystemNotice {
+                text: format!("peer messaging unavailable: {e}"),
+            }],
+        ),
+    };
     Ok(AppProps {
-        initial_entries: Vec::new(),
+        initial_entries,
         initial_messages: Vec::new(),
         session_path: path,
         created_at,
+        peer,
         ..template.clone()
     })
 }

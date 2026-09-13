@@ -26,6 +26,9 @@ pub enum TranscriptEntry {
     /// expected to run past ~70-80 chars on a line must include explicit `\n`
     /// breaks or it will be clipped mid-word at paint time.
     SystemNotice { text: String },
+    /// An inbound message from another running session (`from` is the peer's
+    /// handle).
+    PeerMessage { from: String, text: String },
 }
 
 /// A tool call's lifecycle, tracked as one mutable entry updated in place as
@@ -257,6 +260,10 @@ mod tests {
             },
             TranscriptEntry::SystemNotice {
                 text: "note".into(),
+            },
+            TranscriptEntry::PeerMessage {
+                from: "peer-1234".into(),
+                text: "hi".into(),
             },
         ];
         let json = serde_json::to_string(&entries).unwrap();

@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Inter-session peer messaging: running sessions discover each other through
+  per-session mailbox directories under `<state>/peers/` and exchange messages
+  by dropping JSON files into each other's `inbox/` — no server or network
+  transport. The new `send_message`/`list_peers` built-in tools let the model
+  message another session or list who is running, and `/sessions` lists the
+  live peers. Inbound messages interrupt the current turn and are gated behind
+  per-sender consent (approve once, for the session, or reject). Headless
+  `-p` sessions build a send-only runtime: they can message running TUI
+  sessions but are not listed as live peers and cannot receive replies.
+- **Breaking (API)**: the peer runtime is threaded through the public
+  agent-construction surface. `register_all_tools`,
+  `build_agent_with_mcp_tools`, `build_streaming_agent_with_history`,
+  `rebuild_agent`, and `rebuild_agent_from_history` each take a new `peer`
+  parameter; `TranscriptEntry::PeerMessage` is a new variant; and
+  `DashboardProps`/`SlashCommand` are now `#[non_exhaustive]`.
+
 ## 0.2.0 — 2026-08-27
 
 - Selectable reasoning effort: `/effort low|medium|high|off` in the TUI

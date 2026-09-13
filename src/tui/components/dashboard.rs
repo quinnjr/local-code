@@ -11,6 +11,7 @@ use crate::tui::state::UsageSummary;
 use crate::tui::theme::{BRAND_FROM, BRAND_TO, ChipBackground, ON_WARN, WARN, chip};
 
 #[derive(Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct DashboardProps {
     pub connection_name: String,
     pub model_name: String,
@@ -30,6 +31,9 @@ pub struct DashboardProps {
     pub session_path: String,
     pub created_at: String,
     pub project_root: String,
+    /// This session's peer-messaging handle, shown so the user can share it
+    /// with another session. `None` when peer messaging is unavailable.
+    pub peer_handle: Option<String>,
 }
 
 /// The tier chip's severity styling, keyed off the enum: the brand gradient
@@ -73,11 +77,17 @@ pub fn Dashboard(props: &DashboardProps, hooks: &mut ntui::Hooks) -> ntui::Eleme
     );
     let (chip_bg, chip_fg) = tier_chip_style(props.tier, &theme);
     let tier_chip = chip(&props.tier_label, chip_bg, chip_fg);
-    let metadata = vec![
-        vec!["project".to_string(), props.project_root.clone()],
-        vec!["session".to_string(), props.session_path.clone()],
-        vec!["started".to_string(), props.created_at.clone()],
-    ];
+    let metadata = {
+        let mut rows = vec![
+            vec!["project".to_string(), props.project_root.clone()],
+            vec!["session".to_string(), props.session_path.clone()],
+            vec!["started".to_string(), props.created_at.clone()],
+        ];
+        if let Some(handle) = &props.peer_handle {
+            rows.push(vec!["peer".to_string(), handle.clone()]);
+        }
+        rows
+    };
 
     element! {
         View(
@@ -126,6 +136,7 @@ mod tests {
             session_path: "/tmp/session.json".into(),
             created_at: "2026-07-07T00:00:00Z".into(),
             project_root: "/home/joseph/Projects/local-code".into(),
+            peer_handle: None,
         }
     }
 
@@ -147,6 +158,14 @@ mod tests {
         assert!(text.contains("120 in / 45 out"));
         assert!(text.contains("/tmp/session.json"));
         assert!(text.contains("/home/joseph/Projects/local-code"));
+    }
+
+    #[tokio::test]
+    async fn renders_peer_handle_when_present() {
+        let mut p = props();
+        p.peer_handle = Some("local-code-3f9a2b7c".into());
+        let t = TestTerminal::new(100, 10, Element::component::<Dashboard>(p)).unwrap();
+        assert!(t.frame_text().contains("local-code-3f9a2b7c"));
     }
 
     #[tokio::test]

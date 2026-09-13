@@ -30,8 +30,10 @@ pub type ResponderHandle = Arc<Mutex<Option<oneshot::Sender<PermissionDecision>>
 /// `always_allow`/`always_deny: Vec<String>` parameters deliberately: two
 /// adjacent same-typed `Vec<String>` params are a real footgun a caller
 /// could transpose without a compile error, and `PermissionSettings` is the
-/// type this function builds internally anyway. The resulting 8-parameter
-/// signature is intentional (see above), hence the lint suppression below.
+/// type this function builds internally anyway. The resulting 9-parameter
+/// signature is intentional (see above) — the trailing optional `peer` runtime
+/// is covered by the same rationale (the prompt and tool set must be derived
+/// from one value) — hence the lint suppression below.
 #[allow(clippy::too_many_arguments)]
 pub fn rebuild_agent(
     model: SharedModel,
@@ -42,6 +44,7 @@ pub fn rebuild_agent(
     mcp_tools: Vec<NamespacedMcpTool>,
     skills: Vec<Skill>,
     pending_permission: ntui::State<Option<PermissionRequest>>,
+    peer: Option<Arc<crate::peers::runtime::PeerRuntime>>,
 ) -> daimon::Result<(Arc<Agent>, Arc<PermissionGate>, ResponderHandle)> {
     let prompter = NtuiPermissionPrompter::new(pending_permission);
     let responder = prompter.responder_handle();
@@ -61,6 +64,7 @@ pub fn rebuild_agent(
         extra_system_context,
         mcp_tools,
         skills,
+        peer,
     )?);
     Ok((agent, gate, responder))
 }
@@ -72,9 +76,11 @@ pub fn rebuild_agent(
 /// does NOT use this — it rebuilds from a *loaded session's* messages, not
 /// the live agent's current history, so reloading would be wrong there.
 ///
-/// Mirrors [`rebuild_agent`]'s parameter list (plus `old_agent`) — see its
-/// doc comment for why the arg count is intentional, hence the same lint
-/// suppression below.
+/// Mirrors [`rebuild_agent`]'s 9-parameter list with `old_agent` in place of
+/// `initial_messages` (the history is read from `old_agent`) — still 9
+/// parameters; the `peer` runtime is covered by the same rationale. See
+/// [`rebuild_agent`]'s doc comment for why the arg count is intentional, hence
+/// the same lint suppression below.
 #[allow(clippy::too_many_arguments)]
 pub async fn rebuild_agent_from_history(
     old_agent: &Agent,
@@ -85,6 +91,7 @@ pub async fn rebuild_agent_from_history(
     mcp_tools: Vec<NamespacedMcpTool>,
     skills: Vec<Skill>,
     pending_permission: ntui::State<Option<PermissionRequest>>,
+    peer: Option<Arc<crate::peers::runtime::PeerRuntime>>,
 ) -> daimon::Result<(Arc<Agent>, Arc<PermissionGate>, ResponderHandle)> {
     // A failed history read must propagate as `Err` (both call sites keep
     // the old agent live and post a notice) — never default to an empty
@@ -101,6 +108,7 @@ pub async fn rebuild_agent_from_history(
         mcp_tools,
         skills,
         pending_permission,
+        peer,
     )
 }
 
@@ -148,6 +156,7 @@ mod tests {
                     Vec::new(),
                     Vec::new(),
                     pending,
+                    None,
                 )
                 .expect("static test tool set never fails to build");
                 tokio::spawn(async move {
@@ -197,6 +206,7 @@ mod tests {
                     ],
                     Vec::new(),
                     pending,
+                    None,
                 );
                 *saw_err.lock().unwrap() = Some(result.is_err());
             }
@@ -267,6 +277,7 @@ mod tests {
                         Vec::new(),
                         Vec::new(),
                         pending,
+                        None,
                     )
                     .await;
                     *saw_err.lock().unwrap() = Some(result.is_err());
